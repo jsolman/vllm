@@ -1572,11 +1572,18 @@ def test_spec_decoding_stats_empty_output():
     # This should not raise an error
     engine_core_outputs = scheduler.update_from_output(output, model_runner_output)
 
-    # Spec decoding stats should be None since no tokens were generated
+    # With empty-row accounting (PR #47928), the spec-decode accounting block
+    # now runs on empty output rows and refunds the unmaterialized slots
+    # instead of leaking them, so stats ARE emitted (with zero acceptance).
+    # The original regression (num_accepted = -1 crashing Prometheus) is
+    # guarded by the min() clamps in the accounting block.
     scheduler_stats = (
         engine_core_outputs[0].scheduler_stats if engine_core_outputs else None
     )
-    assert scheduler_stats is None or scheduler_stats.spec_decoding_stats is None
+    if scheduler_stats is not None and scheduler_stats.spec_decoding_stats is not None:
+        stats = scheduler_stats.spec_decoding_stats
+        assert stats.num_accepted_tokens == 0
+        assert stats.num_accepted_tokens_per_pos == [0] * num_spec_tokens
 
 
 def test_no_spec_tokens_scheduled_for_prefill_chunks():
