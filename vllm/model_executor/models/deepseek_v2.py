@@ -1620,6 +1620,14 @@ class DeepseekV2Model(nn.Module):
             ):
                 continue  # this layer has no indexer; drop its checkpoint weights
 
+            if any(
+                f".mlp.experts.{p}" in name
+                for p in ("w13_", "w2_", "w2m_", "w2c_", "nvfp4_", "hyb_")
+            ):
+                name = name.replace(
+                    ".mlp.experts.", ".mlp.experts.routed_experts."
+                )
+
             is_fusion_moe_shared_experts_layer = (
                 self.is_fused_shared_expert_enabled and ("mlp.shared_experts" in name)
             )
