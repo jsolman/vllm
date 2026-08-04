@@ -1572,13 +1572,14 @@ endif()
 
 # For CUDA we also build and ship some external projects.
 if (VLLM_GPU_LANG STREQUAL "CUDA")
-    include(cmake/external_projects/deepgemm.cmake)
-    include(cmake/external_projects/fmha_sm100.cmake)
-    include(cmake/external_projects/flashmla.cmake)
-    include(cmake/external_projects/flashkda.cmake)
+    # deepgemm, fmha_sm100, flashmla, flashkda are sm_90/sm_100 only - skip on sm_110
+    # include(cmake/external_projects/deepgemm.cmake)
+    # include(cmake/external_projects/fmha_sm100.cmake)
+    # include(cmake/external_projects/flashmla.cmake)
+    # include(cmake/external_projects/flashkda.cmake)
     include(cmake/external_projects/qutlass.cmake)
     include(cmake/external_projects/tml_fa4.cmake)
 
-    # vllm-flash-attn should be last as it overwrites some CMake functions
-    include(cmake/external_projects/vllm_flash_attn.cmake)
+    # vllm-flash-attn skipped on sm_110 - using TRITON_MLA instead
+    # include(cmake/external_projects/vllm_flash_attn.cmake)
 endif ()
