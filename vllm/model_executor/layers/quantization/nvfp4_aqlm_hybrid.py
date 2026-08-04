@@ -490,6 +490,8 @@ class HybridExpertsMoEMethod(FusedMoEMethodBase):
         ):
             out = self._apply_gemv(layer, x, topk_weights, topk_ids)
         else:
+            import os as _os
+            print(f"[MoEDBG pid={_os.getpid()}] ROUTE grouped tokens={num_tokens}", flush=True)
             out = self._apply_grouped(layer, x, topk_weights, topk_ids)
         return out.to(x.dtype)
 
@@ -596,25 +598,29 @@ class HybridExpertsMoEMethod(FusedMoEMethodBase):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
+        import os, time
         ext = _get_ext()
         num_tokens, hidden = x.shape
         top_k = topk_ids.shape[1]
         num_experts = self.moe.num_experts
+        _pid = os.getpid()
+        _t0 = time.time()
+        print(f"[MoEDBG pid={_pid}] enter _apply_grouped tokens={num_tokens} topk={top_k}", flush=True)
 
-        xf = x.to(torch.float16)
+        xf = x.to(torch.float16); print(f"[MoEDBG pid={_pid}] +to(fp16) {time.time()-_t0:.3f}s", flush=True)
         flat_ids = topk_ids.reshape(-1)
-        order = torch.argsort(flat_ids)
+        order = torch.argsort(flat_ids); print(f"[MoEDBG pid={_pid}] +argsort {time.time()-_t0:.3f}s", flush=True)
         tok_of_slot = order // top_k
-        counts = torch.bincount(flat_ids, minlength=num_experts)
-        ends = counts.cumsum(0)
+        counts = torch.bincount(flat_ids, minlength=num_experts); print(f"[MoEDBG pid={_pid}] +bincount {time.time()-_t0:.3f}s", flush=True)
+        ends = counts.cumsum(0); print(f"[MoEDBG pid={_pid}] +cumsum {time.time()-_t0:.3f}s", flush=True)
 
-        xg = xf[tok_of_slot]  # [T*K, H] expert-sorted
-        y = torch.empty_like(xg)
+        xg = xf[tok_of_slot]; print(f"[MoEDBG pid={_pid}] +gather {time.time()-_t0:.3f}s", flush=True)
+        y = torch.empty_like(xg); print(f"[MoEDBG pid={_pid}] +empty {time.time()-_t0:.3f}s", flush=True)
 
-        counts_c = counts.cpu()
-        ends_c = ends.cpu()
+        counts_c = counts.cpu(); print(f"[MoEDBG pid={_pid}] +counts.cpu() {time.time()-_t0:.3f}s", flush=True)
+        ends_c = ends.cpu(); print(f"[MoEDBG pid={_pid}] +ends.cpu() {time.time()-_t0:.3f}s", flush=True)
         group = self.PREFILL_GROUP
-        b_lookup_c = layer._b_lookup.cpu()
+        b_lookup_c = layer._b_lookup.cpu(); print(f"[MoEDBG pid={_pid}] +b_lookup.cpu() {time.time()-_t0:.3f}s", flush=True)
 
         def w13_aqlm(globals_chunk):
             local = torch.tensor(
@@ -681,6 +687,7 @@ class HybridExpertsMoEMethod(FusedMoEMethodBase):
                     sl = slice(int(ends_c[ge]) - n, int(ends_c[ge]))
                     h13 = xg[sl] @ w13[j].t()
                     y[sl] = _silu_and_mul(h13) @ w2[j].t()
+        print(f"[MoEDBG pid={_pid}] GEMM loop done {time.time()-_t0:.3f}s", flush=True)
 
         # Weight + accumulate in bounded TILES (2026-07-13 OOM fix): the old
         # single-shot `y.float() * w` materialized a full [num_slots, H] fp32
@@ -700,6 +707,7 @@ class HybridExpertsMoEMethod(FusedMoEMethodBase):
             sl = slice(s0, min(s0 + TILE, y.shape[0]))
             yw = y[sl].float() * wv[sl].unsqueeze(-1).float()
             out.index_add_(0, tok_of_slot[sl], yw)
+        print(f"[MoEDBG pid={_pid}] exit _apply_grouped {time.time()-_t0:.3f}s", flush=True)
         return out
 
 
