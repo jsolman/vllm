@@ -1368,42 +1368,36 @@ if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
 if _is_cuda():
-    ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
+    # vllm_flash_attn skipped on sm_110 - using TRITON_MLA
+    # ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
     if USE_PRECOMPILED_EXTENSIONS or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
     ):
         # FA3 requires CUDA 12.3 or later
-        ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
-    # FA4 CuteDSL - Python-only component for FA4's cute DSL support
-    # Optional since this doesn't produce a .so file, just copies Python files
-    ext_modules.append(
-        CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa4_cutedsl_C", optional=True)
-    )
-    if USE_PRECOMPILED_EXTENSIONS or (
-        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.9")
-    ):
-        # FlashMLA requires CUDA 12.9 or later
-        # Optional since this doesn't get built (produce an .so file) when
-        # not targeting a hopper system
-        ext_modules.append(CMakeExtension(name="vllm._flashmla_C", optional=True))
-        ext_modules.append(
-            CMakeExtension(name="vllm._flashmla_extension_C", optional=True)
-        )
-    if USE_PRECOMPILED_EXTENSIONS or (
-        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.0")
-    ):
-        ext_modules.append(CMakeExtension(name="vllm._flashkda_C", optional=True))
-    if envs.VLLM_USE_PRECOMPILED or (
-        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
-    ):
-        # DeepGEMM requires CUDA 12.3+ (SM90/SM100)
-        # Optional since it won't build on unsupported architectures
-        ext_modules.append(CMakeExtension(name="vllm._deep_gemm_C", optional=True))
-        ext_modules.append(CMakeExtension(name="vllm._qutlass_C", optional=True))
-    # fmha_sm100 is a Python/CuTe-DSL package installed into vllm.third_party.
-    ext_modules.append(CMakeExtension(name="vllm.fmha_sm100", optional=True))
-    # tml-fa4 is copied into an isolated vllm.third_party package.
-    ext_modules.append(CMakeExtension(name="vllm.tml_fa4", optional=True))
+        # ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
+        pass
+    # FA4 CuteDSL - skipped on sm_110
+    # ext_modules.append(
+    #     CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa4_cutedsl_C", optional=True)
+    # )
+    # FlashMLA, DeepGEMM, QuTLASS, fmha_sm100, flashkda - skipped on sm_110 (sm_90/sm_100 only)
+    # if USE_PRECOMPILED_EXTENSIONS or (
+    #     CUDA_HOME and get_nvcc_cuda_version() >= Version("12.9")
+    # ):
+    #     ext_modules.append(CMakeExtension(name="vllm._flashmla_C", optional=True))
+    #     ext_modules.append(
+    #         CMakeExtension(name="vllm._flashmla_extension_C", optional=True)
+    #     )
+    # if USE_PRECOMPILED_EXTENSIONS or (
+    #     CUDA_HOME and get_nvcc_cuda_version() >= Version("12.0")
+    # ):
+    #     ext_modules.append(CMakeExtension(name="vllm._flashkda_C", optional=True))
+    # if envs.VLLM_USE_PRECOMPILED or (
+    #     CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
+    # ):
+    #     ext_modules.append(CMakeExtension(name="vllm._deep_gemm_C", optional=True))
+    #     ext_modules.append(CMakeExtension(name="vllm._qutlass_C", optional=True))
+    # ext_modules.append(CMakeExtension(name="vllm.fmha_sm100", optional=True))
 
 if _is_cpu():
     import platform
