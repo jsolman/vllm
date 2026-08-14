@@ -383,14 +383,10 @@ def mhc_pre_broadcast_tilelang(
             n_splits,
         )
     else:
-        _tilelang_hc_prenorm_gemm(
-            residual_flat,
-            fn_broadcast,
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            hidden_size,
-            hc_mult,
-        )
+        # Torch fallback: out = x @ fn.T, sqrsum = x^2.sum(-1)
+        x_float = residual_flat.float()
+        gemm_out_mul[0] = x_float @ fn_broadcast.t()
+        gemm_out_sqrsum[0] = x_float.square().sum(dim=-1)
     mhc_pre_big_fuse_broadcast_with_norm_tilelang(
         gemm_out_mul,
         gemm_out_sqrsum,
