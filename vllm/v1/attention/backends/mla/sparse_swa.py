@@ -697,6 +697,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             or current_platform.is_rocm()
             or current_platform.is_xpu()
             or current_platform.is_device_capability_family(120)
+            # SM110 (Thor) has no FlashMLA build; the Triton sparse-MLA
+            # path consumes no tile scheduler metadata, same as ROCm.
+            or current_platform.is_device_capability_family(110)
         ):
             return out
         for layer_type in self._layer_types:
