@@ -284,6 +284,26 @@ class CutlassFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             column_major_scales=True,
         )
 
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        super().process_weights_after_loading(layer)
+        # The CUTLASS scaled_mm dispatch requires float32 block scales. Some
+        # checkpoints (DeepSeek-V4-Flash, expert_dtype=fp4) store weight
+        # scales as exponent-only float8_e8m0fnu, which DeepGEMM consumes
+        # natively but this kernel cannot. Upcast e8m0 -> fp32 here.
+        params = self._get_layer_params(layer)
+        scale_attr_name = (
+            params.WEIGHT_SCALE
+            if params.weight_scale_inv is None
+            else params.WEIGHT_SCALE_INV
+        )
+        weight_scale = getattr(layer, scale_attr_name)
+        if weight_scale.data.dtype == torch.float8_e8m0fnu:
+            exp_bits = weight_scale.data.view(torch.uint8).to(torch.int32)
+            fp32_bits = exp_bits << 23
+            replace_parameter(
+                layer, scale_attr_name, fp32_bits.view(torch.float32).contiguous()
+            )
+
     @classmethod
     def is_supported(cls, compute_capability=None):
         if not CUTLASS_BLOCK_FP8_SUPPORTED:
