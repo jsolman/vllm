@@ -56,6 +56,10 @@ def maybe_execute_in_parallel(
             result1 = fn1()
             event1.record()
         event1.wait()
+        # result1 was allocated on aux_stream; record default-stream use so
+        # the caching allocator defers its reuse until aux work completes.
+        if isinstance(result1, torch.Tensor) and result1.is_cuda:
+            result1.record_stream(torch.cuda.current_stream())
     else:
         result0 = fn0()
         result1 = fn1()
@@ -128,5 +132,16 @@ def execute_in_parallel(
 
     for ev in pending:
         ev.wait()
+
+    # Aux-stream results were allocated on their aux stream but are consumed
+    # (and later freed) on the default stream. Without recording ownership,
+    # the caching allocator can reuse their memory while a queued aux kernel
+    # still writes into it — silently corrupting results (observed on Tegra
+    # unified-memory systems). Record every tensor result as used by the
+    # default stream so frees are deferred until the aux work completes.
+    current = torch.cuda.current_stream()
+    for res in aux_results:
+        if isinstance(res, torch.Tensor) and res.is_cuda:
+            res.record_stream(current)
 
     return default_result, aux_results
