@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import typing
 from collections.abc import Callable, Iterable
 from inspect import signature
@@ -27,6 +29,18 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     mhc_pre_broadcast_tilelang,
     mhc_pre_tilelang,
 )
+
+if os.environ.get("DSV4_MHC_TORCH", "1") == "1":
+    # SM110 (Tegra): tilelang MHC kernels rely on PDL launch semantics
+    # that hang/deadlock on this platform and their warmup spin-loops
+    # without full-device pacing. Pure-torch composites (validated to
+    # <=0.8% vs the tilelang reference in bf16) run via cuBLAS/eager ops.
+    from vllm.model_executor.kernels.mhc.torch_fused import (
+        mhc_fused_post_pre_torch as mhc_fused_post_pre_tilelang,
+        mhc_post_torch as mhc_post_tilelang,
+        mhc_pre_broadcast_torch as mhc_pre_broadcast_tilelang,
+        mhc_pre_with_norm_torch as mhc_pre_tilelang,
+    )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
@@ -1085,9 +1099,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        _dsv4_layer_prefix: str = "",
     ):
         super().__init__()
 
+        self._dsv4_layer_prefix = _dsv4_layer_prefix or prefix
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
@@ -1227,6 +1243,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             x = sp_all_gather(x)[: positions.shape[0]]
 
         x = self.attn(positions, x, None)
+        self._dsv4_debug_log(x, "post_attn")
         if self.use_sequence_parallel:
             x = sp_reduce_scatter(x)
 
@@ -1252,7 +1269,49 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
         x = self.ffn(x, input_ids)
+        self._dsv4_debug_log(x, "layer_out")
         return x, residual, post_mix, res_mix
+
+    def _dsv4_debug_log(self, tensor: torch.Tensor, tag: str) -> None:
+        import os
+
+        if os.environ.get("DSV4_DEBUG_HASH") != "1":
+            return
+        if os.environ.get("DSV4_DEBUG_NOSYNC") == "1":
+            # Sync-only mode: same stream barrier as the logging path
+            # (tensor.record_stream equivalent), no I/O — used to test
+            # whether an aux-stream race is the corruption source.
+            if tensor.is_cuda:
+                tensor.record_stream(torch.cuda.current_stream())
+            return
+        if os.environ.get("DSV4_DEBUG_NOSYNC") == "2":
+            # Stream-scoped sync: replicates the .item() pacing of the
+            # logging path (current-stream-only barrier) without I/O or a
+            # device-to-host copy. torch.cuda.synchronize() is WRONG here —
+            # it waits on ALL streams (aux GEMMs, NCCL proxy) at every
+            # sublayer, ~1000x slower on TP.
+            if tensor.is_cuda:
+                torch.cuda.current_stream().synchronize()
+            return
+        if not hasattr(self, "_dsv4_dbg_step"):
+            self._dsv4_dbg_step = 0
+        self._dsv4_dbg_step += 1
+        if not hasattr(self, "_dsv4_layer_idx"):
+            import re as _re
+
+            m = _re.search(r"layers\.(\d+)", self._dsv4_layer_prefix or "")
+            self._dsv4_layer_idx = int(m.group(1)) if m else -1
+        if tensor.numel() == 0:
+            return
+        b = int(tensor.view(torch.uint8).sum(dtype=torch.int64).item())
+        f = tensor.float()
+        print(
+            f"DSV4DBG tag={tag} layer={self._dsv4_layer_idx} "
+            f"fwd={self._dsv4_dbg_step} bytesum={b} "
+            f"absmax={f.abs().max().item():.6f} "
+            f"nan={bool(f.isnan().any().item())} shape={list(tensor.shape)}",
+            flush=True,
+        )
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
@@ -1284,7 +1343,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # DeepseekV4Attention._run_parallel_input_projections
         # (compressor kv_score, indexer.weights_proj, indexer.compressor
         # kv_score). fused_wqa_wkv stays on the default stream.
-        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+        # SM110 (AGX Thor): optionally run sequentially like ROCm. The
+        # multi-stream overlap races with the caching allocator on Tegra
+        # unified memory; sequential execution is correct there.
+        if os.environ.get("DSV4_DISABLE_AUX_STREAMS", "0") == "1":
+            aux_stream_list = None
+        else:
+            aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
 
         # Reserved topk indices buffer for all Indexer layers to reuse.
         self.topk_indices_buffer = torch.empty(
@@ -1386,6 +1451,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
+            if (
+                os.environ.get("DSV4_DEBUG_HASH") == "1"
+                and hidden_states.numel()
+            ):
+                _f = hidden_states.float()
+                print(
+                    f"DSV4DBG tag=embed_out ids_n={input_ids.shape[0]} "
+                    f"bytesum={int(hidden_states.view(torch.uint8).sum(dtype=torch.int64).item())} "
+                    f"absmax={_f.abs().max().item():.6f} "
+                    f"nan={bool(_f.isnan().any().item())}",
+                    flush=True,
+                )
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -1410,6 +1487,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
+            if os.environ.get("DSV4_LAYER_SYNC", "0") == "1":
+                # SM110 (Tegra): without an inter-layer device sync the mhc
+                # tilelang kernels + aux-stream GEMMs race with the caching
+                # allocator and corrupt the residual stream. A hard sync per
+                # layer is the only configuration verified correct so far;
+                # the throughput cost is bounded (decode is latency-bound).
+                torch.cuda.synchronize()
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,

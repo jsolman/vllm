@@ -4,6 +4,8 @@
 from dataclasses import dataclass
 from typing import cast
 
+import os
+
 import torch
 
 from vllm.distributed import (
@@ -686,6 +688,17 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 topk_ragged_indices = attn_metadata.c128a_decode_topk_ragged_indices
                 topk_ragged_indptr = attn_metadata.c128a_decode_topk_ragged_indptr
 
+        if os.environ.get("DSV4_DEBUG_HASH") == "1":
+            _swa_l = swa_metadata.decode_swa_lens
+            _topk_l = topk_lens
+            _pfx = getattr(getattr(self, "cache_layer", self), "prefix", "?")
+            print(
+                f"DSV4DBG tag=decode_lens layer_prefix={str(_pfx)[-12:]} "
+                f"n_dec={num_decodes} swa_lens={_swa_l[:4].tolist() if _swa_l is not None else None} "
+                f"topk_lens={_topk_l[:4].tolist() if _topk_l is not None else None} "
+                f"cr={self.compress_ratio}",
+                flush=True,
+            )
         rocm_sparse_attn_decode(
             q=q,
             kv_cache=kv_cache,
