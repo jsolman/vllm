@@ -348,7 +348,16 @@ def mhc_pre_broadcast_tilelang(
     residual_flat = residual
     num_tokens = residual.shape[0]
 
-    n_splits = compute_num_split(64, hidden_size, cdiv(num_tokens, 64))
+    from vllm.utils.deep_gemm import is_deep_gemm_supported as _idgs
+
+    if _idgs():
+        n_splits = compute_num_split(64, hidden_size, cdiv(num_tokens, 64))
+    else:
+        # The torch-fallback GEMM below only fills split 0; the kernel sums
+        # n_splits partials, so garbage torch.empty partials would poison the
+        # mixes for small batches (decode) — observed as corrupted layer-0
+        # outputs on SM110. Keep n_splits=1 without DeepGemm.
+        n_splits = 1
 
     residual_out = torch.empty(
         num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=residual.device
