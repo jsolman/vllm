@@ -385,7 +385,7 @@ def test_deepseek_v4_maps_xhigh_to_high_reasoning_effort():
     )
 
     assert prompt.startswith(
-        "<｜begin▁of▁sentence｜>Reasoning Effort: Beyond maximum"
+        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
     )
 
 
