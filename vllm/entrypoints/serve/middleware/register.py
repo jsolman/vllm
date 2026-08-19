@@ -35,6 +35,33 @@ def init_entrypoints_middleware(
 
         app.add_middleware(AuthenticationMiddleware, tokens=tokens)
 
+    # DSV4 debug: log request role-structure for chat completions
+    import os as _os
+
+    if _os.environ.get("DSV4_LOG_BODIES", "0") == "1":
+
+        @app.middleware("http")
+        async def _dsv4_log_bodies(request, call_next):
+            if request.url.path == "/v1/chat/completions":
+                body = await request.body()
+                import json as _json
+
+                try:
+                    data = _json.loads(body)
+                    roles = [
+                        (m.get("role"), (m.get("content") or "")[:80])
+                        for m in data.get("messages", [])
+                    ]
+                    print(
+                        f"DSV4_BODY tools={bool(data.get('tools'))} "
+                        f"ctk={data.get('chat_template_kwargs')} "
+                        f"effort={data.get('reasoning_effort')} roles={roles}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+            return await call_next(request)
+
     if args.enable_request_id_headers:
         from .x_request_id import XRequestIdMiddleware
 
