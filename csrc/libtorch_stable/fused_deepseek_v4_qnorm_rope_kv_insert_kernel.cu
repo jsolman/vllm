@@ -49,6 +49,7 @@
 #endif
 #include <cuda_runtime.h>
 #include <type_traits>
+#include "libtorch_stable/pdl_sm110_guard.cuh"
 
 #ifndef FINAL_MASK
   #ifdef USE_ROCM
@@ -617,9 +618,9 @@ static void launchFusedDeepseekV4Templated(
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  attrs[0].val.programmaticStreamSerializationAllowed = vllm_stable::disable_pdl_sm110() ? 0 : 1;
   config.attrs = attrs;
-  config.numAttrs = (sm_version >= 90) ? 1 : 0;
+  config.numAttrs = (!vllm_stable::disable_pdl_sm110() && sm_version >= 90) ? 1 : 0;
 
   if (num_tokens_full < NUM_TOKEN_CUTOFF) {
     cudaLaunchKernelEx(
@@ -919,9 +920,9 @@ static void launchFullCacheKernel(
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  attrs[0].val.programmaticStreamSerializationAllowed = vllm_stable::disable_pdl_sm110() ? 0 : 1;
   config.attrs = attrs;
-  config.numAttrs = (sm_version >= 90) ? 1 : 0;
+  config.numAttrs = (!vllm_stable::disable_pdl_sm110() && sm_version >= 90) ? 1 : 0;
   cudaLaunchKernelEx(&config, kernel, q_inout, q_fp8_out, q_fp8_stride0,
                      q_fp8_stride1, kv_in, k_cache, slot_mapping, position_ids,
                      cos_sin_cache, fp8_scale, q_fp8_scale_inv, eps,

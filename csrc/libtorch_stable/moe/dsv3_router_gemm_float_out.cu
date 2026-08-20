@@ -22,6 +22,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include "libtorch_stable/pdl_sm110_guard.cuh"
 
 // Custom FMA implementation using PTX assembly instructions
 __device__ __forceinline__ void fma(float2& d, float2 const& a, float2 const& b,
@@ -179,8 +180,8 @@ void invokeRouterGemmFloatOutput(float* output, T const* mat_a, T const* mat_b,
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = 1;
-  config.numAttrs = 1;
+  attrs[0].val.programmaticStreamSerializationAllowed = vllm_stable::disable_pdl_sm110() ? 0 : 1;
+  config.numAttrs = vllm_stable::disable_pdl_sm110() ? 0 : 1;
   config.attrs = attrs;
   cudaLaunchKernelEx(
       &config,
