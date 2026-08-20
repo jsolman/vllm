@@ -749,8 +749,15 @@ class CudaPlatformBase(Platform):
     def is_arch_support_pdl(cls) -> bool:
         try:
             device = torch.cuda.current_device()
-            major, _ = torch.cuda.get_device_capability(device)
+            major, minor = torch.cuda.get_device_capability(device)
         except Exception:
+            return False
+        # SM110 (Tegra Thor): PDL semantics (triton launch_pdl, tilelang T.pdl_sync,
+        # CuteDSL) have been implicated in kernel wedges inside piecewise CUDA graphs
+        # (98% SM at idle power, zero progress; see pdl_sm110_guard.cuh for the csrc
+        # side). Disable python-side PDL here too until the graph-level hang is
+        # root-caused.
+        if major * 10 + minor == 110:
             return False
         return major >= 9
 
