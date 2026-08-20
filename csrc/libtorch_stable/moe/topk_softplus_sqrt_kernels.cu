@@ -28,6 +28,7 @@
 #include "../../cuda_compat.h"
 #include "../cub_helpers.h"
 #include "libtorch_stable/torch_utils.h"
+#include "libtorch_stable/pdl_sm110_guard.cuh"
 #ifndef USE_ROCM
   #include <cuda_bf16.h>
   #include <cuda_fp16.h>
@@ -136,9 +137,9 @@ void launchDsv4HashTopk(const float* input, float* output, OutIndType* indices,
   config.stream = stream;
   cudaLaunchAttribute attr;
   attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attr.val.programmaticStreamSerializationAllowed = 1;
+  attr.val.programmaticStreamSerializationAllowed = vllm_stable::disable_pdl_sm110() ? 0 : 1;
   config.attrs = &attr;
-  config.numAttrs = 1;
+  config.numAttrs = vllm_stable::disable_pdl_sm110() ? 0 : 1;
   const float scale = static_cast<float>(routed_scaling_factor);
   cudaLaunchKernelEx(&config, kernel, input, output, indices, num_rows,
                      num_experts, scale, input_ids, tid2eid, is_padding);
@@ -599,8 +600,8 @@ void topkGatingSoftplusSqrtLauncherHelper(
     config.stream = stream;
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
-    config.numAttrs = 1;
+    attrs[0].val.programmaticStreamSerializationAllowed = vllm_stable::disable_pdl_sm110() ? 0 : 1;
+    config.numAttrs = vllm_stable::disable_pdl_sm110() ? 0 : 1;
     config.attrs = attrs;
     cudaLaunchKernelEx(&config, kernel, input, finished, output, num_rows,
                        indices, source_row, k, start_expert, end_expert,

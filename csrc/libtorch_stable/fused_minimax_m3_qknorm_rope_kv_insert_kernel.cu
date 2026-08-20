@@ -58,6 +58,7 @@
 #include "type_convert.cuh"
 #include "../attention/dtype_fp8.cuh"
 #include "dispatch_utils.h"
+#include "libtorch_stable/pdl_sm110_guard.cuh"
 
 #ifdef USE_ROCM
   #include "../quantization/w8a8/fp8/amd/quant_utils.cuh"
@@ -555,9 +556,9 @@ void launchFusedMiniMaxM3(
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  attrs[0].val.programmaticStreamSerializationAllowed = vllm_stable::disable_pdl_sm110() ? 0 : 1;
   config.attrs = attrs;
-  config.numAttrs = (sm_version >= 90) ? 1 : 0;
+  config.numAttrs = (!vllm_stable::disable_pdl_sm110() && sm_version >= 90) ? 1 : 0;
 
   #define LAUNCH(HAS_INDEX, INSERT, PROCESS_INDEX, FP8, OUT_T)                 \
     cudaLaunchKernelEx(                                                        \
