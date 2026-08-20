@@ -167,6 +167,17 @@ __global__ __launch_bounds__(128, 1) void router_gemm_kernel_bf16_output(
 #endif
 }
 
+// PDL launch attributes hang at cudaGridDependencySynchronize() on Tegra
+// SM110 (unified memory): the kernel spins waiting for a dependent-launch
+// dependency that never resolves. Disable PDL there; the grid-dependency
+// intrinsics are no-ops without the attribute.
+static const bool kDisablePdlSm110 = []() {
+  int32_t major = 0, minor = 0;
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
+  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0);
+  return major * 10 + minor == 110;
+}();
+
 template <typename T, int kNumTokens, int kNumExperts, int kHiddenDim>
 void invokeRouterGemmBf16Output(__nv_bfloat16* output, T const* mat_a,
                                 T const* mat_b, cudaStream_t stream) {
@@ -180,7 +191,7 @@ void invokeRouterGemmBf16Output(__nv_bfloat16* output, T const* mat_a,
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[0].val.programmaticStreamSerializationAllowed = 1;
-  config.numAttrs = 1;
+  config.numAttrs = kDisablePdlSm110 ? 0 : 1;
   config.attrs = attrs;
   cudaLaunchKernelEx(
       &config,
