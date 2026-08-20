@@ -820,3 +820,43 @@ def test_spec_output_row_refunds_unmaterialized_scheduled_slots(
     assert req.status == RequestStatus.RUNNING
 
 
+
+
+def test_non_spec_empty_output_row_refunds_sampled_slot():
+    """Without spec decode, an empty output row leaves the reserved sampled
+    slot undrained (PR #47928 guards only the spec path). The scheduler
+    must refund it instead of leaking one placeholder per occurrence."""
+    scheduler = create_scheduler(async_scheduling=True)
+    req = create_requests(num_requests=1, max_tokens=20)[0]
+    scheduler.requests[req.request_id] = req
+    scheduler.running.append(req)
+    req.status = RequestStatus.RUNNING
+
+    scheduled_slots = 1
+    req.num_computed_tokens = req.num_tokens + scheduled_slots
+    req.num_output_placeholders = scheduled_slots
+
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={req.request_id: scheduled_slots},
+        total_num_scheduled_tokens=scheduled_slots,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[req.request_id],
+        req_id_to_index={req.request_id: 0},
+        sampled_token_ids=[[]],  # empty output row
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    assert req.num_output_placeholders == 0
+    assert req.status == RequestStatus.RUNNING
