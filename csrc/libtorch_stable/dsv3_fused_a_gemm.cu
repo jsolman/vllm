@@ -32,6 +32,7 @@
 
 #include <cstdlib>
 #include <mutex>
+#include "libtorch_stable/pdl_sm110_guard.cuh"
 
 namespace {
 
@@ -692,7 +693,7 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[0].val.programmaticStreamSerializationAllowed =
       enable_pdl || getEnvEnablePDL();
-  config.numAttrs = 1;
+  config.numAttrs = vllm_stable::disable_pdl_sm110() ? 0 : 1;
   config.attrs = attrs;
   if (smem_bytes >= (48 * 1024)) {
     cudaFuncSetAttribute(fused_a_gemm_kernel<batch_size, gemm_m, gemm_k, tile_m,
