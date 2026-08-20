@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 
 #include <type_traits>
+#include "libtorch_stable/pdl_sm110_guard.cuh"
 
 // ---------------------------------------------------------------------------
 // Load helpers
@@ -189,8 +190,8 @@ static void launchFp32RouterGemm(float* output, InputT const* mat_a,
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = 1;
-  config.numAttrs = 1;
+  attrs[0].val.programmaticStreamSerializationAllowed = vllm_stable::disable_pdl_sm110() ? 0 : 1;
+  config.numAttrs = vllm_stable::disable_pdl_sm110() ? 0 : 1;
   config.attrs = attrs;
   cudaLaunchKernelEx(
       &config,

@@ -17,6 +17,7 @@
 #include "libtorch_stable/quantization/vectorization_utils.cuh"
 #include "libtorch_stable/dispatch_utils.h"
 #include "libtorch_stable/torch_utils.h"
+#include "libtorch_stable/pdl_sm110_guard.cuh"
 
 __device__ __forceinline__ float GroupReduceMax(float val) {
 #ifdef USE_ROCM
@@ -190,17 +191,6 @@ inline int GetGroupsPerBlockX(int64_t padded_groups_per_row) {
   return 4;
 }
 
-// PDL launch attributes hang at cudaGridDependencySynchronize() on Tegra
-// SM110 (unified memory): the kernel spins waiting for a dependent-launch
-// dependency that never resolves. Disable PDL there; the grid-dependency
-// intrinsics are no-ops without the attribute.
-static const bool kDisablePdlSm110 = []() {
-  int32_t major = 0, minor = 0;
-  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
-  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0);
-  return major * 10 + minor == 110;
-}();
-
 void per_token_group_quant_8bit(const torch::stable::Tensor& input,
                                 torch::stable::Tensor& output_q,
                                 torch::stable::Tensor& output_s,
@@ -241,7 +231,7 @@ void per_token_group_quant_8bit(const torch::stable::Tensor& input,
       cudaLaunchAttribute attrs[1];                                          \
       attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;      \
       attrs[0].val.programmaticStreamSerializationAllowed = 1;               \
-      config.numAttrs = kDisablePdlSm110 ? 0 : 1;                            \
+      config.numAttrs = vllm_stable::disable_pdl_sm110() ? 0 : 1;                            \
       config.attrs = attrs;                                                  \
       cudaLaunchKernelEx(                                                    \
           &config,                                                           \
@@ -558,7 +548,7 @@ void per_token_group_quant_8bit_packed(const torch::stable::Tensor& input,
       cudaLaunchAttribute attrs[1];                                            \
       attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;        \
       attrs[0].val.programmaticStreamSerializationAllowed = 1;                 \
-      config.numAttrs = kDisablePdlSm110 ? 0 : 1;                              \
+      config.numAttrs = vllm_stable::disable_pdl_sm110() ? 0 : 1;                              \
       config.attrs = attrs;                                                    \
       cudaLaunchKernelEx(                                                      \
           &config,                                                             \
