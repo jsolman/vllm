@@ -1908,6 +1908,43 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
+            if (
+                not scheduled_spec_token_ids
+                and not generated_token_ids
+                and not output_is_stale
+            ):
+                # Non-spec empty output row: the sampled slot reserved at
+                # schedule time never materializes and nothing else drains
+                # it (PR #47928 covers only the spec path). Refund it to
+                # keep num_output_placeholders from leaking one slot per
+                # occurrence, which inflates num_new_tokens and keeps
+                # is_prefill_chunk set past the real prefill.
+                refund = min(
+                    self.num_sampled_tokens_per_step,
+                    num_tokens_scheduled,
+                    request.num_output_placeholders,
+                )
+                if refund > 0:
+                    logger.warning(
+                        "Non-spec empty output row: refunding %d output "
+                        "placeholder(s) for request %s "
+                        "(num_computed_tokens=%d, num_output_placeholders=%d).",
+                        refund,
+                        req_id,
+                        request.num_computed_tokens,
+                        request.num_output_placeholders,
+                    )
+                    request.num_output_placeholders -= refund
+                    # The refunded sampled slot was counted in
+                    # num_computed_tokens when it was scheduled. Roll it back
+                    # too, or the next schedule under-counts by `refund`
+                    # tokens: with spec decode the bonus row then falls out
+                    # of num_scheduled_tokens while the draft rows are still
+                    # scheduled, and the model runner's
+                    # num_scheduled >= num_logits invariant breaks.
+                    request.num_computed_tokens = max(
+                        request.num_computed_tokens - refund, 0
+                    )
             # Account any materialized or rejected output slots for this
             # speculative step. Empty output rows previously leaked both
             # num_computed_tokens and num_output_placeholders (PR #47928).
