@@ -45,23 +45,39 @@ logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
+# --- index_share_for_mtp_iteration (GLM-5.2 / DSA MTP draft) ---------------
+# When enabled by the V2 speculator around the MTP draft-decode loop
+# (VLLM_MTP_INDEX_SHARE=1 + hf_config.index_share_for_mtp_iteration), the
+# indexer op becomes a no-op for draft steps 1+: they reuse the top-k indices
+# the draft-extend (step-0) pass wrote into topk_indices_buffer, compacted to
+# rows [0:num_reqs). This flag is read at RUNTIME inside the eager body of a
+# splitting op, so it works under PIECEWISE cudagraphs without recompiles or
+# capture-order hazards (the op always runs eager between graph pieces).
+# Reference semantics: sgl-project/sglang #29654 / #29787 (anchor top-k on
+# the draft-extend step). Draft-only => lossless by rejection sampling.
+_MTP_DRAFT_REUSE_TOPK = False
+
+# Set to True once the CuteDSL DCP top-K selector fails to compile; all
+# subsequent calls go straight to the torch.topk fallback without retrying
+# the (expensive) CUTLASS DSL compilation.
+_cutedsl_dcp_merge_failed: bool = False
+
+
+def set_mtp_draft_reuse_topk(enable: bool) -> None:
+    """Toggle indexer top-k reuse for MTP draft decode steps."""
+    global _MTP_DRAFT_REUSE_TOPK
+    _MTP_DRAFT_REUSE_TOPK = enable
+
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
 
 
-def _assert_cutedsl_dcp_merge_supported(
+def _assert_dcp_merge_supported(
     logits: torch.Tensor,
     topk_indices: torch.Tensor,
     k: int,
 ) -> None:
-    # The DCP merge only supports the CuteDSL path (Triton pack kernel + CuteDSL
-    # stable-topk selector); there is no PyTorch fallback. The first cut targets
-    # Blackwell/Hopper with index_topk in (512, 1024, 2048) (the selector's radix
-    # sizing); the Triton pack itself has no shape/topk constraints.
-    if not has_cutedsl():
-        raise RuntimeError(
-            "DCP sparse-indexer merge requires CuteDSL; install it or disable DCP."
-        )
+    # Basic validation shared by both the CuteDSL and torch fallback paths.
     if logits.device.type != "cuda":
         raise RuntimeError("DCP sparse-indexer merge requires CUDA tensors.")
     if logits.dtype != torch.float32 or topk_indices.dtype != torch.int32:
@@ -99,13 +115,20 @@ def _merge_dcp_topk_global(
     if dcp_world_size <= 1:
         return
 
-    # CuteDSL-only path (no PyTorch fallback): Triton-pack each rank's
-    # (score, global_id) candidates on-device, all-gather, then the CuteDSL
-    # stable-topk selector.
-    _assert_cutedsl_dcp_merge_supported(logits, topk_indices, topk_tokens)
+    global _cutedsl_dcp_merge_failed
+
+    # Triton-pack each rank's (score, global_id) candidates on-device,
+    # all-gather, then select the global top-K.  The Triton pack kernel has
+    # no arch constraints; the top-K selector has two implementations:
+    #   - CuteDSL radix selector (fast, but requires a working CUTLASS DSL
+    #     NVVM toolchain)
+    #   - torch.topk fallback (always available, runs in eager under the
+    #     @eager_break_during_capture decorator on the outer op)
+    _assert_dcp_merge_supported(logits, topk_indices, topk_tokens)
     from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (
         pack_dcp_topk_candidates_cutedsl,
         stable_topk_from_gathered_candidates_cutedsl,
+        stable_topk_from_gathered_candidates_torch,
     )
 
     packed = torch.empty(
@@ -123,7 +146,21 @@ def _merge_dcp_topk_global(
         row_starts,
     )
     gathered = get_dcp_group().all_gather(packed, dim=1)
-    stable_topk_from_gathered_candidates_cutedsl(
+
+    if has_cutedsl() and not _cutedsl_dcp_merge_failed:
+        try:
+            stable_topk_from_gathered_candidates_cutedsl(
+                gathered, topk_tokens, out=topk_indices
+            )
+            return
+        except Exception as e:
+            _cutedsl_dcp_merge_failed = True
+            logger.warning_once(
+                "CuteDSL DCP top-K merge failed (%s); "
+                "falling back to torch.topk for all subsequent calls.", e
+            )
+
+    stable_topk_from_gathered_candidates_torch(
         gathered, topk_tokens, out=topk_indices
     )
 
@@ -783,6 +820,7 @@ class SparseAttnIndexer(CustomOp):
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
         compress_ratio: int = 1,
+        n_head: int | None = None,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -790,6 +828,7 @@ class SparseAttnIndexer(CustomOp):
         self.scale_fmt = scale_fmt
         self.topk_tokens = topk_tokens
         self.head_dim = head_dim
+        self.n_head = n_head
         self.max_model_len = max_model_len
         self.max_total_seq_len = max_total_seq_len
         self.topk_indices_buffer = topk_indices_buffer
