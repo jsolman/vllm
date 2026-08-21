@@ -598,7 +598,10 @@ def has_fbgemm_gpu() -> bool:
 
 def has_cutedsl() -> bool:
     """Whether the optional `cutelass` package is available."""
-    return _has_module("cutlass")
+    # CuTeDSL NVVM compilation ICEs on sm_110 (AGX Thor).  Disable all
+    # CuTeDSL code paths so we never attempt the failing compilation;
+    # callers fall back to torch.topk / eager implementations instead.
+    return False
 
 
 def has_humming() -> bool:

@@ -232,6 +232,7 @@ def _sparse_mla_kernel_final(
     k_buffer,
     indices_ptr,
     out_ptr,
+    lse_ptr,
     seq_kv,
     h_q,
     stride_q_token,
@@ -251,6 +252,8 @@ def _sparse_mla_kernel_final(
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
     IS_FP8: tl.constexpr,
+    RETURN_LSE: tl.constexpr,
+    LOGE2: tl.constexpr,
 ):
     """Single-pass fast path: full topk, write final bf16 output directly."""
     cur_q = tl.program_id(0)
@@ -298,6 +301,14 @@ def _sparse_mla_kernel_final(
         (acc / e_sum_safe[:, None]).to(tl.bfloat16),
         mask=mask_h[:, None],
     )
+    if RETURN_LSE:
+        # Natural-log LSE: ln(sum(exp(qk))) — same formula as the split
+        # kernel's per-split LSE write: (e_max + log2(e_sum)) * LOGE2.
+        # e_max/e_sum are in log2 domain (sm_scale was applied as
+        # sm_scale * LOG2E), so log2(e_sum) gives log2-domain LSE,
+        # and * LOGE2 converts to natural log.
+        lse_val = (e_max + tl.log2(e_sum_safe)) * LOGE2
+        tl.store(lse_ptr + cur_q * h_q + cur_head, lse_val, mask=mask_h)
 
 
 @triton.autotune(
@@ -503,7 +514,8 @@ def triton_mla_sparse_attention(
     sm_scale: float,
     num_kv_splits: int | None = None,
     sm_count: int | None = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Sparse MLA attention over topk indices.
 
     Args:
@@ -513,9 +525,12 @@ def triton_mla_sparse_attention(
         sm_scale:  softmax scale
         num_kv_splits: override auto-heuristic; None/0 = auto, 1 = force single-pass.
         sm_count:  cached device SM count for the split heuristic.
+        return_lse: If True, also return the natural-log softmax LSE
+                    [num_tokens, num_heads_q] fp32.
 
     Returns:
         out:   [num_tokens, num_heads_q, _BLOCK_DV] bf16
+        lse:   [num_tokens, num_heads_q] fp32 (only if return_lse=True)
     """
     num_tokens, num_heads_q, dim_qk = q.shape
     assert dim_qk == _DIM_QK, (
@@ -553,12 +568,20 @@ def triton_mla_sparse_attention(
         device=q.device,
     )
 
+    # Allocate LSE buffer if requested.
+    lse = None
+    if return_lse:
+        lse = torch.empty(
+            (num_tokens, num_heads_q), dtype=torch.float32, device=q.device
+        )
+
     if num_kv_splits == 1:
         _sparse_mla_kernel_final[(num_tokens, num_head_groups)](
             q_buffer=q,
             k_buffer=kv,
             indices_ptr=indices,
             out_ptr=out,
+            lse_ptr=lse,
             seq_kv=kv.shape[0],
             h_q=num_heads_q,
             stride_q_token=q.stride(0),
@@ -577,7 +600,11 @@ def triton_mla_sparse_attention(
             BLOCK_DMODEL=_BLOCK_DMODEL,
             BLOCK_DPE=_BLOCK_DPE,
             IS_FP8=is_fp8,
+            RETURN_LSE=return_lse,
+            LOGE2=LOGE2,
         )
+        if return_lse:
+            return out, lse
         return out
 
     # Split-KV: partial fp32 output + LSE per (token, head, split).
@@ -630,4 +657,22 @@ def triton_mla_sparse_attention(
         BLOCK_DV_TILE=_MERGE_BLOCK_DV_TILE,
         num_warps=2,
     )
+
+    if return_lse:
+        # After the merge kernel, we need to compute the final merged LSE
+        # from the per-split LSE values. The merge kernel already did the
+        # online-softmax reduction for the output, but we need the LSE too.
+        # The per-split LSE is stored at mid_out[..., BLOCK_DV] (the +1 slot).
+        # Final LSE = log(sum_over_splits(exp(lse_split)))
+        #           = log(sum_over_splits(exp(e_max_split + log(e_sum_split))))
+        # We compute this with a small PyTorch reduction.
+        per_split_lse = mid_out[..., _BLOCK_DV]  # [num_tokens, num_heads_q, num_kv_splits]
+        # Handle empty splits (lse = -inf from sentinel) by replacing with 0
+        # so they contribute nothing to the sum.
+        max_lse = per_split_lse.max(dim=-1).values  # [num_tokens, num_heads_q]
+        shifted = per_split_lse - max_lse.unsqueeze(-1)
+        # exp(-inf) = 0, so empty splits contribute nothing
+        sum_exp = shifted.exp().sum(dim=-1)  # [num_tokens, num_heads_q]
+        lse = max_lse + sum_exp.log()
+        return out, lse
     return out
