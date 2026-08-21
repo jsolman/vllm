@@ -19,6 +19,9 @@ from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     triton_convert_req_index_to_global_index,
 )
+from vllm.v1.attention.backends.mla.sparse_utils import (
+    triton_filter_and_convert_dcp_index,
+)
 from vllm.v1.attention.ops.mqa_logits_triton import (
     warmup_fp8_mqa_logits_triton,
     warmup_fp8_paged_mqa_logits_triton,
@@ -32,7 +35,7 @@ from vllm.v1.attention.ops.triton_mla_sparse_kernel import (
 # V3.2 indexers don't expose `n_head`; GLM-5.1-NVFP4 sets index_n_heads=32.
 # Autotune key includes (num_heads, head_dim), so a wrong warmup shape forces
 # a re-tune on first real request.
-_INDEXER_NUM_HEADS = 64
+_INDEXER_NUM_HEADS = 32
 _INDEXER_HEAD_DIM = 128
 
 
@@ -45,6 +48,12 @@ class TritonMLASparseMetadataBuilder(XPUMLASparseMetadataBuilder):
 class TritonMLASparseImpl(XPUMLASparseImpl):
     """Triton sparse-MLA impl with split-KV decode (3-7× faster than the
     single-pass XPU base for single-query decode on SM80 / SM121)."""
+
+    # DCP support: the Triton sparse MLA kernel can emit the natural-log
+    # softmax LSE (return_lse), which the DCP reducer needs to merge
+    # partial attention across the sequence-sharded KV ranks.
+    can_return_lse_for_decode: bool = True
+    lse_base_on_e: bool = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -101,19 +110,39 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        topk_indices_global = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token,
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+        if self.dcp_world_size > 1:
+            topk_indices_global = triton_filter_and_convert_dcp_index(
+                attn_metadata.req_id_per_token[:num_actual_toks],
+                attn_metadata.block_table,
+                topk_indices,
+                dcp_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                cp_kv_cache_interleave_size=getattr(
+                    attn_metadata, "cp_kv_cache_interleave_size", 1
+                ),
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+                return_valid_counts=False,
+            )
+        else:
+            topk_indices_global = triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token,
+                attn_metadata.block_table,
+                topk_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+            )
+
+        return_lse = self.need_to_return_lse_for_decode
+        attn_out, lse = self._forward_bf16_kv(
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices_global,
+            attn_metadata,
+            return_lse=return_lse,
         )
 
-        attn_out = self._forward_bf16_kv(
-            q, kv_c_and_k_pe_cache, topk_indices_global, attn_metadata
-        )
-
-        return attn_out, None
+        return attn_out, lse
 
     def _forward_bf16_kv(
         self,
@@ -121,20 +150,41 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         kv_c_and_k_pe_cache: torch.Tensor,  # [blocks, heads, d_qk]
         topk_indices: torch.Tensor,  # [sq, topk]
         attn_metadata: XPUMLASparseMetadata,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         num_tokens = q.shape[0]
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
         topk_indices = topk_indices.view(num_tokens, 1, -1)
-        output = triton_mla_sparse_attention(
+        result = triton_mla_sparse_attention(
             q,
             kv_c_and_k_pe_cache,
             topk_indices,
             sm_scale=self.softmax_scale,
             sm_count=self._sm_count,
+            return_lse=return_lse,
         )
-        return output[:, : self.num_heads, :]
+        if return_lse:
+            output, lse = result
+        else:
+            output, lse = result, None
+        # When DCP is active the q heads were all-gathered (num_heads *
+        # dcp_world_size) by the MLA layer before calling forward_mqa; the
+        # full output must be returned so cp_lse_ag_out_rs can reduce-scatter
+        # the heads back to num_heads per rank.  Without DCP, num_heads_q
+        # equals self.num_heads and the slice is a no-op.
+        if self.dcp_world_size > 1:
+            out = output
+            if return_lse and lse is not None:
+                return out, lse
+            return out, None
+
+        out = output[:, : self.num_heads, :]
+        if return_lse and lse is not None:
+            lse = lse[:, : self.num_heads]
+            return out, lse
+        return out, None
 
 
 class TritonMLASparseBackend(AttentionBackend):
