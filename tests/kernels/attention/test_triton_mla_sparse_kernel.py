@@ -114,3 +114,35 @@ def test_short_prefill_no_nan(num_kv_splits, kv_cache):
     )
     assert not torch.isnan(out).any()
     assert not torch.isinf(out).any()
+
+
+@pytest.mark.parametrize("num_kv_splits", [1, 2, 4, 8])
+def test_return_lse_matches_reference(kv_cache, num_kv_splits):
+    """When return_lse=True, the kernel must produce the same natural-log
+    LSE as a reference logsumexp over the sparse topk positions."""
+    torch.manual_seed(42)
+    num_tokens, num_heads, topk = 4, 16, 2048
+    q = torch.randn(num_tokens, num_heads, _DIM_QK, dtype=torch.bfloat16, device="cuda")
+    indices = torch.randint(0, kv_cache.shape[0], (num_tokens, 1, topk), dtype=torch.int32, device="cuda")
+    sm_scale = 0.1
+
+    out, lse = triton_mla_sparse_attention(
+        q, kv_cache, indices, sm_scale=sm_scale,
+        num_kv_splits=num_kv_splits, return_lse=True,
+    )
+
+    # Reference: compute qk for each (token, head) over the selected positions
+    # LSE = ln(sum_j exp(sm_scale * q[t,h] . kv[j,0]))
+    for t in range(num_tokens):
+        for h in range(num_heads):
+            idx = indices[t, 0, :].long()
+            kv_sel = kv_cache[idx, 0, :].float()  # [topk, 512+64]
+            q_th = q[t, h, :].float()
+            qk_ref = (kv_sel @ q_th) * sm_scale
+            lse_ref = torch.logsumexp(qk_ref, dim=0)
+            torch.testing.assert_close(
+                lse[t, h].float(), lse_ref.float(), atol=1e-2, rtol=1e-3,
+            )
+
+    assert lse.isfinite().all()
+    assert not torch.isnan(out).any()
