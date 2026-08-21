@@ -279,6 +279,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
     MLAAttentionImpl,
+    SparseMLAAttentionImpl,
 )
 from vllm.v1.attention.backends.mla.prefill import (
     MLAPrefillBackend,
@@ -696,7 +697,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     kv_c_normed,
                     k_pe,
                     layer_slot_mapping,
-                    attn_metadata.num_decode_tokens
+                    getattr(attn_metadata, "num_decode_tokens", None)
                     if attn_metadata is not None
                     else None,
                     self.use_pcp,
@@ -818,13 +819,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
-        assert (
-            attn_metadata.num_decodes is not None
-            and attn_metadata.num_prefills is not None
-            and attn_metadata.num_decode_tokens is not None
-        )
-        num_mqa_tokens = attn_metadata.num_decode_tokens
-        num_mha_tokens = q.size(0) - num_mqa_tokens
+        is_sparse_impl = isinstance(self.impl, SparseMLAAttentionImpl)
+
+        if is_sparse_impl:
+            num_mqa_tokens = q.size(0)
+            num_mha_tokens = 0
+        else:
+            assert (
+                attn_metadata.num_decodes is not None
+                and attn_metadata.num_prefills is not None
+                and attn_metadata.num_decode_tokens is not None
+            )
+            num_mqa_tokens = attn_metadata.num_decode_tokens
+            num_mha_tokens = q.size(0) - num_mqa_tokens
 
         if self.impl.is_sparse and num_mha_tokens > 0:
             prefill = getattr(attn_metadata, "prefill", None)
@@ -1272,7 +1279,9 @@ def unified_mla_kv_cache_update(
             kv_c_normed,
             k_pe,
             layer_slot_mapping,
-            attn_metadata.num_decode_tokens if attn_metadata is not None else None,
+            getattr(attn_metadata, "num_decode_tokens", None)
+            if attn_metadata is not None
+            else None,
             attn_layer.use_pcp,
         )
         attn_layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]
