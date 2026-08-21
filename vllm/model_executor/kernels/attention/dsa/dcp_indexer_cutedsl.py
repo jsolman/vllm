@@ -31,6 +31,38 @@ def stable_topk_from_gathered_candidates_cutedsl(
     return out
 
 
+def stable_topk_from_gathered_candidates_torch(
+    gathered: torch.Tensor,
+    topk: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Pure-PyTorch fallback for the DCP global top-K merge.
+
+    ``gathered`` has shape [num_rows, num_candidates, 2] where
+    ``gathered[..., 0]`` is the score (fp32) and ``gathered[..., 1]`` is the
+    global token id (stored as fp32 but representing an int32 value).
+
+    Selects the top-``topk`` candidates by score for each row and writes their
+    global ids into ``out`` [num_rows, topk] int32.  Invalid candidates
+    (global_id < 0, score = -inf) are pushed to the bottom so they are never
+    selected when enough valid candidates exist.
+    """
+    if out is None:
+        out = torch.empty(
+            (gathered.shape[0], topk),
+            dtype=torch.int32,
+            device=gathered.device,
+        )
+    scores = gathered[..., 0]                      # [num_rows, num_candidates]
+    global_ids = gathered[..., 1].to(torch.int32)  # [num_rows, num_candidates]
+
+    # torch.topk returns indices into the candidate dimension; those indices
+    # are then used to gather the corresponding global token ids.
+    _, sel_idx = torch.topk(scores, topk, dim=-1, sorted=True)
+    out.copy_(global_ids.gather(1, sel_idx))
+    return out
+
+
 def pack_dcp_topk_candidates_cutedsl(
     logits: torch.Tensor,
     topk_indices: torch.Tensor,
