@@ -16,6 +16,9 @@ from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
     XPUMLASparseMetadata,
     XPUMLASparseMetadataBuilder,
 )
+from vllm.v1.attention.backends.mla.flashmla_sparse import (
+    triton_convert_req_index_to_global_index,
+)
 from vllm.v1.attention.ops.mqa_logits_triton import (
     warmup_fp8_mqa_logits_triton,
     warmup_fp8_paged_mqa_logits_triton,
@@ -83,6 +86,35 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 device=device,
             )
 
+    def forward_mqa(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: XPUMLASparseMetadata,
+        layer,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if isinstance(q, tuple):
+            q = torch.cat(q, dim=-1)
+
+        num_actual_toks = q.shape[0]
+
+        assert self.topk_indices_buffer is not None
+        topk_indices = self.topk_indices_buffer[:num_actual_toks]
+
+        topk_indices_global = triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token,
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+        )
+
+        attn_out = self._forward_bf16_kv(
+            q, kv_c_and_k_pe_cache, topk_indices_global, attn_metadata
+        )
+
+        return attn_out, None
+
     def _forward_bf16_kv(
         self,
         q: torch.Tensor,  # [sq, heads, d_qk]
@@ -114,6 +146,9 @@ class TritonMLASparseBackend(AttentionBackend):
         "auto",
         "float16",
         "bfloat16",
+        "fp8_ds_mla",
+        "fp8",
+        "fp8_e4m3",
     ]
 
     @staticmethod
@@ -148,6 +183,8 @@ class TritonMLASparseBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
+        if cache_dtype_str == "fp8_ds_mla":
+            return (num_blocks, block_size, 656)
         return (num_blocks, block_size, head_size)
 
     @classmethod
