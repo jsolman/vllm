@@ -4101,8 +4101,16 @@ class GPUModelRunner(
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
             )
 
+        # Disable FULL cudagraph when DCP is active: the NCCL collectives
+        # inside sparse_attn_indexer (_merge_dcp_topk_global) and
+        # unified_mla_attention_with_output (mqa_q all-gather, cp_lse_ag_out_rs)
+        # go through torch.distributed which is not CUDA-graph-safe.
+        # PIECEWISE mode runs these ops eagerly via eager_break_during_capture.
+        disable_full = (
+            use_cascade_attn or has_encoder_output or self.dcp_world_size > 1
+        )
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
-            num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output
+            num_tokens_padded, disable_full=disable_full
         )
         num_tokens_padded = batch_descriptor.num_tokens
         if self.compilation_config.pass_config.enable_sp:
@@ -7319,6 +7327,12 @@ class GPUModelRunner(
         )
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.
+        # Disable FULL cudagraph when DCP is active: NCCL collectives inside
+        # sparse_attn_indexer and unified_mla_attention_with_output go through
+        # torch.distributed which is not CUDA-graph-safe.  PIECEWISE mode runs
+        # these ops eagerly via eager_break_during_capture.
+        if self.dcp_world_size > 1 and cudagraph_mode.has_full_cudagraphs():
+            cudagraph_mode = CUDAGraphMode.PIECEWISE
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
             cudagraph_mode, self.uniform_decode_query_len
         )
