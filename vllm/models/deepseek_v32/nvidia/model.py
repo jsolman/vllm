@@ -341,6 +341,17 @@ class DeepseekV32Model(torch.nn.Module):
             # MTP / nextn layers are loaded by the MTP model, not here.
             if get_spec_layer_idx_from_weight_name(self.config, name) is not None:
                 continue
+            # nvfp4_aqlm_hybrid checkpoints store expert quant-tensor params
+            # (w13_codes, hyb_kind, nvfp4_*, ...) on the RoutedExperts submodule,
+            # but checkpoint names are bare ".mlp.experts.<p>" (deepseek_v2.py
+            # applies the same remap in its load_weights).
+            if any(
+                f".mlp.experts.{p}" in name
+                for p in ("w13_", "w2_", "w2m_", "w2c_", "nvfp4_", "hyb_")
+            ):
+                name = name.replace(
+                    ".mlp.experts.", ".mlp.experts.routed_experts."
+                )
             if _try_load_fp8_indexer_wk(
                 name,
                 loaded_weight,
