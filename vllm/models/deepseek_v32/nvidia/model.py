@@ -270,6 +270,11 @@ class DeepseekV32Model(torch.nn.Module):
             assert residual is None, "Currently, SP is not supported with PP"
 
         aux_hidden_states = []
+        if hasattr(self, "_glmdbg_ring"):
+            # Pre-layer input fingerprint: ring[1, 0] = L0's input (token 0).
+            x0 = (hidden_states if residual is None
+                  else hidden_states + residual)
+            self._glmdbg_ring[1, 0] = x0[0]
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
