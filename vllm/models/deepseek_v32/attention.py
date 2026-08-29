@@ -377,6 +377,27 @@ class DeepseekV32Attention(MLAAttention):
             index_k_out=index_k_out,
         )
 
+        # VLLM_GLMDBG_Q: capture the first token's post-rope query + kv
+        # inputs at the attention breakpoint (python re-executes per step,
+        # so this observes LIVE captured-segment outputs).
+        import os as _os
+        if (_os.environ.get("VLLM_GLMDBG_Q") == "1"
+                and not getattr(self, "_glmdbg_q_init", False)):
+            self._glmdbg_q_buf = torch.zeros(
+                3, 2, q_c.shape[-1], dtype=torch.bfloat16, device=q_c.device
+            )
+            self._glmdbg_q_step = [0]
+            self._glmdbg_q_init = True
+        if hasattr(self, "_glmdbg_q_buf") and ".layers.0." in self.layer_name:
+            p = self._glmdbg_q_step[0] % 2
+            self._glmdbg_q_buf[0, p] = q_c[0]
+            self._glmdbg_q_buf[1, p] = kv_c[0]
+            self._glmdbg_q_buf[2, p] = k_pe[0]
+            self._glmdbg_q_step[0] += 1
+            if (_os.environ.get("VLLM_GLMDBG_DUMP") == "1"
+                    and self._glmdbg_q_step[0] % 2 == 0):
+                torch.save(self._glmdbg_q_buf.clone(), "/tmp/glmdbg_q.pt")
+
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
