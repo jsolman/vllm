@@ -669,19 +669,14 @@ def sparse_attn_indexer(
                     indices=decode_metadata.indices,
                 )
             else:
-                # NOTE: attn_metadata.max_seq_len is baked at CUDA-graph
-                # capture time from the dummy batch (for_capture=False under
-                # PIECEWISE per #49364), so it is garbage at replay. The
-                # config-level max_model_len is a host constant and always
-                # valid - it upper-bounds every real seq_len, and the kernel
-                # masks out-of-range pages via seq_lens anyway.
+                active_max_model_len = attn_metadata_narrowed.max_seq_len
                 logits = fp8_paged_mqa_logits_triton(
                     padded_q_quant_cast,
                     kv_cache,
                     weights[:num_padded_tokens],
                     seq_lens,
                     decode_metadata.block_table,
-                    max_model_len=max_model_len,
+                    max_model_len=active_max_model_len,
                     clean_logits=False,
                 )
         num_rows = logits.shape[0]
