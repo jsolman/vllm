@@ -402,9 +402,18 @@ class DeepseekV32Attention(MLAAttention):
             self._glmdbg_q_step[0] += 1
             if (_os.environ.get("VLLM_GLMDBG_DUMP") == "1"
                     and self._glmdbg_q_step[0] % 2 == 0):
+                # Also dump the MLA cache row for token 0 (written by the
+                # captured fused_norm_rope) + the slot_mapping value.
+                _slot0 = int(mla_slot[0].item()) if mla_slot is not None else -1
+                _row = None
+                if mla_kv_cache is not None and _slot0 >= 0:
+                    _u8 = mla_kv_cache.view(torch.uint8)
+                    _blk = _u8[_slot0 // _u8.shape[1]]
+                    _off = _slot0 % _u8.shape[1]
+                    _row = _blk[_off].clone()
                 torch.save(
                     (self._glmdbg_q_buf.clone(), self._glmdbg_kv_buf.clone(),
-                     self._glmdbg_kpe_buf.clone()),
+                     self._glmdbg_kpe_buf.clone(), _slot0, _row),
                     "/tmp/glmdbg_q.pt",
                 )
 
