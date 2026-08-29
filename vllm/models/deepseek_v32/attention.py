@@ -384,19 +384,29 @@ class DeepseekV32Attention(MLAAttention):
         if (_os.environ.get("VLLM_GLMDBG_Q") == "1"
                 and not getattr(self, "_glmdbg_q_init", False)):
             self._glmdbg_q_buf = torch.zeros(
-                3, 2, q_c.shape[-1], dtype=torch.bfloat16, device=q_c.device
+                2, 2, q_c.shape[-1], dtype=torch.bfloat16, device=q_c.device
+            )
+            self._glmdbg_kv_buf = torch.zeros(
+                2, 2, kv_c.shape[-1], dtype=torch.bfloat16, device=q_c.device
+            )
+            self._glmdbg_kpe_buf = torch.zeros(
+                2, 2, k_pe.shape[-1], dtype=torch.bfloat16, device=q_c.device
             )
             self._glmdbg_q_step = [0]
             self._glmdbg_q_init = True
         if hasattr(self, "_glmdbg_q_buf") and ".layers.0." in self.layer_name:
             p = self._glmdbg_q_step[0] % 2
-            self._glmdbg_q_buf[0, p] = q_c[0]
-            self._glmdbg_q_buf[1, p] = kv_c[0]
-            self._glmdbg_q_buf[2, p] = k_pe[0]
+            self._glmdbg_q_buf[p, 0] = q_c[0]
+            self._glmdbg_kv_buf[p, 0] = kv_c[0]
+            self._glmdbg_kpe_buf[p, 0] = k_pe[0]
             self._glmdbg_q_step[0] += 1
             if (_os.environ.get("VLLM_GLMDBG_DUMP") == "1"
                     and self._glmdbg_q_step[0] % 2 == 0):
-                torch.save(self._glmdbg_q_buf.clone(), "/tmp/glmdbg_q.pt")
+                torch.save(
+                    (self._glmdbg_q_buf.clone(), self._glmdbg_kv_buf.clone(),
+                     self._glmdbg_kpe_buf.clone()),
+                    "/tmp/glmdbg_q.pt",
+                )
 
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
