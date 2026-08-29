@@ -597,6 +597,17 @@ def _resolve_rust_cli_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # GLMDBG probe infrastructure (registered so the EngineCore/worker
+    # env-copy includes them and validate_environ doesn't warn).
+    "VLLM_GLMDBG": lambda: os.getenv("VLLM_GLMDBG", "0"),
+    "VLLM_GLMDBG_OUT": lambda: os.getenv("VLLM_GLMDBG_OUT", "0"),
+    "VLLM_GLMDBG_DUMP": lambda: os.getenv("VLLM_GLMDBG_DUMP", "0"),
+    "VLLM_GLMDBG_Q": lambda: os.getenv("VLLM_GLMDBG_Q", "0"),
+    "VLLM_GLMDBG_BUFFER": lambda: os.getenv("VLLM_GLMDBG_BUFFER", "0"),
+    "VLLM_GLMDBG_GRAPH": lambda: os.getenv("VLLM_GLMDBG_GRAPH", "0"),
+    "VLLM_GLMDBG_GRAPH_DIR": lambda: os.getenv(
+        "VLLM_GLMDBG_GRAPH_DIR", "/tmp/glmdbg_graphs"
+    ),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]
