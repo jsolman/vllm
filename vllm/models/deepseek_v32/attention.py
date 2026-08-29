@@ -395,11 +395,13 @@ class DeepseekV32Attention(MLAAttention):
             self._glmdbg_q_step = [0]
             self._glmdbg_q_init = True
         if hasattr(self, "_glmdbg_q_buf") and ".layers.0." in self.layer_name:
-            import sys as _sys
             _cap = torch.cuda.is_current_stream_capturing()
-            print(f"VLLM_GLMDBG_Q: L0 attention fwd call #{self._glmdbg_q_step[0]} "
-                  f"capturing={_cap} slot0={mla_slot[0].item() if mla_slot is not None else 'NA'} "
-                  f"q_absmax={q_c[0].abs().max().item():.4f}", flush=True)
+            if not _cap:
+                # Host-side prints with .item() are ILLEGAL during capture;
+                # only log from eager (breakpoint/replay) executions.
+                print(f"VLLM_GLMDBG_Q: L0 attention fwd #{self._glmdbg_q_step[0]} "
+                      f"slot0={mla_slot[0].item() if mla_slot is not None else 'NA'} "
+                      f"q_absmax={q_c[0].abs().max().item():.4f}", flush=True)
             p = self._glmdbg_q_step[0] % 2
             self._glmdbg_q_buf[p, 0] = q_c[0]
             self._glmdbg_kv_buf[p, 0] = kv_c[0]
