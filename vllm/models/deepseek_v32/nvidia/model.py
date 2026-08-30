@@ -248,7 +248,7 @@ class DeepseekV32Model(torch.nn.Module):
             2, len(self.layers), config.hidden_size,
             dtype=torch.bfloat16, device=self.device,
         )
-        self._glmdbg_ring_path = os.environ.get(
+        self._glmdbg_ring_path = _os.environ.get(
             "VLLM_GLMDBG_RING_PATH", "/tmp/glmdbg_ring_watch.pt")
         self._glmdbg_topk_snap = self.topk_indices_buffer.clone()
         self._glmdbg_ring2 = torch.zeros(
