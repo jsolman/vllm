@@ -4323,15 +4323,15 @@ class GPUModelRunner(
                           type(_inner).__name__, flush=True)
                 else:
                     _path = getattr(_mod, "_glmdbg_ring_path",
-                                    "/tmp/glmdbg_ring_watch.pt")
+                                    "/tmp/glmdbg_ring_watch")
                     _tkbuf = getattr(_mod, "topk_indices_buffer", None)
                     torch.cuda.synchronize()
                     _snap = _ring.detach().clone().cpu()
                     _tk = (_tkbuf[:, :64].clone().cpu()
                            if _tkbuf is not None else _snap[:, :64])
-                    _tmp = _path + ".tmp"
-                    torch.save((_snap, _tk), _tmp)
-                    _os.replace(_tmp, _path)
+                    _n = getattr(_mod, "_glmdbg_step_n", 0)
+                    _mod._glmdbg_step_n = _n + 1
+                    torch.save((_snap, _tk), f"{_path}.{_n:04d}")
             except Exception as _e:
                 print("VLLM_GLMDBG_RING_WATCH: hook error:", repr(_e)[:120],
                       flush=True)
