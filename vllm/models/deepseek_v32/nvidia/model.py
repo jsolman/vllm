@@ -229,7 +229,6 @@ class DeepseekV32Model(torch.nn.Module):
         # thread dumps the ring periodically (python can't run at replay).
         import os as _os
         if _os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1":
-            import threading as _threading
             self._glmdbg_ring = torch.zeros(
                 2, len(self.layers), config.hidden_size,
                 dtype=torch.bfloat16, device=self.device,
@@ -237,26 +236,6 @@ class DeepseekV32Model(torch.nn.Module):
             self._glmdbg_ring_path = _os.environ.get(
                 "VLLM_GLMDBG_RING_PATH", "/tmp/glmdbg_ring_watch.pt")
             self._glmdbg_topk_snap = self.topk_indices_buffer.clone()
-
-            def _watch():
-                import time as _time
-                # Skip the startup window: graph capture must not race a
-                # concurrent D2H copy (cudaErrorStreamCaptureInvalidated).
-                _time.sleep(300)
-                while True:
-                    _time.sleep(5)
-                    try:
-                        torch.cuda.synchronize()
-                        _snap = self._glmdbg_ring.detach().clone().cpu()
-                        _tk = self.topk_indices_buffer[:, :64].clone().cpu()
-                        _tmp = self._glmdbg_ring_path + ".tmp"
-                        torch.save((_snap, _tk), _tmp)
-                        _os.replace(_tmp, self._glmdbg_ring_path)
-                    except Exception:
-                        pass
-
-            _t = _threading.Thread(target=_watch, daemon=True)
-            _t.start()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
