@@ -245,6 +245,7 @@ class DeepseekV32Model(torch.nn.Module):
                 while True:
                     _time.sleep(5)
                     try:
+                        torch.cuda.synchronize()
                         _snap = self._glmdbg_ring.detach().clone().cpu()
                         _tmp = self._glmdbg_ring_path + ".tmp"
                         torch.save(_snap, _tmp)
