@@ -503,6 +503,11 @@ class DeepseekV32Attention(MLAAttention):
         mqa_q: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
+        import os as _os
+        if _os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1":
+            _cap = torch.cuda.is_current_stream_capturing()
+            print(f"VLLM_GLMDBG_RING_WATCH: _sparse_indexer_and_attn "
+                  f"capturing={_cap}", flush=True)
         if self.indexer is not None and not self.skip_topk:
             assert index_q_fp8 is not None
             assert index_weights_out is not None
