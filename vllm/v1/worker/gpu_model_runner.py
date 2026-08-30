@@ -4298,6 +4298,8 @@ class GPUModelRunner(
         import os as _os
         if _os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1":
             try:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError  # never touch CUDA during capture
                 _m0 = getattr(self, "model", None)
                 _inner = getattr(_m0, "model", _m0)  # ForCausalLM -> Model
                 _ring = getattr(_inner, "_glmdbg_ring", None)
