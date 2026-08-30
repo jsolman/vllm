@@ -411,11 +411,12 @@ class DeepseekV32Attention(MLAAttention):
             # the weight, this absmax changes between calls.
             if not hasattr(self, "_glmdbg_w_ref"):
                 self._glmdbg_w_ref = self.q_a_layernorm.weight.detach().clone()
-            _wd = (self.q_a_layernorm.weight.detach().float()
-                   - self._glmdbg_w_ref.float()).abs().max().item()
-            print(f"VLLM_GLMDBG_Q: L0 q_a_rms_weight drift={_wd:.6f} "
-                  f"w_absmax={self.q_a_layernorm.weight.abs().max().item():.4f}",
-                  flush=True)
+            if not _cap:
+                _wd = (self.q_a_layernorm.weight.detach().float()
+                       - self._glmdbg_w_ref.float()).abs().max().item()
+                print(f"VLLM_GLMDBG_Q: L0 q_a_rms_weight drift={_wd:.6f} "
+                      f"w_absmax={self.q_a_layernorm.weight.abs().max().item():.4f}",
+                      flush=True)
             self._glmdbg_q_step[0] += 1
             if (_os.environ.get("VLLM_GLMDBG_DUMP") == "1"
                     and self._glmdbg_q_step[0] % 2 == 0):
