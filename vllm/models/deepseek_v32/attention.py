@@ -402,13 +402,14 @@ class DeepseekV32Attention(MLAAttention):
                       f"hs_bytesum={_hs.sum().item():.2f}", flush=True)
                 # Metadata forensics: block_table row 0 + req_id_per_token[0]
                 # + num_actual_tokens - the index-conversion inputs.
-                _bt = attn_metadata.block_table
-                _rq = attn_metadata.req_id_per_token
-                print(f"VLLM_GLMDBG_Q: L0 bt_row0={_bt[0,:8].tolist()} "
-                      f"bt_shape={list(_bt.shape)} "
-                      f"req0={_rq[:4].tolist()} "
-                      f"num_actual={attn_metadata.num_actual_tokens} "
-                      f"max_seq_len={attn_metadata.max_seq_len}", flush=True)
+                if attn_metadata is not None:
+                    _bt = attn_metadata.block_table
+                    _rq = attn_metadata.req_id_per_token
+                    print(f"VLLM_GLMDBG_Q: L0 bt_row0={_bt[0,:8].tolist()} "
+                          f"bt_shape={list(_bt.shape)} "
+                          f"req0={_rq[:4].tolist()} "
+                          f"num_actual={attn_metadata.num_actual_tokens} "
+                          f"max_seq_len={attn_metadata.max_seq_len}", flush=True)
             if not _cap:
                 # Host-side prints with .item() are ILLEGAL during capture;
                 # only log from eager (breakpoint/replay) executions.
