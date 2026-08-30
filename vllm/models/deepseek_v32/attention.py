@@ -458,6 +458,15 @@ class DeepseekV32Attention(MLAAttention):
         if self.indexer is not None and not self.skip_topk:
             index_q = self.indexer.wq_b(q_c)[0]
             index_q = index_q.view(-1, self.indexer.n_head, self.indexer.head_dim)
+            import os as _os
+            if (_os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1"
+                    and not torch.cuda.is_current_stream_capturing()):
+                _layer = self.layer_name.split(".")[2] if self.layer_name else "?"
+                if _layer in ("0", "1", "2"):
+                    print(f"VLLM_GLMDBG_RING_WATCH: L{_layer} index_q(pre-q) "
+                          f"absmax={index_q[0].float().abs().max().item():.4f} "
+                          f"nan={torch.isnan(index_q[0].float()).sum().item()}",
+                          flush=True)
         else:
             index_q = None
 
