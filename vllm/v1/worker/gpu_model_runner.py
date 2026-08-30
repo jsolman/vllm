@@ -4331,7 +4331,10 @@ class GPUModelRunner(
                            if _tkbuf is not None else _snap[:, :64])
                     _n = getattr(_mod, "_glmdbg_step_n", 0)
                     _mod._glmdbg_step_n = _n + 1
-                    torch.save((_snap, _tk), f"{_path}.{_n:04d}")
+                    _r2 = getattr(_mod, "_glmdbg_ring2", None)
+                    _r2s = (_r2.detach().clone().cpu()
+                            if _r2 is not None else None)
+                    torch.save((_snap, _tk, _r2s), f"{_path}.{_n:04d}")
             except Exception as _e:
                 print("VLLM_GLMDBG_RING_WATCH: hook error:", repr(_e)[:120],
                       flush=True)
