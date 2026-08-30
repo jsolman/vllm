@@ -587,13 +587,6 @@ def fused_norm_rope(
         USE_PDL=use_pdl,
         launch_pdl=use_pdl,
     )
-    # VLLM_GLMDBG_NORM: verify the kernel output after each launch.
-    import os as _os
-    if _os.environ.get("VLLM_GLMDBG_NORM") == "1":
-        _cap = torch.cuda.is_current_stream_capturing()
-        _s = q_c_out[0].float()
-        print(f"VLLM_GLMDBG_NORM: fused_norm_rope q_c_out[0] absmax="
-              f"{_s.abs().max().item():.4f} capturing={_cap}", flush=True)
     return q_c_out
 
 
