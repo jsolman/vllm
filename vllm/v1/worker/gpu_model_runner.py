@@ -4322,11 +4322,13 @@ class GPUModelRunner(
                     print("VLLM_GLMDBG_RING_WATCH: no _glmdbg_ring on",
                           type(_inner).__name__, flush=True)
                 else:
-                    _path = getattr(_inner, "_glmdbg_ring_path",
+                    _path = getattr(_mod, "_glmdbg_ring_path",
                                     "/tmp/glmdbg_ring_watch.pt")
+                    _tkbuf = getattr(_mod, "topk_indices_buffer", None)
                     torch.cuda.synchronize()
                     _snap = _ring.detach().clone().cpu()
-                    _tk = _inner.topk_indices_buffer[:, :64].clone().cpu()
+                    _tk = (_tkbuf[:, :64].clone().cpu()
+                           if _tkbuf is not None else _snap[:, :64])
                     _tmp = _path + ".tmp"
                     torch.save((_snap, _tk), _tmp)
                     _os.replace(_tmp, _path)
