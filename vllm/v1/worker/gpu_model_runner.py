@@ -4308,16 +4308,12 @@ class GPUModelRunner(
                 # Search the module tree for the ring (model nesting varies
                 # by arch: ForCausalLM.model, VL .language_model.model, ...)
                 _ring = None
-                _stack = [_m0]
-                _seen = 0
-                while _stack and _ring is None and _seen < 64:
-                    _mod = _stack.pop(0)
-                    _seen += 1
-                    _ring = getattr(_mod, "_glmdbg_ring", None)
-                    if _ring is None:
-                        for _c in _mod.children():
-                            _stack.append(_c)
-                _inner = _mod
+                _inner = None
+                for _name, _mod in _m0.named_modules():
+                    if hasattr(_mod, "_glmdbg_ring"):
+                        _ring = _mod._glmdbg_ring
+                        _inner = _mod
+                        break
                 if _ring is None:
                     print("VLLM_GLMDBG_RING_WATCH: no _glmdbg_ring on",
                           type(_inner).__name__, flush=True)
