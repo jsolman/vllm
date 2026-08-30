@@ -223,6 +223,35 @@ class DeepseekV32Model(torch.nn.Module):
         self.aux_hidden_state_layers = tuple[int, ...]()
         self.num_redundant_experts = parallel_config.eplb_config.num_redundant_experts
 
+        # VLLM_GLMDBG_RING_WATCH: capture-safe per-layer ring + watcher.
+        # The ring writes are enqueued during capture and re-execute at
+        # replay, so they observe the REAL in-graph data flow. The watcher
+        # thread dumps the ring periodically (python can't run at replay).
+        import os as _os
+        if _os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1":
+            import threading as _threading
+            self._glmdbg_ring = torch.zeros(
+                2, len(self.layers), config.hidden_size,
+                dtype=torch.bfloat16, device=self.device,
+            )
+            self._glmdbg_ring_path = _os.environ.get(
+                "VLLM_GLMDBG_RING_PATH", "/tmp/glmdbg_ring_watch.pt")
+
+            def _watch():
+                import time as _time
+                while True:
+                    _time.sleep(5)
+                    try:
+                        _snap = self._glmdbg_ring.detach().clone().cpu()
+                        _tmp = self._glmdbg_ring_path + ".tmp"
+                        torch.save(_snap, _tmp)
+                        _os.replace(_tmp, self._glmdbg_ring_path)
+                    except Exception:
+                        pass
+
+            _t = _threading.Thread(target=_watch, daemon=True)
+            _t.start()
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -285,6 +314,10 @@ class DeepseekV32Model(torch.nn.Module):
                 )
             hidden_states, residual = layer(positions, hidden_states, residual, attn_in)
             attn_in = None
+            if hasattr(self, "_glmdbg_ring"):
+                x = (hidden_states if residual is None
+                     else hidden_states + residual)
+                self._glmdbg_ring[0, idx] = x[0]
 
         if not get_pp_group().is_last_rank:
             assert not self.use_sequence_parallel, (
