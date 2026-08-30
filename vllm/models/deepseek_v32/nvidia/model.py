@@ -112,6 +112,8 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        if getattr(config, "index_topk", None) == 2048 and self.layer_idx == 1:
+            self._glmdbg_dbg_layer = 0  # marker for L1 probes
 
     def forward(
         self,
@@ -152,11 +154,21 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
             hidden_states, residual = fused_allreduce_rms_norm(
                 hidden_states, residual, self.post_attention_layernorm
             )
+        # VLLM_GLMDBG_RING_WATCH: L1 post-attention fingerprint (slot 2)
+        import os as _os
+        if (getattr(self, "_glmdbg_dbg_layer", None) is not None
+                and hasattr(self, "_glmdbg_ring2")):
+            x = (hidden_states if residual is None
+                 else hidden_states + residual)
+            self._glmdbg_ring2[0, self._glmdbg_dbg_layer] = x[0]
 
         if self.use_sequence_parallel and isinstance(self.mlp, DeepseekV2MoE):
             hidden_states = self.mlp(hidden_states, already_sequence_parallel=True)
         else:
             hidden_states = self.mlp(hidden_states)
+        if (getattr(self, "_glmdbg_dbg_layer", None) is not None
+                and hasattr(self, "_glmdbg_ring2")):
+            self._glmdbg_ring2[1, self._glmdbg_dbg_layer] = hidden_states[0]
         return hidden_states, residual
 
 
@@ -238,6 +250,11 @@ class DeepseekV32Model(torch.nn.Module):
             self._glmdbg_ring_path = _os.environ.get(
                 "VLLM_GLMDBG_RING_PATH", "/tmp/glmdbg_ring_watch.pt")
             self._glmdbg_topk_snap = self.topk_indices_buffer.clone()
+            self._glmdbg_ring2 = torch.zeros(
+                2, 2, config.hidden_size,
+                dtype=torch.bfloat16, device=self.device,
+            )
+            self.layers[1]._glmdbg_ring2 = self._glmdbg_ring2
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
