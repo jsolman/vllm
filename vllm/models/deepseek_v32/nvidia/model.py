@@ -188,6 +188,8 @@ class DeepseekV32Model(torch.nn.Module):
             dtype=torch.int32,
             device=self.device,
         )
+        # Expose on self (the runner ring-dump hook reads it here).
+        self.topk_indices_buffer = topk_indices_buffer
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = make_input_embedding(
