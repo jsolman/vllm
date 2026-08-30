@@ -4297,20 +4297,21 @@ class GPUModelRunner(
         # (safe: this code never runs inside a capture).
         import os as _os
         if _os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1":
-            _model = getattr(self, "model_state", None) or getattr(self, "model", None)
-            _ring = getattr(_model, "_glmdbg_ring", None)
-            if _ring is not None:
-                _path = getattr(_model, "_glmdbg_ring_path",
-                                "/tmp/glmdbg_ring_watch.pt")
-                try:
+            try:
+                _m0 = getattr(self, "model", None)
+                _inner = getattr(_m0, "model", _m0)  # ForCausalLM -> Model
+                _ring = getattr(_inner, "_glmdbg_ring", None)
+                if _ring is not None:
+                    _path = getattr(_inner, "_glmdbg_ring_path",
+                                    "/tmp/glmdbg_ring_watch.pt")
                     torch.cuda.synchronize()
                     _snap = _ring.detach().clone().cpu()
-                    _tk = _model.topk_indices_buffer[:, :64].clone().cpu()
+                    _tk = _inner.topk_indices_buffer[:, :64].clone().cpu()
                     _tmp = _path + ".tmp"
                     torch.save((_snap, _tk), _tmp)
                     _os.replace(_tmp, _path)
-                except Exception:
-                    pass
+            except Exception:
+                pass
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
