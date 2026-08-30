@@ -608,6 +608,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GLMDBG_GRAPH_DIR": lambda: os.getenv(
         "VLLM_GLMDBG_GRAPH_DIR", "/tmp/glmdbg_graphs"
     ),
+    "VLLM_GLMDBG_RING_WATCH": lambda: os.getenv("VLLM_GLMDBG_RING_WATCH", "0"),
+    "VLLM_GLMDBG_RING_PATH": lambda: os.getenv(
+        "VLLM_GLMDBG_RING_PATH", "/tmp/glmdbg_ring_watch.pt"
+    ),
+    "VLLM_GLMDBG_NORM": lambda: os.getenv("VLLM_GLMDBG_NORM", "0"),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]
