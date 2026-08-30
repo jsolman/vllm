@@ -876,6 +876,11 @@ class SparseAttnIndexer(CustomOp):
     ):
         # FP8 path: single tensor (per-token scale is folded into `weights`).
         # FP4 path: (values, scales) tuple with scales required by the kernel.
+        import os as _os
+        if _os.environ.get("VLLM_GLMDBG_NORM") == "1":
+            _cap = torch.cuda.is_current_stream_capturing()
+            print(f"VLLM_GLMDBG_NORM: indexer fwd capturing={_cap} "
+                  f"rows={hidden_states.shape[0]}", flush=True)
         if isinstance(q_quant, tuple):
             q_values, q_scale = q_quant
         else:
