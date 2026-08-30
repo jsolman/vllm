@@ -241,20 +241,21 @@ class DeepseekV32Model(torch.nn.Module):
         # The ring writes are enqueued during capture and re-execute at
         # replay, so they observe the REAL in-graph data flow. The watcher
         # thread dumps the ring periodically (python can't run at replay).
+        # Always allocate the ring + hook state (capture-safe: the ring
+        # writes re-execute at replay; the runner hook dumps per step).
         import os as _os
-        if _os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1":
-            self._glmdbg_ring = torch.zeros(
-                2, len(self.layers), config.hidden_size,
-                dtype=torch.bfloat16, device=self.device,
-            )
-            self._glmdbg_ring_path = _os.environ.get(
-                "VLLM_GLMDBG_RING_PATH", "/tmp/glmdbg_ring_watch.pt")
-            self._glmdbg_topk_snap = self.topk_indices_buffer.clone()
-            self._glmdbg_ring2 = torch.zeros(
-                2, 2, config.hidden_size,
-                dtype=torch.bfloat16, device=self.device,
-            )
-            self.layers[1]._glmdbg_ring2 = self._glmdbg_ring2
+        self._glmdbg_ring = torch.zeros(
+            2, len(self.layers), config.hidden_size,
+            dtype=torch.bfloat16, device=self.device,
+        )
+        self._glmdbg_ring_path = os.environ.get(
+            "VLLM_GLMDBG_RING_PATH", "/tmp/glmdbg_ring_watch.pt")
+        self._glmdbg_topk_snap = self.topk_indices_buffer.clone()
+        self._glmdbg_ring2 = torch.zeros(
+            2, 2, config.hidden_size,
+            dtype=torch.bfloat16, device=self.device,
+        )
+        self.layers[1]._glmdbg_ring2 = self._glmdbg_ring2
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
