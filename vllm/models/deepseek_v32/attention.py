@@ -531,6 +531,11 @@ class DeepseekV32Attention(MLAAttention):
                     print(f"VLLM_GLMDBG_RING_WATCH: L{_layer} index_k "
                           f"absmax={index_k.float().abs().max().item():.4f} "
                           f"nan={_kn}", flush=True)
+                _mf = mqa_q[0].float()
+                print(f"VLLM_GLMDBG_RING_WATCH: L{_layer} mqa_q[0] "
+                      f"absmax={_mf.abs().max().item():.4f} "
+                      f"nan={torch.isnan(_mf).sum().item()} "
+                      f"inf={torch.isinf(_mf).sum().item()}", flush=True)
         if self.indexer is not None and not self.skip_topk:
             assert index_q_fp8 is not None
             assert index_weights_out is not None
