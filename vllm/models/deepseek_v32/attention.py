@@ -397,6 +397,10 @@ class DeepseekV32Attention(MLAAttention):
         if hasattr(self, "_glmdbg_q_buf") and ".layers.0." in self.layer_name:
             _cap = torch.cuda.is_current_stream_capturing()
             if not _cap:
+                _hs = hidden_states[0].float()
+                print(f"VLLM_GLMDBG_Q: L0 hs_absmax={_hs.abs().max().item():.4f} "
+                      f"hs_bytesum={_hs.sum().item():.2f}", flush=True)
+            if not _cap:
                 # Host-side prints with .item() are ILLEGAL during capture;
                 # only log from eager (breakpoint/replay) executions.
                 print(f"VLLM_GLMDBG_Q: L0 attention fwd #{self._glmdbg_q_step[0]} "
