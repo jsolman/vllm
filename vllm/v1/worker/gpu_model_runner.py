@@ -4301,6 +4301,10 @@ class GPUModelRunner(
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError  # never touch CUDA during capture
                 _m0 = getattr(self, "model", None)
+                # Unwrap graph wrappers (BreakableCUDAGraphWrapper etc.)
+                for _ in range(4):
+                    if hasattr(_m0, "runnable"):
+                        _m0 = _m0.runnable
                 _inner = getattr(_m0, "model", _m0)  # ForCausalLM -> Model
                 _ring = getattr(_inner, "_glmdbg_ring", None)
                 if _ring is None:
