@@ -507,11 +507,21 @@ class DeepseekV32Attention(MLAAttention):
         if (_os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1"
                 and not torch.cuda.is_current_stream_capturing()):
             _layer = self.layer_name.split(".")[2] if self.layer_name else "?"
-            if _layer in ("0", "1", "2", "3", "4", "5"):
-                _n = torch.isnan(output).sum().item()
-                print(f"VLLM_GLMDBG_RING_WATCH: L{_layer} attn-out "
-                      f"absmax={output[0].abs().max().item():.4f} "
-                      f"nan={_n}", flush=True)
+            if _layer in ("0", "1", "2"):
+                if index_q_fp8 is not None:
+                    _q = index_q_fp8
+                    _qn = (torch.isnan(_q.float()).sum().item()
+                           if _q.dtype in (torch.float16, torch.bfloat16,
+                                           torch.float32)
+                           else -1)
+                    print(f"VLLM_GLMDBG_RING_WATCH: L{_layer} index_q_fp8 "
+                          f"absmax={_q.float().abs().max().item():.4f} "
+                          f"nan={_qn}", flush=True)
+                if index_k is not None:
+                    _kn = torch.isnan(index_k.float()).sum().item()
+                    print(f"VLLM_GLMDBG_RING_WATCH: L{_layer} index_k "
+                          f"absmax={index_k.float().abs().max().item():.4f} "
+                          f"nan={_kn}", flush=True)
         if self.indexer is not None and not self.skip_topk:
             assert index_q_fp8 is not None
             assert index_weights_out is not None
