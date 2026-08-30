@@ -214,6 +214,11 @@ class BreakableCUDAGraphCapture:
     def replay(self) -> None:
         for r in self.segments:
             r()
+            # Join the graph's internal streams before the next eager
+            # segment reads its outputs. Without this, the eager break
+            # kernels race the graph's in-flight internal-stream work
+            # (intermittent NaN corruption on multi-node TP).
+            torch.cuda.synchronize()
 
     # --- introspection ---------------------------------------------------
 
