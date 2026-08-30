@@ -504,10 +504,14 @@ class DeepseekV32Attention(MLAAttention):
         output: torch.Tensor,
     ) -> None:
         import os as _os
-        if _os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1":
-            _cap = torch.cuda.is_current_stream_capturing()
-            print(f"VLLM_GLMDBG_RING_WATCH: _sparse_indexer_and_attn "
-                  f"capturing={_cap}", flush=True)
+        if (_os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1"
+                and not torch.cuda.is_current_stream_capturing()):
+            _layer = self.layer_name.split(".")[2] if self.layer_name else "?"
+            if _layer in ("0", "2", "3", "4", "5"):
+                _n = torch.isnan(output).sum().item()
+                print(f"VLLM_GLMDBG_RING_WATCH: L{_layer} attn-out "
+                      f"absmax={output[0].abs().max().item():.4f} "
+                      f"nan={_n}", flush=True)
         if self.indexer is not None and not self.skip_topk:
             assert index_q_fp8 is not None
             assert index_weights_out is not None
