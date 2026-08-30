@@ -236,6 +236,7 @@ class DeepseekV32Model(torch.nn.Module):
             )
             self._glmdbg_ring_path = _os.environ.get(
                 "VLLM_GLMDBG_RING_PATH", "/tmp/glmdbg_ring_watch.pt")
+            self._glmdbg_topk_snap = self.topk_indices_buffer.clone()
 
             def _watch():
                 import time as _time
@@ -247,8 +248,9 @@ class DeepseekV32Model(torch.nn.Module):
                     try:
                         torch.cuda.synchronize()
                         _snap = self._glmdbg_ring.detach().clone().cpu()
+                        _tk = self.topk_indices_buffer[:, :64].clone().cpu()
                         _tmp = self._glmdbg_ring_path + ".tmp"
-                        torch.save(_snap, _tmp)
+                        torch.save((_snap, _tk), _tmp)
                         _os.replace(_tmp, self._glmdbg_ring_path)
                     except Exception:
                         pass
