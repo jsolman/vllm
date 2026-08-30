@@ -634,3 +634,12 @@ class DeepseekV32Attention(MLAAttention):
         torch.bmm(x, self.W_UV, out=out)
         if self.use_pcp and num_actual < output.shape[0]:
             output[num_actual:].zero_()
+        import os as _os
+        if (_os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1"
+                and not torch.cuda.is_current_stream_capturing()):
+            _layer = self.layer_name.split(".")[2] if self.layer_name else "?"
+            if _layer in ("0", "1", "2", "3", "4", "5"):
+                _n = torch.isnan(output).sum().item()
+                print(f"VLLM_GLMDBG_RING_WATCH: L{_layer} MLA-out "
+                      f"absmax={output[0].abs().max().item():.4f} "
+                      f"nan={_n}", flush=True)
