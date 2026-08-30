@@ -239,6 +239,9 @@ class DeepseekV32Model(torch.nn.Module):
 
             def _watch():
                 import time as _time
+                # Skip the startup window: graph capture must not race a
+                # concurrent D2H copy (cudaErrorStreamCaptureInvalidated).
+                _time.sleep(300)
                 while True:
                     _time.sleep(5)
                     try:
