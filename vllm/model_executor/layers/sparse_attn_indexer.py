@@ -755,6 +755,12 @@ def sparse_attn_indexer(
                 topk_indices
             )
 
+    import os as _os
+    if _os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1":
+        _cap = torch.cuda.is_current_stream_capturing()
+        _r0 = topk_indices_buffer[0, :16].tolist() if topk_indices_buffer is not None else None
+        print(f"VLLM_GLMDBG_RING_WATCH: indexer END capturing={_cap} "
+              f"row0={_r0}", flush=True)
     return topk_indices_buffer
 
 
