@@ -756,12 +756,12 @@ def sparse_attn_indexer(
             )
 
     import os as _os
-    if _os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1":
-        _cap = torch.cuda.is_current_stream_capturing()
-        _r0 = (topk_indices_buffer[0, :64].tolist()
+    if (_os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1"
+            and not torch.cuda.is_current_stream_capturing()):
+        _r0 = (topk_indices_buffer[0, :24].tolist()
                if topk_indices_buffer is not None else None)
         _valid = int((topk_indices_buffer[0] >= 0).sum().item()) if topk_indices_buffer is not None else -1
-        print(f"VLLM_GLMDBG_RING_WATCH: indexer END capturing={_cap} "
+        print(f"VLLM_GLMDBG_RING_WATCH: indexer END "
               f"valid={_valid} row0={_r0}", flush=True)
     return topk_indices_buffer
 
