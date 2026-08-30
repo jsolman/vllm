@@ -465,8 +465,8 @@ class DeepseekV32Attention(MLAAttention):
                 if _layer in ("0", "1", "2"):
                     print(f"VLLM_GLMDBG_RING_WATCH: L{_layer} index_q(pre-q) "
                           f"absmax={index_q[0].float().abs().max().item():.4f} "
-                          f"nan={torch.isnan(index_q[0].float()).sum().item()}",
-                          flush=True)
+                          f"nan={torch.isnan(index_q[0].float()).sum().item()} "
+                          f"ptr={index_q.data_ptr()}", flush=True)
         else:
             index_q = None
 
