@@ -443,10 +443,12 @@ class DeepseekV32Attention(MLAAttention):
                     _blk = _u8[_slot0 // _u8.shape[1]]
                     _off = _slot0 % _u8.shape[1]
                     _row = _blk[_off].clone()
+                _dump_path = _os.environ.get(
+                    "VLLM_GLMDBG_Q_PATH", "/tmp/glmdbg_q.pt")
                 torch.save(
                     (self._glmdbg_q_buf.clone(), self._glmdbg_kv_buf.clone(),
                      self._glmdbg_kpe_buf.clone(), _slot0, _row),
-                    "/tmp/glmdbg_q.pt",
+                    _dump_path,
                 )
 
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
