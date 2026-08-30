@@ -507,7 +507,7 @@ class DeepseekV32Attention(MLAAttention):
         if (_os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1"
                 and not torch.cuda.is_current_stream_capturing()):
             _layer = self.layer_name.split(".")[2] if self.layer_name else "?"
-            if _layer in ("0", "2", "3", "4", "5"):
+            if _layer in ("0", "1", "2", "3", "4", "5"):
                 _n = torch.isnan(output).sum().item()
                 print(f"VLLM_GLMDBG_RING_WATCH: L{_layer} attn-out "
                       f"absmax={output[0].abs().max().item():.4f} "
