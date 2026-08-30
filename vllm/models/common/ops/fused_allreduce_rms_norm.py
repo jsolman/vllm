@@ -46,9 +46,6 @@ def fused_allreduce_rms_norm(
     # (platforms/cuda.py is_arch_support_pdl). Fall back to the explicit
     # allreduce + norm path on platforms without PDL support.
     if not current_platform.is_arch_support_pdl():
-        import sys
-        print("GLMARFIX: PDL unsupported - using explicit allreduce fallback",
-              file=sys.stderr, flush=True)
         reduced = tensor_model_parallel_all_reduce(hidden_states)
         return norm(reduced, residual)
 
