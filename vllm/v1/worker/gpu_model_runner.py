@@ -4301,6 +4301,13 @@ class GPUModelRunner(
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError  # never touch CUDA during capture
                 _m0 = getattr(self, "model", None)
+                if _m0 is None:
+                    try:
+                        _m0 = self.get_model()
+                    except Exception:
+                        _m0 = None
+                if _m0 is None:
+                    raise RuntimeError("runner model not loaded yet")
                 # Unwrap graph wrappers (BreakableCUDAGraphWrapper etc.)
                 for _ in range(4):
                     if hasattr(_m0, "runnable"):
