@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
 
+import os
+
 import torch
 
 from vllm.platforms import current_platform
@@ -640,6 +642,7 @@ def _fused_q_kernel(
     INDEX_ROPE_INTERLEAVE: tl.constexpr,
     QUANTIZE_MQA: tl.constexpr,
     USE_PDL: tl.constexpr,
+    DBG_PTR,
 ):
     tok_idx = tl.program_id(0).to(tl.int64)
     pid = tl.program_id(1)
@@ -754,6 +757,10 @@ def _fused_q_kernel(
         index_q_block = tl.arange(0, INDEX_Q_HEAD_DIM)
         iq_base = index_q_ptr + tok_idx * index_q_stride0 + head_idx * index_q_stride1
         index_q = tl.load(iq_base + index_q_block).to(tl.float32)
+        if DBG_PTR is not None:
+            if head_idx == 0:
+                tl.store(DBG_PTR + tok_idx * INDEX_Q_HEAD_DIM + index_q_block,
+                         index_q)
 
         # RoPE in registers (interleaved for GLM-5.2, NeoX for DeepSeek-V3.2),
         # gathering the rotation partner from the read-only input.
@@ -807,6 +814,13 @@ def _fused_q_kernel(
             index_weights_out_ptr + tok_idx * index_weights_out_stride + head_idx,
             index_weights,
         )
+
+
+_DBG_BUFFERS: dict = {}
+
+
+def get_fused_q_dbg_buffers() -> dict:
+    return _DBG_BUFFERS
 
 
 def fused_q(
@@ -915,6 +929,20 @@ def fused_q(
         return index_q_fp8, index_weights_out, mqa_q
 
     use_pdl = current_platform.is_arch_support_pdl()
+    # VLLM_GLMDBG_RING_WATCH: persistent dump buffer for the kernel's
+    # loaded index_q (token 0) - lets the runner hook observe what the
+    # captured kernel ACTUALLY reads at replay.
+    _dbg = None
+    if os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1" and index_q is not None:
+        _key = ("fused_q_dbg", int(index_q.shape[0]), int(index_q.shape[1]),
+                int(index_q.shape[2]))
+        _dbg = _DBG_BUFFERS.get(_key)
+        if _dbg is None:
+            _dbg = torch.full(
+                (_key[1] * _key[2] * _key[3],), float("nan"),
+                dtype=torch.float32, device=q_pe.device,
+            )
+            _DBG_BUFFERS[_key] = _dbg
     _fused_q_kernel[(num_tokens, 3, grid_heads)](
         positions,
         q_pe,
@@ -958,6 +986,7 @@ def fused_q(
         QUANTIZE_MQA=quantize_mqa,
         USE_PDL=use_pdl,
         launch_pdl=use_pdl,
+        DBG_PTR=_dbg if _dbg is not None else index_q_fp8,
         # num_warps=1 is optimal here: each program is a single 128-element
         # rope+quant, so the kernel is program-count/occupancy bound, not
         # per-program compute bound (swept 1/2/4/8 — 1 wins or ties everywhere).
