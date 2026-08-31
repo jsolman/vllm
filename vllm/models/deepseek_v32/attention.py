@@ -456,9 +456,17 @@ class DeepseekV32Attention(MLAAttention):
         ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
 
         if self.indexer is not None and not self.skip_topk:
+            import os as _os
+            if (_os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1"
+                    and not torch.cuda.is_current_stream_capturing()):
+                _layer = self.layer_name.split(".")[2] if self.layer_name else "?"
+                if _layer in ("0", "1"):
+                    print(f"VLLM_GLMDBG_RING_WATCH: L{_layer} q_c(wq_b in) "
+                          f"absmax={q_c[0].float().abs().max().item():.6f} "
+                          f"nan={torch.isnan(q_c[0].float()).sum().item()} "
+                          f"ptr={q_c.data_ptr()}", flush=True)
             index_q = self.indexer.wq_b(q_c)[0]
             index_q = index_q.view(-1, self.indexer.n_head, self.indexer.head_dim)
-            import os as _os
             if (_os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1"
                     and not torch.cuda.is_current_stream_capturing()):
                 _layer = self.layer_name.split(".")[2] if self.layer_name else "?"
