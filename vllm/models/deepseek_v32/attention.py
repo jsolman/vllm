@@ -456,16 +456,26 @@ class DeepseekV32Attention(MLAAttention):
         ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
 
         if self.indexer is not None and not self.skip_topk:
+            index_q_raw = self.indexer.wq_b(q_c)[0]
+            # PERSISTENT index_q buffer: the captured fused_q kernel bakes
+            # the index_q pointer at capture time; a fresh eager allocation
+            # at replay would move the data to a new address and the baked
+            # kernel would read the stale capture-time buffer (NaN). Keep a
+            # stable-address buffer and copy the fresh GEMM output into it.
+            _nt = index_q_raw.shape[0]
+            _buf = getattr(self, "_index_q_persistent", None)
+            if (_buf is None or _buf.shape[0] < _nt
+                    or _buf.device != index_q_raw.device):
+                _cap = max(_nt, 64)
+                self._index_q_persistent = torch.empty(
+                    _cap, self.indexer.n_head, self.indexer.head_dim,
+                    dtype=index_q_raw.dtype, device=index_q_raw.device,
+                )
+                _buf = self._index_q_persistent
+            _buf[:_nt].copy_(index_q_raw.view(_nt, self.indexer.n_head,
+                                              self.indexer.head_dim))
+            index_q = _buf[:_nt]
             import os as _os
-            if (_os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1"
-                    and not torch.cuda.is_current_stream_capturing()):
-                _layer = self.layer_name.split(".")[2] if self.layer_name else "?"
-                if _layer in ("0", "1"):
-                    print(f"VLLM_GLMDBG_RING_WATCH: L{_layer} q_c(wq_b in) "
-                          f"absmax={q_c[0].float().abs().max().item():.6f} "
-                          f"nan={torch.isnan(q_c[0].float()).sum().item()} "
-                          f"ptr={q_c.data_ptr()}", flush=True)
-            index_q = self.indexer.wq_b(q_c)[0]
             if (_os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1"
                     and not torch.cuda.is_current_stream_capturing()):
                 _layer = self.layer_name.split(".")[2] if self.layer_name else "?"
@@ -474,7 +484,6 @@ class DeepseekV32Attention(MLAAttention):
                           f"absmax={index_q[0].float().abs().max().item():.6f} "
                           f"nan={torch.isnan(index_q[0].float()).sum().item()} "
                           f"ptr={index_q.data_ptr()}", flush=True)
-            index_q = index_q.view(-1, self.indexer.n_head, self.indexer.head_dim)
             if (_os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1"
                     and not torch.cuda.is_current_stream_capturing()):
                 _layer = self.layer_name.split(".")[2] if self.layer_name else "?"
