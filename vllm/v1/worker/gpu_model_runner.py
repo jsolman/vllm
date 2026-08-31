@@ -4351,14 +4351,14 @@ class GPUModelRunner(
                     # The per-layer device-side captures (q_c/index_q_fp8/
                     # mqa_q at replay) from the L1 attention:
                     _dev = {}
-                    for _attr in ("_glmdbg_dev_q_c", "_glmdbg_dev_iq",
-                                  "_glmdbg_dev_mqa"):
-                        _t = getattr(_mod.layers[1].self_attn.attn, _attr,
-                                     None) if hasattr(_mod, "layers") else None
-                        if _t is not None:
-                            _dev[_attr] = _t.detach().clone().cpu()
-                    _dev["nt"] = getattr(_mod.layers[1].self_attn.attn,
-                                         "_glmdbg_dev_nt", 0)
+                    _l1attn = getattr(_mod.layers[1].self_attn, None) if hasattr(_mod, "layers") else None
+                    if _l1attn is not None:
+                        for _attr in ("_glmdbg_dev_q_c", "_glmdbg_dev_iq",
+                                      "_glmdbg_dev_mqa"):
+                            _t = getattr(_l1attn, _attr, None)
+                            if _t is not None:
+                                _dev[_attr] = _t.detach().clone().cpu()
+                        _dev["nt"] = getattr(_l1attn, "_glmdbg_dev_nt", 0)
                     torch.save((_snap, _tk, _r2s, _dbg, _dev),
                                f"{_path}.{_n:04d}")
             except Exception as _e:
