@@ -4309,14 +4309,17 @@ class GPUModelRunner(
                 # by arch: ForCausalLM.model, VL .language_model.model, ...)
                 _ring = None
                 _inner = None
-                for _name, _mod in _m0.named_modules():
+                _names = [(_n, _m) for _n, _m in _m0.named_modules()]
+                for _name, _mod in _names:
                     if hasattr(_mod, "_glmdbg_ring"):
                         _ring = _mod._glmdbg_ring
                         _inner = _mod
                         break
                 if _ring is None:
-                    print("VLLM_GLMDBG_RING_WATCH: no _glmdbg_ring on",
-                          type(_inner).__name__, flush=True)
+                    _mtype = type(_m0).__name__
+                    _nmods = len(_names)
+                    print(f"VLLM_GLMDBG_RING_WATCH: no _glmdbg_ring; "
+                          f"model={_mtype} nmodules={_nmods}", flush=True)
                 else:
                     _path = getattr(_mod, "_glmdbg_ring_path",
                                     "/tmp/glmdbg_ring_watch")
