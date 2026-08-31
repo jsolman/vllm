@@ -941,7 +941,7 @@ def fused_q(
         _dbg = _DBG_BUFFERS.get(_key)
         if _dbg is None:
             _dbg = torch.full(
-                (_key[1] * _key[2] * _key[3],), float("nan"),
+                (_key[2] * _key[3] * _key[4],), float("nan"),
                 dtype=torch.float32, device=q_pe.device,
             )
             _DBG_BUFFERS[_key] = _dbg
