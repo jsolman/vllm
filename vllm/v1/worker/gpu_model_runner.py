@@ -4318,8 +4318,14 @@ class GPUModelRunner(
                 if _ring is None:
                     _mtype = type(_m0).__name__
                     _nmods = len(_names)
+                    _lm = getattr(_m0, "language_model", None)
+                    _lmmodel = getattr(_lm, "model", None) if _lm else None
                     print(f"VLLM_GLMDBG_RING_WATCH: no _glmdbg_ring; "
-                          f"model={_mtype} nmodules={_nmods}", flush=True)
+                          f"model={_mtype} nmodules={_nmods} "
+                          f"lm={type(_lm).__name__ if _lm else None} "
+                          f"lmmodel={type(_lmmodel).__name__ if _lmmodel else None} "
+                          f"lmhasring={hasattr(_lmmodel, '_glmdbg_ring') if _lmmodel else '?'}",
+                          flush=True)
                 else:
                     print(f"VLLM_GLMDBG_RING_WATCH: ring FOUND on "
                           f"{type(_inner).__name__}", flush=True)
