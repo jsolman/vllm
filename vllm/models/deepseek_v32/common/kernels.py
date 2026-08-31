@@ -873,7 +873,8 @@ def fused_q(
     # fused_q is shared with the ROCm path, and the CuTeDSL module imports
     # cutlass at module scope, so only reach for it on CUDA.
     cutedsl_kernel: Callable[..., None] | None = None
-    if current_platform.is_cuda():
+    if current_platform.is_cuda() and os.environ.get(
+            "VLLM_GLMDBG_DISABLE_CUTEDSL_FQ") != "1":
         from vllm.models.deepseek_v32.nvidia.ops.fused_q_cutedsl import (
             fused_q_cutedsl,
             is_fused_q_cutedsl_supported,
