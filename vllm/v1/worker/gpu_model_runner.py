@@ -4321,6 +4321,9 @@ class GPUModelRunner(
                     print(f"VLLM_GLMDBG_RING_WATCH: no _glmdbg_ring; "
                           f"model={_mtype} nmodules={_nmods}", flush=True)
                 else:
+                    print(f"VLLM_GLMDBG_RING_WATCH: ring FOUND on "
+                          f"{type(_inner).__name__}", flush=True)
+                else:
                     _path = getattr(_mod, "_glmdbg_ring_path",
                                     "/tmp/glmdbg_ring_watch")
                     _tkbuf = getattr(_mod, "topk_indices_buffer", None)
