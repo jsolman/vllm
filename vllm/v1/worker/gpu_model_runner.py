@@ -4301,6 +4301,10 @@ class GPUModelRunner(
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError  # never touch CUDA during capture
                 _m0 = self.get_model()  # unwraps graph wrappers
+                import os as _os2
+                print(f"VLLM_GLMDBG_RING_WATCH: worker env RING_WATCH="
+                      f"{_os2.environ.get('VLLM_GLMDBG_RING_WATCH', 'MISSING')}",
+                      flush=True)
                 # Search the module tree for the ring (model nesting varies
                 # by arch: ForCausalLM.model, VL .language_model.model, ...)
                 _ring = None
