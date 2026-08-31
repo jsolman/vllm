@@ -102,9 +102,12 @@ def eager_break_during_capture(fn: F) -> F:
             if mode == CUDAGraphMode.FULL:
                 return fn(*args, **kwargs)
 
-        # Weak-ref args: strong refs in the replay lambda pin cudagraph-pool
-        # slots across batch descriptors. cudagraph owns the slot, so the
-        # weak_ref is safe to deref on replay.
+        # Strong-ref args: pin the capture-time tensor objects so their
+        # storage stays allocated at the SAME addresses across replay.
+        # The captured kernels in adjacent segments bake these pointers;
+        # if a capture-time temporary is freed, the pool slot is reused
+        # and the baked pointers read foreign data (NaN) at replay.
+        capture._pin_args(args, kwargs)
         weak_args = tuple(
             weak_ref_tensor(a) if isinstance(a, torch.Tensor) else a for a in args
         )
@@ -193,6 +196,18 @@ class BreakableCUDAGraphCapture:
         self._num_graphs += 1
         self._current_graph = None
         self._capturing = False
+
+    def _pin_args(self, args: tuple, kwargs: dict) -> None:
+        """Hold strong refs to the eager segment's tensor args for the
+        lifetime of the capture (pins their pool addresses)."""
+        if not hasattr(self, "_pinned"):
+            self._pinned = []
+        self._pinned.extend(
+            a for a in args if isinstance(a, torch.Tensor)
+        )
+        self._pinned.extend(
+            v for v in kwargs.values() if isinstance(v, torch.Tensor)
+        )
 
     def add_eager(self, fn: Callable[[], Any]) -> Any:
         """End the current capture segment, run ``fn`` eagerly on the
