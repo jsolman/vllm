@@ -934,9 +934,10 @@ def fused_q(
     # loaded index_q (token 0) - lets the runner hook observe what the
     # captured kernel ACTUALLY reads at replay.
     _dbg = None
+    _tag = os.environ.get("VLLM_GLMDBG_DBG_TAG", "")
     if os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1" and index_q is not None:
-        _key = ("fused_q_dbg", int(index_q.shape[0]), int(index_q.shape[1]),
-                int(index_q.shape[2]))
+        _key = ("fused_q_dbg", _tag, int(index_q.shape[0]),
+                int(index_q.shape[1]), int(index_q.shape[2]))
         _dbg = _DBG_BUFFERS.get(_key)
         if _dbg is None:
             _dbg = torch.full(

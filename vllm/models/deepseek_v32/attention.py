@@ -495,6 +495,7 @@ class DeepseekV32Attention(MLAAttention):
         else:
             index_q = None
 
+        _os.environ["VLLM_GLMDBG_DBG_TAG"] = (self.layer_name or "?")
         index_q_fp8, index_weights_out, mqa_q = fused_q(
             positions,
             q_pe,
