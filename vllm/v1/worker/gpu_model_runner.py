@@ -4348,7 +4348,19 @@ class GPUModelRunner(
                     )
                     _dbg = {k: v.detach().clone().cpu()
                             for k, v in _DBG_BUFFERS.items()}
-                    torch.save((_snap, _tk, _r2s, _dbg), f"{_path}.{_n:04d}")
+                    # The per-layer device-side captures (q_c/index_q_fp8/
+                    # mqa_q at replay) from the L1 attention:
+                    _dev = {}
+                    for _attr in ("_glmdbg_dev_q_c", "_glmdbg_dev_iq",
+                                  "_glmdbg_dev_mqa"):
+                        _t = getattr(_mod.layers[1].self_attn.attn, _attr,
+                                     None) if hasattr(_mod, "layers") else None
+                        if _t is not None:
+                            _dev[_attr] = _t.detach().clone().cpu()
+                    _dev["nt"] = getattr(_mod.layers[1].self_attn.attn,
+                                         "_glmdbg_dev_nt", 0)
+                    torch.save((_snap, _tk, _r2s, _dbg, _dev),
+                               f"{_path}.{_n:04d}")
             except Exception as _e:
                 print("VLLM_GLMDBG_RING_WATCH: hook error:", repr(_e)[:120],
                       flush=True)

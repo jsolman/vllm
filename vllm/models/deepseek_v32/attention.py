@@ -512,6 +512,24 @@ class DeepseekV32Attention(MLAAttention):
             quantize_mqa=self._fp8_query,
         )
 
+        import os as _os2
+        if _os2.environ.get("VLLM_GLMDBG_RING_WATCH") == "1":
+            # Device-side captures of the captured-region tensors: the
+            # copy kernels are part of the graph and re-run at replay,
+            # so these buffers hold the REPLAY-TIME data (unlike the
+            # python probes which only run during capture/prefill).
+            _nt = q_c.shape[0]
+            for _name, _src_t in (("q_c", q_c), ("iq", index_q_fp8),
+                                  ("mqa", mqa_q)):
+                _key = f"_glmdbg_dev_{_name}"
+                _buf = getattr(self, _key, None)
+                if _buf is None or _buf.shape[0] < _nt:
+                    _buf = torch.empty_like(_src_t[:1]).expand(
+                        max(_nt, 1), *_src_t.shape[1:]).contiguous()
+                    setattr(self, _key, _buf)
+                _buf[:_nt].copy_(_src_t[:_nt])
+            self._glmdbg_dev_nt = _nt
+
         self._sparse_indexer_and_attn(
             q_c,
             index_q_fp8,
