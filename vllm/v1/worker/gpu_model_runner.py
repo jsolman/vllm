@@ -4333,7 +4333,12 @@ class GPUModelRunner(
                     _r2 = getattr(_mod, "_glmdbg_ring2", None)
                     _r2s = (_r2.detach().clone().cpu()
                             if _r2 is not None else None)
-                    torch.save((_snap, _tk, _r2s), f"{_path}.{_n:04d}")
+                    from vllm.models.deepseek_v32.common.kernels import (
+                        _DBG_BUFFERS,
+                    )
+                    _dbg = {k: v.detach().clone().cpu()
+                            for k, v in _DBG_BUFFERS.items()}
+                    torch.save((_snap, _tk, _r2s, _dbg), f"{_path}.{_n:04d}")
             except Exception as _e:
                 print("VLLM_GLMDBG_RING_WATCH: hook error:", repr(_e)[:120],
                       flush=True)
