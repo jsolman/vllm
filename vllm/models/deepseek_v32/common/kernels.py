@@ -69,6 +69,7 @@ def _fp8_quant_and_cache_write(
     kv_cache_scale_ptr,
     cache_block_size,
     cache_stride,
+    num_cache_blocks,
     offsets,
     HEAD_DIM: tl.constexpr,
 ):
@@ -76,15 +77,19 @@ def _fp8_quant_and_cache_write(
 
     block_idx = slot_idx // cache_block_size
     block_offset = slot_idx % cache_block_size
+    # Bounds guard: a slot beyond the allocated cache blocks must NEVER write
+    # (the pointer arithmetic would land in foreign memory and corrupt it).
+    in_cache = block_idx < num_cache_blocks
     block_start = block_idx * cache_block_size * cache_stride
 
     tl.store(
         kv_cache_ptr + block_start + block_offset * HEAD_DIM + offsets,
         k_fp8,
-        mask=mask,
+        mask=mask & in_cache,
     )
     scale_byte_off = block_start + cache_block_size * HEAD_DIM + block_offset * 4
-    tl.store(kv_cache_scale_ptr + scale_byte_off // 4, scale)
+    tl.store(kv_cache_scale_ptr + scale_byte_off // 4, scale, mask=in_cache)
+
 
 
 @triton.jit
@@ -136,11 +141,13 @@ def _fused_norm_rope_kernel(
     indexer_cache_scale_ptr,
     indexer_cache_block_size,
     indexer_cache_stride,
+    IDX_CACHE_NUM_BLOCKS,
     # MLA KV cache (concat kv_c_normed + k_pe_roped, uses slot_mapping_ptr)
     mla_cache_ptr,
     mla_cache_block_stride,
     mla_cache_entry_stride,
     MLA_CACHE_BLOCK_SIZE: tl.constexpr,
+    MLA_CACHE_NUM_BLOCKS,
     MLA_CACHE_FP8: tl.constexpr,
     mla_cache_scale_ptr,
     # fp8_ds_mla cache views (block-scaled fp8 NoPE + unquantized bf16 RoPE).
@@ -253,6 +260,9 @@ def _fused_norm_rope_kernel(
             mla_block_size = MLA_CACHE_BLOCK_SIZE
             mla_block_idx = slot_idx // mla_block_size
             mla_block_off = slot_idx % mla_block_size
+            # Bounds guard: a slot beyond the allocated cache blocks must
+            # NEVER write (pointer arithmetic would corrupt foreign memory).
+            mla_in_cache = mla_block_idx < MLA_CACHE_NUM_BLOCKS
 
             if MLA_CACHE_DS_MLA:
                 # fp8_ds_mla layout (DeepSeek-V3.2, KV_DIM == 512): per-128-element
@@ -273,11 +283,12 @@ def _fused_norm_rope_kernel(
                 # concat_and_cache_ds_mla kernel; floored to FLT_MIN.
                 tile_scale = tl.maximum(tile_amax * (1.0 / 448.0), 1.1754944e-38)
                 kv_c_fp8 = tl.reshape((kv_2d / tile_scale).to(tl.float8e4nv), (KV_DIM,))
-                tl.store(mla_cache_ptr + byte_base + kv_block, kv_c_fp8)
+                tl.store(mla_cache_ptr + byte_base + kv_block, kv_c_fp8, mask=mla_in_cache)
                 tile_off = tl.arange(0, MLA_NUM_TILES)
                 tl.store(
                     mla_cache_ds_scale_ptr + byte_base // 4 + KV_DIM // 4 + tile_off,
                     tl.reshape(tile_scale, (MLA_NUM_TILES,)),
+                    mask=mla_in_cache,
                 )
                 rope_dst = mla_cache_ds_rope_ptr + byte_base // 2 + (KV_DIM // 2 + 8)
                 tl.store(rope_dst + dim_off * 2, r1.to(tl.bfloat16))
@@ -293,19 +304,26 @@ def _fused_norm_rope_kernel(
             if MLA_CACHE_FP8:
                 scale = tl.load(mla_cache_scale_ptr)
                 kv_c_fp8 = (kv_c.to(tl.float32) / scale).to(tl.float8e4nv)
-                tl.store(dst + kv_block, kv_c_fp8)
+                tl.store(dst + kv_block, kv_c_fp8, mask=mla_in_cache)
             else:
-                tl.store(dst + kv_block, kv_c)
+                tl.store(dst + kv_block, kv_c, mask=mla_in_cache)
             # k_pe_roped (from registers, interleaved layout)
             if MLA_CACHE_FP8:
-                tl.store(dst + KV_DIM + dim_off * 2, (r1 / scale).to(tl.float8e4nv))
+                tl.store(
+                    dst + KV_DIM + dim_off * 2,
+                    (r1 / scale).to(tl.float8e4nv),
+                    mask=mla_in_cache,
+                )
                 tl.store(
                     dst + KV_DIM + dim_off * 2 + 1,
                     (r2 / scale).to(tl.float8e4nv),
+                    mask=mla_in_cache,
                 )
             else:
-                tl.store(dst + KV_DIM + dim_off * 2, r1)
-                tl.store(dst + KV_DIM + dim_off * 2 + 1, r2)
+                tl.store(dst + KV_DIM + dim_off * 2, r1, mask=mla_in_cache)
+                tl.store(
+                    dst + KV_DIM + dim_off * 2 + 1, r2, mask=mla_in_cache
+                )
     elif pid == 0:
         if not HAS_INDEXER:
             # Shared layer: no indexer K to process.
@@ -404,6 +422,7 @@ def _fused_norm_rope_kernel(
                 indexer_cache_scale_ptr,
                 indexer_cache_block_size,
                 indexer_cache_stride,
+                IDX_CACHE_NUM_BLOCKS,
                 index_k_block,
                 INDEX_K_DIM,
             )
@@ -576,11 +595,21 @@ def fused_norm_rope(
         idx_cache_scale_view,
         idx_cache_block_size,
         idx_cache_stride,
+        (
+            indexer_k_cache.shape[0]
+            if indexer_k_cache is not None
+            else 0
+        ),
         # MLA KV cache (uses same slot_mapping)
         mla_kv_cache,
         mla_block_stride,
         mla_entry_stride,
         mla_block_size,
+        (
+            mla_kv_cache.shape[0]
+            if mla_kv_cache is not None
+            else 0
+        ),
         mla_cache_fp8,
         mla_k_scale,
         mla_ds_scale_view,
