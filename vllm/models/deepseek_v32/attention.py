@@ -305,6 +305,7 @@ class DeepseekV32Attention(MLAAttention):
         slot_mapping = forward_context.slot_mapping
         assert isinstance(slot_mapping, dict)
         mla_slot = slot_mapping.get(self.layer_name)
+        attn_metadata = forward_context.attn_metadata
 
         if self.indexer is not None and not self.skip_topk:
             has_indexer = True
