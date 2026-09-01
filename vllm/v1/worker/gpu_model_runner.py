@@ -4351,7 +4351,7 @@ class GPUModelRunner(
                     # The per-layer device-side captures (q_c/index_q_fp8/
                     # mqa_q at replay) from the L1 attention:
                     _dev = {}
-                    _l1attn = getattr(_mod.layers[1].self_attn, None) if hasattr(_mod, "layers") else None
+                    _l1attn = getattr(_mod.layers[1], "self_attn", None) if hasattr(_mod, "layers") else None
                     if _l1attn is not None:
                         for _attr in ("_glmdbg_dev_q_c", "_glmdbg_dev_iq",
                                       "_glmdbg_dev_mqa"):
