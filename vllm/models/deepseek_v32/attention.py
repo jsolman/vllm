@@ -327,11 +327,40 @@ class DeepseekV32Attention(MLAAttention):
             indexer_softmax_scale = 0.0
             indexer_n_head_scale = 0.0
 
-        if forward_context.attn_metadata is None or self.use_pcp:
+        if self.use_pcp:
             mla_kv_cache = None
             mla_k_scale = None
             indexer_k_cache = None
             mla_slot = None
+        elif attn_metadata is None:
+            # Capture-time break python: the compiled-PIECEWISE capture runs the
+            # model's python with NO attention metadata (the capture runner builds
+            # it only for FULL graphs / eager replays). The captured
+            # fused_norm_rope launch must bake the REAL bound cache views and the
+            # persistent slot-mapping buffer here — NOT dummy/None caches. With
+            # the persistent buffer filled with PAD_SLOT_ID=-1 during capture the
+            # kernel returns early (no write); at replay the same buffer carries
+            # the real per-step slots, so the baked in-graph kernel writes the
+            # correct KV rows. Baking dummy caches here previously starved every
+            # decode replay of its KV-cache write (jibberish root cause).
+            if (
+                mla_slot is not None
+                and self.kv_cache.numel() > 0
+            ):
+                mla_kv_cache = self.kv_cache
+                mla_k_scale = self._k_scale
+            else:
+                mla_kv_cache = None
+                mla_k_scale = None
+                mla_slot = None
+            if (
+                mla_slot is not None
+                and self.indexer is not None
+                and self.indexer.k_cache.kv_cache.numel() > 0
+            ):
+                indexer_k_cache = self.indexer.k_cache.kv_cache
+            else:
+                indexer_k_cache = None
         else:
             mla_kv_cache = self.kv_cache
             mla_k_scale = self._k_scale
