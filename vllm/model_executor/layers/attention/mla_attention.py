@@ -1125,7 +1125,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         return output_padded
 
     def _use_sparse_mha(self, attn_metadata: "MLACommonMetadata") -> bool:
-        prefill = attn_metadata.prefill
+        # XPUMLASparseMetadata (TRITON_MLA_SPARSE builder) serves all tokens
+        # through the sparse MQA path and carries no .prefill object.
+        prefill = getattr(attn_metadata, "prefill", None)
         if prefill is None:
             return False
         use_masked_mha = (
