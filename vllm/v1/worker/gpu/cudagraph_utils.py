@@ -29,34 +29,9 @@ from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 
-# --- GLMDBG_GRAPH: global CUDAGraph dump hook ----------------------------
-# Wraps CUDAGraph.capture_end at class level so EVERY graph captured in this
-# process gets its node list dumped (torch.debug_dump requires
-# enable_debug_mode() before capture, also handled here).
-import os as _os
-if _os.environ.get("VLLM_GLMDBG_GRAPH") == "1":
-    _orig_begin = torch.cuda.CUDAGraph.capture_begin
-    _orig_end = torch.cuda.CUDAGraph.capture_end
-    _graph_counter = [0]
 
-    def _glmdbg_capture_begin(self, *args, **kwargs):
-        self.enable_debug_mode()
-        return _orig_begin(self, *args, **kwargs)
 
-    def _glmdbg_capture_end(self, *args, **kwargs):
-        _r = _orig_end(self, *args, **kwargs)
-        _graph_counter[0] += 1
-        _dir = _os.environ.get("VLLM_GLMDBG_GRAPH_DIR", "/tmp/glmdbg_graphs")
-        try:
-            self.debug_dump(f"{_dir}/graph_{_graph_counter[0]}.dot")
-        except Exception as _e:
-            print(f"VLLM_GLMDBG_GRAPH dump failed: {_e}", flush=True)
-        return _r
 
-    torch.cuda.CUDAGraph.capture_begin = _glmdbg_capture_begin
-    torch.cuda.CUDAGraph.capture_end = _glmdbg_capture_end
-    print("VLLM_GLMDBG_GRAPH: global capture hooks installed", flush=True)
-# -------------------------------------------------------------------------
 
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors

@@ -112,8 +112,6 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
-        if getattr(config, "index_topk", None) == 2048 and self.layer_idx == 1:
-            self._glmdbg_dbg_layer = 0  # marker for L1 probes
 
     def forward(
         self,
@@ -154,21 +152,10 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
             hidden_states, residual = fused_allreduce_rms_norm(
                 hidden_states, residual, self.post_attention_layernorm
             )
-        # VLLM_GLMDBG_RING_WATCH: L1 post-attention fingerprint (slot 2)
-        import os as _os
-        if (getattr(self, "_glmdbg_dbg_layer", None) is not None
-                and hasattr(self, "_glmdbg_ring2")):
-            x = (hidden_states if residual is None
-                 else hidden_states + residual)
-            self._glmdbg_ring2[0, self._glmdbg_dbg_layer] = x[0]
-
         if self.use_sequence_parallel and isinstance(self.mlp, DeepseekV2MoE):
             hidden_states = self.mlp(hidden_states, already_sequence_parallel=True)
         else:
             hidden_states = self.mlp(hidden_states)
-        if (getattr(self, "_glmdbg_dbg_layer", None) is not None
-                and hasattr(self, "_glmdbg_ring2")):
-            self._glmdbg_ring2[1, self._glmdbg_dbg_layer] = hidden_states[0]
         return hidden_states, residual
 
 
@@ -237,26 +224,6 @@ class DeepseekV32Model(torch.nn.Module):
         self.aux_hidden_state_layers = tuple[int, ...]()
         self.num_redundant_experts = parallel_config.eplb_config.num_redundant_experts
 
-        # VLLM_GLMDBG_RING_WATCH: capture-safe per-layer ring + watcher.
-        # The ring writes are enqueued during capture and re-execute at
-        # replay, so they observe the REAL in-graph data flow. The watcher
-        # thread dumps the ring periodically (python can't run at replay).
-        # Always allocate the ring + hook state (capture-safe: the ring
-        # writes re-execute at replay; the runner hook dumps per step).
-        import os as _os
-        self._glmdbg_ring = torch.zeros(
-            2, len(self.layers), config.hidden_size,
-            dtype=torch.bfloat16, device=self.device,
-        )
-        self._glmdbg_ring_path = _os.environ.get(
-            "VLLM_GLMDBG_RING_PATH", "/tmp/glmdbg_ring_watch.pt")
-        self._glmdbg_topk_snap = self.topk_indices_buffer.clone()
-        self._glmdbg_ring2 = torch.zeros(
-            2, 2, config.hidden_size,
-            dtype=torch.bfloat16, device=self.device,
-        )
-        self.layers[1]._glmdbg_ring2 = self._glmdbg_ring2
-
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -304,11 +271,6 @@ class DeepseekV32Model(torch.nn.Module):
             assert residual is None, "Currently, SP is not supported with PP"
 
         aux_hidden_states = []
-        if hasattr(self, "_glmdbg_ring"):
-            # Pre-layer input fingerprint: ring[1, 0] = L0's input (token 0).
-            x0 = (hidden_states if residual is None
-                  else hidden_states + residual)
-            self._glmdbg_ring[1, 0] = x0[0]
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -319,10 +281,6 @@ class DeepseekV32Model(torch.nn.Module):
                 )
             hidden_states, residual = layer(positions, hidden_states, residual, attn_in)
             attn_in = None
-            if hasattr(self, "_glmdbg_ring"):
-                x = (hidden_states if residual is None
-                     else hidden_states + residual)
-                self._glmdbg_ring[0, idx] = x[0]
 
         if not get_pp_group().is_last_rank:
             assert not self.use_sequence_parallel, (

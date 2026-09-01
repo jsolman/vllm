@@ -406,80 +406,6 @@ class DeepseekV32Attention(MLAAttention):
             index_k_out=index_k_out,
         )
 
-        # VLLM_GLMDBG_Q: capture the first token's post-rope query + kv
-        # inputs at the attention breakpoint (python re-executes per step,
-        # so this observes LIVE captured-segment outputs).
-        import os as _os
-        if (_os.environ.get("VLLM_GLMDBG_Q") == "1"
-                and not getattr(self, "_glmdbg_q_init", False)):
-            self._glmdbg_q_buf = torch.zeros(
-                2, 2, q_c.shape[-1], dtype=torch.bfloat16, device=q_c.device
-            )
-            self._glmdbg_kv_buf = torch.zeros(
-                2, 2, kv_c.shape[-1], dtype=torch.bfloat16, device=q_c.device
-            )
-            self._glmdbg_kpe_buf = torch.zeros(
-                2, 2, k_pe.shape[-1], dtype=torch.bfloat16, device=q_c.device
-            )
-            self._glmdbg_q_step = [0]
-            self._glmdbg_q_init = True
-        if hasattr(self, "_glmdbg_q_buf") and ".layers.0." in self.layer_name:
-            _cap = torch.cuda.is_current_stream_capturing()
-            if not _cap:
-                _hs = hidden_states[0].float()
-                print(f"VLLM_GLMDBG_Q: L0 hs_absmax={_hs.abs().max().item():.4f} "
-                      f"hs_bytesum={_hs.sum().item():.2f}", flush=True)
-                # Metadata forensics: block_table row 0 + req_id_per_token[0]
-                # + num_actual_tokens - the index-conversion inputs.
-                if attn_metadata is not None:
-                    _bt = attn_metadata.block_table
-                    _rq = attn_metadata.req_id_per_token
-                    print(f"VLLM_GLMDBG_Q: L0 bt_row0={_bt[0,:8].tolist()} "
-                          f"bt_shape={list(_bt.shape)} "
-                          f"req0={_rq[:4].tolist()} "
-                          f"num_actual={attn_metadata.num_actual_tokens} "
-                          f"max_seq_len={attn_metadata.max_seq_len}", flush=True)
-            if not _cap:
-                # Host-side prints with .item() are ILLEGAL during capture;
-                # only log from eager (breakpoint/replay) executions.
-                print(f"VLLM_GLMDBG_Q: L0 attention fwd #{self._glmdbg_q_step[0]} "
-                      f"slot0={mla_slot[0].item() if mla_slot is not None else 'NA'} "
-                      f"q_absmax={q_c[0].abs().max().item():.4f}", flush=True)
-            p = self._glmdbg_q_step[0] % 2
-            self._glmdbg_q_buf[p, 0] = q_c[0]
-            self._glmdbg_kv_buf[p, 0] = kv_c[0]
-            self._glmdbg_kpe_buf[p, 0] = k_pe[0]
-            # Weight-integrity check: the RMS norm weight must be identical
-            # every call. If a captured kernel aliases its output buffer over
-            # the weight, this absmax changes between calls.
-            if not hasattr(self, "_glmdbg_w_ref"):
-                self._glmdbg_w_ref = self.q_a_layernorm.weight.detach().clone()
-            if not _cap:
-                _wd = (self.q_a_layernorm.weight.detach().float()
-                       - self._glmdbg_w_ref.float()).abs().max().item()
-                print(f"VLLM_GLMDBG_Q: L0 q_a_rms_weight drift={_wd:.6f} "
-                      f"w_absmax={self.q_a_layernorm.weight.abs().max().item():.4f}",
-                      flush=True)
-            self._glmdbg_q_step[0] += 1
-            if (_os.environ.get("VLLM_GLMDBG_DUMP") == "1"
-                    and self._glmdbg_q_step[0] % 2 == 0):
-                # Also dump the MLA cache row for token 0 (written by the
-                # captured fused_norm_rope) + the slot_mapping value.
-                _slot0 = int(mla_slot[0].item()) if mla_slot is not None else -1
-                _row = None
-                if mla_kv_cache is not None and _slot0 >= 0:
-                    _u8 = mla_kv_cache.view(torch.uint8)
-                    _blk = _u8[_slot0 // _u8.shape[1]]
-                    _off = _slot0 % _u8.shape[1]
-                    _row = _blk[_off].clone()
-                _dump_path = _os.environ.get(
-                    "VLLM_GLMDBG_Q_PATH", "/tmp/glmdbg_q.pt")
-                torch.save(
-                    (self._glmdbg_q_buf.clone(), self._glmdbg_kv_buf.clone(),
-                     self._glmdbg_kpe_buf.clone(), _slot0, _row),
-                    _dump_path,
-                )
-
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
@@ -504,27 +430,9 @@ class DeepseekV32Attention(MLAAttention):
             _buf[:_nt].copy_(index_q_raw.view(_nt, self.indexer.n_head,
                                               self.indexer.head_dim))
             index_q = _buf[:_nt]
-            import os as _os
-            if (_os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1"
-                    and not torch.cuda.is_current_stream_capturing()):
-                _layer = self.layer_name.split(".")[2] if self.layer_name else "?"
-                if _layer in ("0", "1"):
-                    print(f"VLLM_GLMDBG_RING_WATCH: L{_layer} wq_b OUT "
-                          f"absmax={index_q[0].float().abs().max().item():.6f} "
-                          f"nan={torch.isnan(index_q[0].float()).sum().item()} "
-                          f"ptr={index_q.data_ptr()}", flush=True)
-            if (_os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1"
-                    and not torch.cuda.is_current_stream_capturing()):
-                _layer = self.layer_name.split(".")[2] if self.layer_name else "?"
-                if _layer in ("0", "1", "2"):
-                    print(f"VLLM_GLMDBG_RING_WATCH: L{_layer} index_q(pre-q) "
-                          f"absmax={index_q[0].float().abs().max().item():.4f} "
-                          f"nan={torch.isnan(index_q[0].float()).sum().item()} "
-                          f"ptr={index_q.data_ptr()}", flush=True)
         else:
             index_q = None
 
-        _os.environ["VLLM_GLMDBG_DBG_TAG"] = (self.layer_name or "?")
         index_q_fp8, index_weights_out, mqa_q = fused_q(
             positions,
             q_pe,
@@ -540,24 +448,6 @@ class DeepseekV32Attention(MLAAttention):
             index_rope_interleave=self._index_rope_interleave,
             quantize_mqa=self._fp8_query,
         )
-
-        import os as _os2
-        if _os2.environ.get("VLLM_GLMDBG_RING_WATCH") == "1":
-            # Device-side captures of the captured-region tensors: the
-            # copy kernels are part of the graph and re-run at replay,
-            # so these buffers hold the REPLAY-TIME data (unlike the
-            # python probes which only run during capture/prefill).
-            _nt = q_c.shape[0]
-            for _name, _src_t in (("q_c", q_c), ("iq", index_q_fp8),
-                                  ("mqa", mqa_q)):
-                _key = f"_glmdbg_dev_{_name}"
-                _buf = getattr(self, _key, None)
-                if _buf is None or _buf.shape[0] < _nt:
-                    _buf = torch.empty_like(_src_t[:1]).expand(
-                        max(_nt, 1), *_src_t.shape[1:]).contiguous()
-                    setattr(self, _key, _buf)
-                _buf[:_nt].copy_(_src_t[:_nt])
-            self._glmdbg_dev_nt = _nt
 
         self._sparse_indexer_and_attn(
             q_c,
@@ -585,30 +475,6 @@ class DeepseekV32Attention(MLAAttention):
         mqa_q: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        import os as _os
-        if (_os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1"
-                and not torch.cuda.is_current_stream_capturing()):
-            _layer = self.layer_name.split(".")[2] if self.layer_name else "?"
-            if _layer in ("0", "1", "2"):
-                if index_q_fp8 is not None:
-                    _q = index_q_fp8
-                    _qn = (torch.isnan(_q.float()).sum().item()
-                           if _q.dtype in (torch.float16, torch.bfloat16,
-                                           torch.float32)
-                           else -1)
-                    print(f"VLLM_GLMDBG_RING_WATCH: L{_layer} index_q_fp8 "
-                          f"absmax={_q.float().abs().max().item():.4f} "
-                          f"nan={_qn}", flush=True)
-                if index_k is not None:
-                    _kn = torch.isnan(index_k.float()).sum().item()
-                    print(f"VLLM_GLMDBG_RING_WATCH: L{_layer} index_k "
-                          f"absmax={index_k.float().abs().max().item():.4f} "
-                          f"nan={_kn}", flush=True)
-                _mf = mqa_q[0].float()
-                print(f"VLLM_GLMDBG_RING_WATCH: L{_layer} mqa_q[0] "
-                      f"absmax={_mf.abs().max().item():.4f} "
-                      f"nan={torch.isnan(_mf).sum().item()} "
-                      f"inf={torch.isinf(_mf).sum().item()}", flush=True)
         if self.indexer is not None and not self.skip_topk:
             assert index_q_fp8 is not None
             assert index_weights_out is not None
@@ -731,12 +597,3 @@ class DeepseekV32Attention(MLAAttention):
         torch.bmm(x, self.W_UV, out=out)
         if self.use_pcp and num_actual < output.shape[0]:
             output[num_actual:].zero_()
-        import os as _os
-        if (_os.environ.get("VLLM_GLMDBG_RING_WATCH") == "1"
-                and not torch.cuda.is_current_stream_capturing()):
-            _layer = self.layer_name.split(".")[2] if self.layer_name else "?"
-            if _layer in ("0", "1", "2", "3", "4", "5"):
-                _n = torch.isnan(output).sum().item()
-                print(f"VLLM_GLMDBG_RING_WATCH: L{_layer} MLA-out "
-                      f"absmax={output[0].abs().max().item():.4f} "
-                      f"nan={_n}", flush=True)
