@@ -399,8 +399,10 @@ class DeepseekV32Attention(MLAAttention):
             if not _cap:
                 # One-shot metadata-presence forensics: WHY is attn_metadata None
                 # during capture-time break executions (slot0=NA, no bt_row0)?
-                if not getattr(self, "_glmdbg_meta_probe", False):
-                    self._glmdbg_meta_probe = True
+                self._glmdbg_meta_probe = (
+                    getattr(self, "_glmdbg_meta_probe", 0) + 1
+                )
+                if self._glmdbg_meta_probe % 4 == 1:
                     _raw = attn_metadata_raw
                     _type = type(_raw).__name__
                     if isinstance(_raw, dict):
