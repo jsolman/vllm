@@ -426,26 +426,6 @@ class DeepseekV32Attention(MLAAttention):
         if hasattr(self, "_glmdbg_q_buf") and ".layers.0." in self.layer_name:
             _cap = torch.cuda.is_current_stream_capturing()
             if not _cap:
-                # One-shot metadata-presence forensics: WHY is attn_metadata None
-                # during capture-time break executions (slot0=NA, no bt_row0)?
-                self._glmdbg_meta_probe = (
-                    getattr(self, "_glmdbg_meta_probe", 0) + 1
-                )
-                if self._glmdbg_meta_probe % 4 == 1:
-                    _raw = attn_metadata_raw
-                    _type = type(_raw).__name__
-                    if isinstance(_raw, dict):
-                        _keys = list(_raw.keys())[:4]
-                        _has_l0 = self.layer_name in _raw
-                    elif isinstance(_raw, list):
-                        _keys = (list(_raw[0].keys())[:4] if _raw and
-                                 isinstance(_raw[0], dict) else None)
-                        _has_l0 = bool(_raw) and self.layer_name in _raw[0]
-                    else:
-                        _keys = None
-                        _has_l0 = _raw is not None
-                    print(f"VLLM_GLMDBG_Q: L0 meta_probe type={_type} "
-                          f"has_l0={_has_l0} sample_keys={_keys}", flush=True)
                 _hs = hidden_states[0].float()
                 print(f"VLLM_GLMDBG_Q: L0 hs_absmax={_hs.abs().max().item():.4f} "
                       f"hs_bytesum={_hs.sum().item():.2f}", flush=True)
