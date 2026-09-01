@@ -203,7 +203,34 @@ class BreakableCUDAGraphCapture:
         downstream dependencies via static output buffers.
         """
         self._end_segment()
-        result = fn()
+        # Run the eager break's allocations in a PRIVATE persistent pool so
+        # that at replay the same allocations land at the SAME addresses.
+        # Without this, the replay-time allocations come from the default
+        # caching allocator, whose cached blocks overlap the capture-time
+        # break buffers that downstream captured segments baked pointers
+        # to - corrupting them (NaN) intermittently.
+        import torch as _torch
+        if not hasattr(self, "_break_pools"):
+            self._break_pools = []
+        if len(self._break_pools) <= self._num_eager_breaks:
+            self._break_pools.append(_torch.cuda.graph_pool_handle())
+            first_call = True
+        else:
+            first_call = False
+        _bp = self._break_pools[self._num_eager_breaks]
+        _pinned = []
+        if first_call:
+            # First (capture-time) call: run normally, then pin the graph-
+            # pool tensors this break produced so the reserved addresses
+            # stay stable.
+            result = fn()
+            self.segments.append(fn)
+            self._num_eager_breaks += 1
+            self._begin_segment()
+            return result
+        # Replay-time call: allocate from this break's private pool.
+        with _torch.cuda.use_mem_pool(_bp):
+            result = fn()
         self.segments.append(fn)
         self._num_eager_breaks += 1
         self._begin_segment()
