@@ -197,31 +197,8 @@ class ParserEngine(Parser):
 
     def finish_streaming(self) -> DeltaMessage | None:
         events = self._engine.finish()
-        # A recovery hold that was active going into finish() gets rolled
-        # back by engine.finish() (abort re-emits the held text), and a
-        # recovery commit may have consumed reasoning-end in the same batch.
-        # In both cases the deferred trailing whitespace belongs BEFORE the
-        # finish-time text, restoring the original stream order.
-        _recovery_finish = bool(
-            getattr(self._engine, "_recovery_hold_active", False)
-            or getattr(self._engine, "recovery_rolled_back_at_finish", False)
-            or getattr(self._engine, "recovery_committed", False)
-        )
         if events or self._deferred_content:
-            delta = self._events_to_delta(events, finished=True)
-            if self._deferred_reasoning and _recovery_finish:
-                if delta is None:
-                    delta = DeltaMessage(reasoning=self._deferred_reasoning)
-                elif delta.reasoning is not None:
-                    delta.reasoning = self._deferred_reasoning + delta.reasoning
-                else:
-                    delta.reasoning = self._deferred_reasoning
-                self._deferred_reasoning = ""
-            return delta
-        if self._deferred_reasoning and _recovery_finish:
-            delta = DeltaMessage(reasoning=self._deferred_reasoning)
-            self._deferred_reasoning = ""
-            return delta
+            return self._events_to_delta(events, finished=True)
         return None
 
     def _reset(self, initial_state: ParserState | None = None) -> None:
@@ -517,11 +494,6 @@ class ParserEngine(Parser):
             ):
                 return None
         elif self._deferred_reasoning and self._reasoning_ended:
-            if delta is not None and (delta.content or delta.tool_calls):
-                # Reasoning ended within this same delta (e.g. a recovered
-                # tool call committed): the deferred trailing whitespace is
-                # part of the reasoning text, not a continuation marker.
-                delta.reasoning = (delta.reasoning or "") + self._deferred_reasoning
             self._deferred_reasoning = ""
         return delta
 

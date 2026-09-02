@@ -92,7 +92,7 @@ class ParserEngineReasoningAdapter(ReasoningParser):
     ) -> DeltaMessage | None:
         self._streaming_count_valid = True
         with self._skip_tool_parsing():
-            _r = self._parser_engine.extract_reasoning_streaming(
+            return self._parser_engine.extract_reasoning_streaming(
                 previous_text,
                 current_text,
                 delta_text,
@@ -100,7 +100,6 @@ class ParserEngineReasoningAdapter(ReasoningParser):
                 current_token_ids,
                 delta_token_ids,
             )
-        return _r
 
     @property
     def reasoning_start_str(self) -> str | None:
@@ -118,16 +117,6 @@ class ParserEngineReasoningAdapter(ReasoningParser):
         with self._skip_tool_parsing():
             self._parser_engine._check_skip_tool_parsing(request)
         return request
-
-    def flush_deferred_reasoning_whitespace(self) -> DeltaMessage | None:
-        engine_ws = getattr(
-            self._parser_engine, "flush_deferred_reasoning_whitespace", None
-        )
-        if engine_ws is not None:
-            return engine_ws()
-        # _parser_engine may be a raw StreamingParserEngine (no ParserEngine
-        # deferral layer): nothing to flush in that case.
-        return None
 
     def has_engine_confirmed_reasoning_end(self) -> bool:
         return self._parser_engine.reasoning_ended
@@ -221,13 +210,6 @@ class ParserEngineToolAdapter(ToolParser):
 
     def finish_streaming(self) -> DeltaMessage | None:
         return self._parser_engine.finish_streaming()
-
-    def flush_deferred_reasoning_whitespace(self) -> DeltaMessage | None:
-        return (
-            self._parser_engine.finish_streaming()
-            if False
-            else (self._parser_engine.flush_deferred_reasoning_whitespace())
-        )
 
 
 def make_adapters(
