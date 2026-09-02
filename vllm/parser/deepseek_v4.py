@@ -256,6 +256,7 @@ class DeepSeekV4Parser(ParserEngine):
         super()._check_skip_tool_parsing(request)
         self._recovery_request_tools = list(getattr(request, "tools", None) or [])
         self._recovery_suppressed = getattr(request, "tool_choice", None) == "none"
+        self._engine.recovery_tools_suppressed = self._recovery_suppressed
 
     def _can_recover_tool_name(self, name: str) -> bool:
         return bool(
