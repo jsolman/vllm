@@ -162,17 +162,17 @@ class TestArgConverter:
         result = json.loads(_dsml_arg_converter(raw, partial=False))
         assert result == {"city": "Tokyo\n"}
 
-    def test_implicit_close_preserves_malformed_text(self):
+    def test_implicit_close_drops_malformed_value(self):
+        # A mis-spelled closer makes the value untrustworthy; the value is
+        # bounded at the DSML tag boundary and the parameter dropped so its
+        # neighbors survive (production behavior from PR #54686 analysis).
         raw = (
             f"<{_PARAM_OPEN.format(name='city', is_str='true')}"
             "Tokyo</｜DSML｜parameter\n"
             f"<{_PARAM_OPEN.format(name='unit', is_str='true')}celsius{_PARAM_CLOSE}"
         )
         result = json.loads(_dsml_arg_converter(raw, partial=False))
-        assert result == {
-            "city": "Tokyo</｜DSML｜parameter\n",
-            "unit": "celsius",
-        }
+        assert result == {"unit": "celsius"}
 
     def test_null_string_false(self):
         raw = self._raw(("val", "false", "null"))
