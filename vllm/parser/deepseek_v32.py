@@ -29,13 +29,8 @@ from vllm.parser.deepseek_v4 import (
     DSML_INVOKE_NAME_END,
     DSML_INVOKE_PREFIX,
     DSML_PARAM_CLOSE,
-<<<<<<< HEAD
     DSML_PARAM_START,
-    _PARAM_RE,
-    _PARTIAL_PARAM_RE,
-    _TAG_CHARS,
-=======
->>>>>>> 7ea8576193 (fix(parser): harden fast path with schema-stability, open-string gating, and JSON escaping)
+
     _dsml_arg_converter,
     _has_pending_tag,
     _is_open_json_string,
