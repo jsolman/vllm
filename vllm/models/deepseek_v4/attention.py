@@ -4,6 +4,7 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -66,6 +67,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
 
 
 @triton.jit
@@ -693,6 +695,34 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         ),
     ) -> torch.Tensor:
         if not isinstance(attn_metadata, dict):
+            # No metadata: either the profile run (kernel must not fire) or the
+            # capture-time break python (the capture runner builds metadata only
+            # for FULL graphs / eager replays). For capture, bake the REAL bound
+            # SWA cache and the persistent slot-mapping buffer into the kernel
+            # launch: the persistent buffer holds -1 during capture (kernel
+            # skips those rows) and is rewritten with real slots before every
+            # replay, so the captured kernel writes the correct KV rows each
+            # step. Baking a no-op here previously starved every decode replay
+            # of its KV-cache write and corrupted the output.
+            if (
+                torch.cuda.is_current_stream_capturing()
+                and self.swa_cache_layer.kv_cache.numel() > 0
+            ):
+                # The runner's slot-mapping buffer is persistent (stable
+                # address, rewritten with real slots before every replay);
+                # at capture it is filled with -1 so the kernel skips all
+                # rows. Baking it keeps the KV write in the graph.
+                slot_mapping_ctx = get_forward_context().slot_mapping
+                if isinstance(slot_mapping_ctx, list):
+                    slot_mapping_ctx = slot_mapping_ctx[0]
+                slot_buf = slot_mapping_ctx.get(self.prefix)
+                if slot_buf is None:
+                    slot_buf = slot_mapping_ctx.get(self.swa_cache_layer.prefix)
+                if slot_buf is not None:
+                    assert positions.dtype == torch.int64
+                    return self._fused_qnorm_rope_kv_insert_captured(
+                        q, kv, positions, slot_buf
+                    )
             # Profile run: kernel doesn't fire; produce a padded tensor so
             # downstream FlashMLA gets the right shape.
             if self.n_local_heads < self.padded_heads:
@@ -764,6 +794,64 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             q_fp8,
             swa_kv_cache_3d,
             swa_metadata.slot_mapping,
+            positions,
+            cos_sin_cache,
+            self._flashinfer_fp8_kv_scale,
+            self._flashinfer_fp8_q_scale_inv,
+            self.eps,
+            block_size,
+        )
+        return q_fp8
+
+    def _fused_qnorm_rope_kv_insert_captured(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fused insert against the REAL bound cache + persistent slot buffer,
+        used when capture-time python has no attention metadata."""
+        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        swa_kv_cache = self.swa_cache_layer.kv_cache
+        cache_dtype = swa_kv_cache.dtype
+        block_size = self.swa_cache_layer.block_size
+
+        if cache_dtype == torch.uint8:
+            swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+            return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+                q,
+                kv,
+                swa_kv_cache_2d,
+                slot_mapping,
+                positions,
+                cos_sin_cache,
+                self.padded_heads,
+                self.eps,
+                block_size,
+            )
+
+        swa_kv_cache_3d = swa_kv_cache
+        if cache_dtype == torch.bfloat16:
+            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
+                q,
+                kv,
+                swa_kv_cache_3d,
+                slot_mapping,
+                positions,
+                cos_sin_cache,
+                self.eps,
+                block_size,
+            )
+            return q
+
+        q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
+            q,
+            kv,
+            q_fp8,
+            swa_kv_cache_3d,
+            slot_mapping,
             positions,
             cos_sin_cache,
             self._flashinfer_fp8_kv_scale,
