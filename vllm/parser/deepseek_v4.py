@@ -51,15 +51,20 @@ DSML_PARAM_START = f"<{_DSML}parameter"
 DSML_PARAM_CLOSE = f"</{_DSML}parameter>"
 
 _ESCAPED_DSML = re.escape(_DSML)
+# A parameter value ends at the first DSML tag boundary. Without that bound,
+# `(.*?)` skips a mis-spelled closer and latches onto the *next* real one, so a
+# single malformed parameter absorbs every parameter after it; `(.*)$` swallows
+# the rest of the buffer and leaks the closer into a streamed argument.
+_VALUE = rf"((?:(?!</?{_ESCAPED_DSML}).)*)"
 _PARAM_RE = re.compile(
     rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
-    rf"(.*?)"
+    rf"{_VALUE}"
     rf"(?:</{_ESCAPED_DSML}parameter>|(?=<{_ESCAPED_DSML}parameter\s+name=))",
     re.DOTALL,
 )
 _PARTIAL_PARAM_RE = re.compile(
     rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
-    rf"(.*)$",
+    rf"{_VALUE}",
     re.DOTALL,
 )
 
