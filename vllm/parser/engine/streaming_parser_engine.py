@@ -109,16 +109,6 @@ class StreamingParserEngine:
             # convert events to DeltaMessage
     """
 
-    # True when a held candidate invoke was rolled back (abort_recovery_hold).
-    # Used by ParserEngine.finish_streaming to decide whether deferred trailing
-    # reasoning whitespace should be flushed (it belongs before rollback text).
-    recovery_rolled_back_at_finish: bool = False
-    # True when a provisional hold committed (recovery accepted) since reset.
-    recovery_committed: bool = False
-    # True when the request disables tool parsing entirely
-    # (tool_choice="none"): recovery must restore text, not calls.
-    recovery_tools_suppressed: bool = False
-
     def __init__(
         self,
         config: ParserEngineConfig,
@@ -631,9 +621,7 @@ class StreamingParserEngine:
         if self.state == ParserState.TOOL_ARGS:
             if not transition.commit_provisional_tool_call:
                 return self._abort_recovery_hold()
-            if self.skip_tool_parsing and self.recovery_tools_suppressed:
-                # Tool parsing is explicitly disabled (tool_choice="none"):
-                # restore the recovered invoke as ordinary text.
+            if self.skip_tool_parsing:
                 raw = self._recovery_hold_raw
                 held_token_count = self._recovery_hold_token_count
                 prior_state = self._recovery_prior_state
@@ -660,8 +648,6 @@ class StreamingParserEngine:
                     )
                 )
                 return events
-            self.recovery_committed = True
-            self.recovery_committed = True
             transition_events = self._run_transition(transition, value, token_count)
             self._recovery_hold_events.extend(transition_events)
             events = self._recovery_hold_events
@@ -676,7 +662,6 @@ class StreamingParserEngine:
         return self._abort_recovery_hold()
 
     def _abort_recovery_hold(self) -> list[SemanticEvent]:
-        self.recovery_rolled_back_at_finish = True
         raw = self._recovery_hold_raw
         token_count = self._recovery_hold_token_count
         self.state = self._recovery_prior_state
