@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4 FlashInfer sparse MLA backend."""
 
+import os
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
@@ -33,6 +34,24 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWABackend,
     DeepseekSparseSWAMetadataBuilder,
 )
+
+_DSV4_DBG = os.environ.get("VLLM_DSV4_DBG", "0") == "1"
+_dsv4_dbg_none_meta_count = [0]
+
+
+def _dsv4_dbg_log_none_meta(where: str) -> None:
+    """Env-gated (VLLM_DSV4_DBG=1) probe: log None-metadata forward calls and
+    whether they happen under (or outside) CUDA graph capture."""
+    if not _DSV4_DBG:
+        return
+    _dsv4_dbg_none_meta_count[0] += 1
+    if _dsv4_dbg_none_meta_count[0] <= 40:
+        capturing = torch.cuda.is_current_stream_capturing()
+        print(
+            f"DSV4DBG {where}: attn_metadata=None call "
+            f"#{_dsv4_dbg_none_meta_count[0]} capturing={capturing}",
+            flush=True,
+        )
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -279,6 +298,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
+            _dsv4_dbg_log_none_meta("forward_mqa_sm10x")
             # Warmup dummy run: FlashInfer reads the cache directly and lazily
             # allocates its workspace, so nothing to reserve here.
             output.zero_()
@@ -695,6 +715,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
+            _dsv4_dbg_log_none_meta("forward_mqa")
             self._reserve_empty_forward_workspace()
             output.zero_()
             return
