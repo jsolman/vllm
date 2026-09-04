@@ -104,9 +104,13 @@ def _sparse_mla_compute_tile(
     (656 B/token) and is decoded in-register -- no fp8e4nv conversion, so this
     path compiles and runs on sm_80/sm_86 where native fp8 does not exist."""
     offs_d = tl.arange(0, BLOCK_DMODEL)
-    offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
     offs_dv = tl.arange(0, BLOCK_DV)
-    mask_dpe = offs_dpe < BLOCK_DMODEL + BLOCK_DPE
+    # NoPE MLA (GLM-5.3-Flash) passes BLOCK_DPE == 0: tl.arange(0, 0) is
+    # illegal and a zero-K tl.dot is invalid, so the PE tail must be
+    # compiled out with constexpr guards rather than masked.
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        mask_dpe = offs_dpe < BLOCK_DMODEL + BLOCK_DPE
 
     q = tl.load(
         q_buffer
@@ -116,14 +120,15 @@ def _sparse_mla_compute_tile(
         mask=mask_h[:, None],
         other=0.0,
     )
-    qpe = tl.load(
-        q_buffer
-        + cur_q * stride_q_token
-        + cur_head[:, None] * stride_q_head
-        + offs_dpe[None, :],
-        mask=(mask_h[:, None]) & (mask_dpe[None, :]),
-        other=0.0,
-    )
+    if BLOCK_DPE > 0:
+        qpe = tl.load(
+            q_buffer
+            + cur_q * stride_q_token
+            + cur_head[:, None] * stride_q_head
+            + offs_dpe[None, :],
+            mask=(mask_h[:, None]) & (mask_dpe[None, :]),
+            other=0.0,
+        )
 
     # Finite sentinel (not -inf) — when an entire BLOCK_N tile is masked,
     # `-inf - -inf = NaN` poisons the softmax; `sentinel - sentinel = 0`
@@ -169,15 +174,16 @@ def _sparse_mla_compute_tile(
             qk = tl.dot(q, k)
 
             # RoPE half is stored RAW bf16 -- never quantized, never scaled.
-            kpe = tl.load(
-                (k_buffer + row[None, :] + _FP8_ROPE_OFF).to(
-                    tl.pointer_type(tl.bfloat16)
-                )
-                + tl.arange(0, BLOCK_DPE)[:, None],
-                mask=mask_kv[None, :],
-                other=0.0,
-            ).to(q.dtype)
-            qk += tl.dot(qpe, kpe)
+            if BLOCK_DPE > 0:
+                kpe = tl.load(
+                    (k_buffer + row[None, :] + _FP8_ROPE_OFF).to(
+                        tl.pointer_type(tl.bfloat16)
+                    )
+                    + tl.arange(0, BLOCK_DPE)[:, None],
+                    mask=mask_kv[None, :],
+                    other=0.0,
+                ).to(q.dtype)
+                qk += tl.dot(qpe, kpe)
         else:
             offs_k = (
                 indices[None, :] * stride_kv_token
@@ -187,17 +193,18 @@ def _sparse_mla_compute_tile(
             k = tl.load(k_buffer + offs_k, mask=mask_kv[None, :], other=0.0)
             qk = tl.dot(q, k.to(q.dtype))
 
-            offs_kpe = (
-                indices[None, :] * stride_kv_token
-                + cur_kv_head_id * stride_kv_head
-                + offs_dpe[:, None]
-            )
-            kpe = tl.load(
-                k_buffer + offs_kpe,
-                mask=(mask_kv[None, :]) & (mask_dpe[:, None]),
-                other=0.0,
-            )
-            qk += tl.dot(qpe, kpe.to(q.dtype))
+            if BLOCK_DPE > 0:
+                offs_kpe = (
+                    indices[None, :] * stride_kv_token
+                    + cur_kv_head_id * stride_kv_head
+                    + offs_dpe[:, None]
+                )
+                kpe = tl.load(
+                    k_buffer + offs_kpe,
+                    mask=(mask_kv[None, :]) & (mask_dpe[:, None]),
+                    other=0.0,
+                )
+                qk += tl.dot(qpe, kpe.to(q.dtype))
 
         qk *= sm_scale
         qk = tl.where((mask_h[:, None]) & (mask_kv[None, :]), qk, NEG_LARGE)
@@ -533,10 +540,14 @@ def triton_mla_sparse_attention(
         lse:   [num_tokens, num_heads_q] fp32 (only if return_lse=True)
     """
     num_tokens, num_heads_q, dim_qk = q.shape
-    assert dim_qk == _DIM_QK, (
-        f"sparse MLA kernel requires dim_qk={_DIM_QK} (DeepSeek-V3.2 / GLM-5), "
-        f"got {dim_qk}"
+    # DeepSeek-V3.2 / GLM-5 carry a 64-wide RoPE tail (dim_qk 576); GLM-5.3-Flash
+    # is NoPE (qk_rope_head_dim = 0), so dim_qk is just the 512 latent. The
+    # kernels zero the PE tail via mask_dpe when BLOCK_DPE == 0.
+    assert dim_qk in (_BLOCK_DMODEL, _DIM_QK), (
+        f"sparse MLA kernel requires dim_qk={_BLOCK_DMODEL} (NoPE) or "
+        f"{_DIM_QK} (RoPE), got {dim_qk}"
     )
+    block_dpe = dim_qk - _BLOCK_DMODEL
     # fp8_ds_mla: the cache arrives as raw uint8 pages (656 B/token) instead of
     # bf16 [seq_kv, 1, 576]. Decoded in-register by the kernel -- no fp8e4nv, so
     # this works on sm_80/sm_86 where native fp8 conversion does not exist.
@@ -545,7 +556,7 @@ def triton_mla_sparse_attention(
         kv = kv.view(torch.uint8).reshape(-1, 1, _FP8_ROW_BYTES_PY)
         assert kv.shape[2] == _FP8_ROW_BYTES_PY
     else:
-        assert kv.shape[1] == 1 and kv.shape[2] == _DIM_QK
+        assert kv.shape[1] == 1 and kv.shape[2] == dim_qk
     index_topk = indices.shape[2]
     assert index_topk % _MIN_BLOCK_N == 0, (
         f"topk ({index_topk}) must be a multiple of the smallest autotune "
@@ -598,7 +609,7 @@ def triton_mla_sparse_attention(
             BLOCK_H=_BLOCK_H,
             BLOCK_DV=_BLOCK_DV,
             BLOCK_DMODEL=_BLOCK_DMODEL,
-            BLOCK_DPE=_BLOCK_DPE,
+            BLOCK_DPE=block_dpe,
             IS_FP8=is_fp8,
             RETURN_LSE=return_lse,
             LOGE2=LOGE2,
@@ -636,7 +647,7 @@ def triton_mla_sparse_attention(
         BLOCK_H=_BLOCK_H,
         BLOCK_DV=_BLOCK_DV,
         BLOCK_DMODEL=_BLOCK_DMODEL,
-        BLOCK_DPE=_BLOCK_DPE,
+        BLOCK_DPE=block_dpe,
         IS_FP8=is_fp8,
         LOGE2=LOGE2,
     )

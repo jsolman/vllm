@@ -254,7 +254,10 @@ class TritonMLASparseBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [_DIM_QK]
+        # 576 = 512 latent + 64 RoPE (DeepSeek-V3.2 / GLM-5 with-rope).
+        # 512 = NoPE MLA (GLM-5.3-Flash, qk_rope_head_dim = 0); the kernel
+        # masks the PE tail out via mask_dpe when BLOCK_DPE == 0.
+        return [512, 576]
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
