@@ -30,14 +30,24 @@ _GiB = 1024**3
 # Global workspace manager instance
 _manager: "WorkspaceManager | None" = None
 _workspace_lane: ContextVar[int] = ContextVar("vllm_workspace_lane", default=0)
+# Plain-global shadow of "is any non-default lane active". Dynamocannot trace
+# ContextVar.get(), but it CAN guard on a module-level bool: compiled code
+# reading this flag constant-folds the False branch (lane 0) with a guard, so
+# the first non-default use_workspace_lane() forces a recompile that hits the
+# ContextVar path and fails loudly under fullgraph instead of silently using
+# workspace slot 0.
+_workspace_lane_active = False
 
 
 @contextmanager
 def use_workspace_lane(lane: int) -> Iterator[None]:
     """Select an independent workspace owner for this execution context."""
+    global _workspace_lane_active
     if lane < 0:
         raise ValueError(f"Workspace lane must be non-negative, got {lane}.")
     token = _workspace_lane.set(lane)
+    if lane != 0:
+        _workspace_lane_active = True
     try:
         yield
     finally:
@@ -151,7 +161,7 @@ class WorkspaceManager:
         """
         ubatch_id = dbo_current_ubatch_id()
         lane = (
-            0 if torch.compiler.is_compiling() else _workspace_lane.get()
+            _workspace_lane.get() if _workspace_lane_active else 0
         )
         if lane >= self._num_lanes:
             raise RuntimeError(
