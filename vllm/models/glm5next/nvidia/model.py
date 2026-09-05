@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from vllm.config import ParallelConfig, VllmConfig
+from vllm.compilation.decorators import support_torch_compile
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -575,6 +576,7 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
 
+@support_torch_compile
 class Glm5NextModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
