@@ -134,7 +134,9 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 attn_metadata.block_table,
                 topk_indices,
                 BLOCK_SIZE=attn_metadata.block_size,
-                NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+                # Match the padded topk buffer width (index_topk + kpool-1
+                # rounded up), not the nominal topk_tokens.
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
             )
 
         return_lse = self.need_to_return_lse_for_decode
