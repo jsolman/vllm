@@ -21,6 +21,7 @@ from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.models.interfaces import requires_raw_input_tokens
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
 from vllm.distributed.parallel_state import (
     get_pp_group,
@@ -566,6 +567,18 @@ class ModelCudaGraphManager(CudaGraphManager):
                 "positions": input_buffers.positions[:num_tokens],
                 **model_state.prepare_dummy_inputs(num_reqs, num_tokens),
             }
+            # Multimodal models are served through inputs_embeds: execute_model
+            # drops input_ids whenever inputs_embeds is prepared and the model
+            # does not require raw tokens. The captured graph must see the SAME
+            # kwarg structure as replay, otherwise replay feeds stale capture-
+            # time buffers (baked token ids -> corrupted output). Mirror the
+            # execute_model rule here: with dummy inputs_embeds present, drop
+            # input_ids exactly like execute_model does.
+            if (
+                model_inputs.get("inputs_embeds") is not None
+                and not requires_raw_input_tokens(model)
+            ):
+                model_inputs["input_ids"] = None
             if not self.is_first_pp_rank:
                 # Update for non-first PP ranks.
                 model_inputs["input_ids"] = None
