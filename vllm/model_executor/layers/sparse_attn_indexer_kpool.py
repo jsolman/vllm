@@ -298,7 +298,13 @@ def sparse_attn_indexer_kpool(
     # does not support (e.g. SM110 Thor) the kpool cache is plain fp8 e4m3 +
     # fp32 scale (kpool_compress_and_write_cache never emits fp4), so the
     # Triton kernels are drop-in replacements.
-    use_deep_gemm = is_deep_gemm_supported()
+    # is_deep_gemm_supported() is an lru-cached callable touching
+    # cudaDeviceGetAttribute — dynamo cannot trace it under fullgraph, so
+    # freeze the decision outside the compiled region.
+    if torch.compiler.is_compiling():
+        use_deep_gemm = False
+    else:
+        use_deep_gemm = is_deep_gemm_supported()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
     # assert isinstance(attn_metadata, dict)
