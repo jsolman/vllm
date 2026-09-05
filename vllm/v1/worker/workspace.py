@@ -150,7 +150,9 @@ class WorkspaceManager:
             The current workspace tensor.
         """
         ubatch_id = dbo_current_ubatch_id()
-        lane = _workspace_lane.get()
+        lane = (
+            0 if torch.compiler.is_compiling() else _workspace_lane.get()
+        )
         if lane >= self._num_lanes:
             raise RuntimeError(
                 f"Workspace lane {lane} is not configured; manager has "

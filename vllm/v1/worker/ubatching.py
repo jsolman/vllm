@@ -154,6 +154,10 @@ def dbo_enabled() -> bool:
 def dbo_current_ubatch_id() -> int:
     if len(_THREAD_ID_TO_CONTEXT) == 0:
         return 0
+    if torch.compiler.is_compiling():
+        # threading.get_ident() / dict lookup is not traceable by dynamo;
+        # DBO contexts do not exist during compilation (single ubatch).
+        return 0
     return _THREAD_ID_TO_CONTEXT[threading.get_ident()]
 
 
