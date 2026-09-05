@@ -44,9 +44,14 @@ _INDEXER_HEAD_DIM = 128
 
 
 class TritonMLASparseMetadataBuilder(XPUMLASparseMetadataBuilder):
-    # XPU base keeps NEVER (not validated under cudagraph); this subclass
-    # claims UNIFORM_BATCH for the CUDA/Triton path.
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    # UNIFORM_BATCH: the CUDA/Triton path builds all per-step attention state
+    # into persistent device buffers (topk indices, req_id_per_token), and the
+    # metadata's python-int fields (num_reqs/max_query_len/max_seq_len) are
+    # dataclass bookkeeping not read by the captured forward path, so uniform
+    # decode batches (spec-decode) replay correctly. Earlier NEVER was due to
+    # a GLM-5.2-era capture bug whose real root cause (capture-time metadata
+    # None baking dummy caches) was fixed separately (PR #54851).
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
 
 class TritonMLASparseImpl(XPUMLASparseImpl):
