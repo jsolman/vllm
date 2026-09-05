@@ -22,7 +22,7 @@ elif current_platform.is_rocm():
 else:
     from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
 
-from vllm.utils.deep_gemm import has_deep_gemm
+from vllm.utils.deep_gemm import has_deep_gemm, is_deep_gemm_supported
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -32,6 +32,10 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.mqa_logits_triton import (
+    fp8_mqa_logits_triton,
+    fp8_paged_mqa_logits_triton,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if current_platform.is_cuda_alike():
@@ -290,6 +294,11 @@ def sparse_attn_indexer_kpool(
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
+    # DeepGEMM's MQA-logits kernels are Hopper/Blackwell-only. On GPUs it
+    # does not support (e.g. SM110 Thor) the kpool cache is plain fp8 e4m3 +
+    # fp32 scale (kpool_compress_and_write_cache never emits fp4), so the
+    # Triton kernels are drop-in replacements.
+    use_deep_gemm = is_deep_gemm_supported()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
     # assert isinstance(attn_metadata, dict)
@@ -517,11 +526,25 @@ def sparse_attn_indexer_kpool(
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
                 )
-            else:
+            elif use_deep_gemm:
                 from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
 
                 logits = fp8_fp4_mqa_logits(
                     (q_slice_cast, q_scale_slice),
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    clean_logits=False,
+                )
+            else:
+                # Triton fallback (DeepGEMM unavailable on this GPU).
+                assert not use_fp4_cache, (
+                    "kpool indexer: fp4 index cache needs DeepGEMM; the Triton "
+                    "fallback is fp8-only."
+                )
+                logits = fp8_mqa_logits_triton(
+                    q_slice_cast,
                     (k_quant_cast, k_scale_cast),
                     weights[chunk.token_start : chunk.token_end],
                     chunk.cu_seqlen_ks,
@@ -780,7 +803,7 @@ def sparse_attn_indexer_kpool(
                 decode_metadata.schedule_metadata,
                 max_model_len=max_model_len,
             )
-        else:
+        elif use_deep_gemm:
             from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
 
             logits = fp8_fp4_paged_mqa_logits(
@@ -790,6 +813,25 @@ def sparse_attn_indexer_kpool(
                 seq_lens,
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
+                max_model_len=max_model_len,
+                clean_logits=False,
+            )
+        else:
+            # Triton fallback (DeepGEMM unavailable on this GPU, e.g. SM110
+            # Thor). No schedule_metadata: that is DeepGEMM's persistent-
+            # kernel scheduling, which the Triton paged kernel does not use.
+            # block_table is already pool-granular (the indexer metadata
+            # builder divides it by index_kpool).
+            assert not use_fp4_cache, (
+                "kpool indexer: fp4 index cache needs DeepGEMM; the Triton "
+                "fallback is fp8-only."
+            )
+            logits = fp8_paged_mqa_logits_triton(
+                padded_q_quant_cast,
+                kv_cache,
+                padded_weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
                 max_model_len=max_model_len,
                 clean_logits=False,
             )
@@ -915,9 +957,28 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
+        # DeepGEMM's MQA-logits kernels are Hopper/Blackwell-only; on GPUs it
+        # does not support (e.g. SM110 Thor) the fp8 Triton MQA-logits path is
+        # the drop-in fallback (the kpool cache is plain fp8 e4m3 + fp32
+        # scales, never fp4, so the Triton kernels are equivalent). Only
+        # hard-require deep_gemm where the platform would actually use it.
+        if (
+            current_platform.is_cuda()
+            and current_platform.support_deep_gemm()
+            and not has_deep_gemm()
+        ):
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
+            )
+        if current_platform.is_cuda() and not is_deep_gemm_supported():
+            if use_fp4_cache:
+                raise RuntimeError(
+                    "kpool indexer: use_fp4_cache requires DeepGEMM (SM90+). "
+                    "This GPU falls back to the fp8 Triton MQA-logits path."
+                )
+            logger.info_once(
+                "Sparse Attention Indexer: DeepGEMM unavailable on this GPU; "
+                "using the Triton fp8 MQA-logits fallback."
             )
 
     def forward_native(
