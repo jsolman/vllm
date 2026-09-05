@@ -1689,31 +1689,20 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         if prefix.endswith(".lm_head"):
             candidates.append("lm_head")
 
-        # MTP/speculative draft layers are wrapped as ``layers.N.mtp_block.``;
-        # checkpoint (and quantized_layers) keys never contain the wrapper.
-        # Also consider the un-wrapped prefix, then apply the language-model
-        # mappings to it (the draft model is text-only, so the target model's
-        # ``model.language_model.`` / ``language_model.model.`` conventions
-        # don't apply directly).
-        if ".mtp_block." in prefix:
-            stripped = prefix.replace(".mtp_block.", ".")
+        # MTP/speculative draft models build their layers as plain text-tower
+        # prefixes (``model.layers.45.mtp_block.*`` / ``model.layers.45.*``),
+        # while ``quantized_layers`` keys use the serialized
+        # (ForConditionalGeneration) form ``model.language_model.layers.*``
+        # (mapped at config load to ``language_model.model.layers.*``) and
+        # never contain the draft-only ``mtp_block`` wrapper. Also consider
+        # the un-wrapped prefix and both language-model conventions.
+        stripped = prefix.replace(".mtp_block.", ".")
+        if stripped.startswith("model.layers."):
             candidates.append(stripped)
-            if stripped.startswith("language_model.model."):
-                candidates.append(
-                    "model.language_model." + stripped[len("language_model.model.") :]
-                )
-            elif stripped.startswith("model.language_model."):
-                candidates.append(
-                    "language_model.model." + stripped[len("model.language_model.") :]
-                )
-            else:
-                # Plain text-tower prefix (draft model, ``model.layers.45.``):
-                # also try the serialized (ForConditionalGeneration) form,
-                # which is what quantized_layers keys use.
-                candidates.append("language_model.model." + stripped[len("model.") :])
-                candidates.append(
-                    "model.language_model." + stripped[len("model.") :]
-                )
+            candidates.append("language_model.model." + stripped[len("model.") :])
+            candidates.append(
+                "model.language_model." + stripped[len("model.") :]
+            )
 
         if prefix.startswith("language_model.model."):
             candidates.append(
