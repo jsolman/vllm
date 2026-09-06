@@ -339,15 +339,21 @@ def _compute_slot_mappings_kernel(
         block_indices = tl.where(
             mapping_enabled, local_positions // kernel_block_size, 0
         )
+        # Guard against block indices beyond this group's block-table row
+        # width: a narrow cache group's table does not span the sequence in
+        # raw token positions, so a deep position can produce an index past
+        # the row end. The unguarded load would read out of bounds and the
+        # `other=0` fallback would fabricate a valid-looking slot in block 0.
+        block_indices_ok = block_indices < block_table_stride
         block_offsets = local_positions % kernel_block_size
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices,
-            mask=is_local,
+            mask=is_local & block_indices_ok,
             other=0,
         )
         slot_ids = block_numbers * kernel_block_size + block_offsets
         if CP_SIZE != 1:
             slot_ids = tl.where(is_local, slot_ids, PAD_ID)
 
-        slot_ids = tl.where(mapping_enabled, slot_ids, PAD_ID)
+        slot_ids = tl.where(mapping_enabled & block_indices_ok, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
