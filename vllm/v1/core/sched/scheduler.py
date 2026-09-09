@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -662,11 +663,36 @@ class Scheduler(SchedulerInterface):
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
+                # GLM53 drift fix (9/9): reserve one token of lookahead
+                # capacity for every scheduled decode token. The
+                # compressed KV write of the token being scheduled
+                # targets the FIRST compressed state of the NEXT pool
+                # page when the request sits exactly on a 2176-token
+                # page boundary, but that page was previously allocated
+                # only in the NEXT schedule() — one full forward too
+                # late under the async pipeline (the worker executes
+                # the boundary token while its page id is still absent
+                # from the gathered block table; with stale tails it
+                # wrote a ghost page, with the gather-tail fix it
+                # writes page 0 and destroys state 0 — the residual
+                # one-step NaN at 2863/4365/5867/...). A +1 token of
+                # lookahead makes num_tokens_need_slot cross the page
+                # boundary ONE schedule early, so the page exists in
+                # the same schedOut that carries the boundary token.
+                # Cost: zero extra blocks except exactly at the
+                # boundary (cdiv granularity).
+                _gl53_lookahead = self.num_lookahead_tokens
+                if (
+                    _gl53_lookahead < 1
+                    and not self.use_pp
+                    and request.is_prefill_chunk is False
+                ):
+                    _gl53_lookahead = 1
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=_gl53_lookahead,
                     )
 
                     if new_blocks is not None:
@@ -1390,6 +1416,47 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        # SCHEDLOG (f43b): scheduler-side allocation timing at the MLA
+        # 2176-block boundaries. Log per running request the MLA group's
+        # block-id tail + num_computed_tokens whenever the request's
+        # computed position is within 8 tokens of a 2176 boundary, plus
+        # every step in a small window (caught via the boundary flag).
+        if os.environ.get("VLLM_DEBUG_DRIFT_SCHEDLOG"):
+            try:
+                # sched_step_seq only advances with defer_block_free (not
+                # active here); maintain a dedicated counter for the probe.
+                self._schedlog_seq = getattr(self, "_schedlog_seq", -1) + 1
+                _seq = self._schedlog_seq
+                for _rid in num_scheduled_tokens:
+                    _req = self.requests.get(_rid)
+                    if _req is None:
+                        continue
+                    _blocks = self.kv_cache_manager.get_block_ids(_rid)
+                    # Dump EVERY group's tail: group-0 ids [1,7,12] turned
+                    # out to be the ragged-wrapper ledger (+5..6 per ~1300
+                    # steps), NOT the 2176-page MLA group. The MLA group
+                    # (which holds the boundary pages 306..322 in f36) is
+                    # one of the other indices.
+                    _pos = _req.num_computed_tokens
+                    _near = (_pos % 2176) < 16 or 2176 - (_pos % 2176) < 16
+                    _tails = "|".join(
+                        f"{i}:{len(b)}:{b[-6:]}" for i, b in enumerate(_blocks)
+                    )
+                    if _near:
+                        with open(
+                            "/tmp/drift-schedlog-"
+                            + os.environ.get("VLLM_DEBUG_DRIFT_TAG", "x")
+                            + ".txt",
+                            "a",
+                        ) as _f:
+                            _f.write(
+                                f"{_seq} req={_rid} pos={_pos} "
+                                f"groups={_tails}\n"
+                            )
+            except Exception as _e:
+                import sys
+
+                print(f"[schedlog] ERR {_e!r}", file=sys.stderr, flush=True)
         return scheduler_output
 
     def _build_kv_connector_meta(
