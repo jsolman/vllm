@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
+import sys
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -184,6 +186,36 @@ class SingleTypeKVCacheManager(ABC):
         """
 
         num_required_blocks = cdiv(num_tokens, self.block_size)
+        # MGRCHECK (9/9): log manager-level alloc decisions near the
+        # 2176 boundary — required vs held vs returned, per manager.
+        import os as _mgr_os
+        import vllm.debug_drift_trace as _ddt_mgr
+
+        if _mgr_os.environ.get("VLLM_DEBUG_DRIFT_SCHEDLOG"):
+            try:
+                _pos = num_tokens - 1
+                if (_pos % 2176) < 8 or 2176 - (_pos % 2176) < 8:
+                    _ret = (
+                        "fast"
+                        if request_id in self.num_cached_block
+                        else "slow"
+                    )
+                    _reqb = len(self.req_to_blocks.get(request_id, ()))
+                    with open(
+                        "/tmp/drift-mgrchk-"
+                        + _mgr_os.environ.get("VLLM_DEBUG_DRIFT_TAG", "x")
+                        + ".txt",
+                        "a",
+                    ) as _mf:
+                        _mf.write(
+                            f"{getattr(_ddt_mgr, '_step', -1)} "
+                            f"mgr={type(self).__name__} bs={self.block_size} "
+                            f"ntok={num_tokens} main={num_tokens_main_model} "
+                            f"reqb={_reqb} path={_ret} "
+                            f"computed={total_computed_tokens}\n"
+                        )
+            except Exception:
+                pass
         if apply_admission_cap and self._max_admission_blocks_per_request is not None:
             # Recycling-aware specs (SWA, chunked-local) cap the per-request
             # reservation here so admission matches the startup pool sizer
@@ -361,6 +393,27 @@ class SingleTypeKVCacheManager(ABC):
             # get_num_blocks_to_allocate.
             block_idx, source_block = self._partial_hit_reqs.pop(request_id)
             cow_block = self.block_pool.get_new_blocks(1)[0]
+            # COWLOG: mid-decode CoW entry point (the early-return
+            # path skips the ALLOCLOG below, so log here too).
+            if os.environ.get("VLLM_DEBUG_DRIFT_ALLOCLOG"):
+                try:
+                    import time
+
+                    with open(
+                        "/tmp/drift-alloclog-"
+                        + os.environ.get("VLLM_DEBUG_DRIFT_TAG", "x")
+                        + ".txt",
+                        "a",
+                    ) as _f:
+                        _f.write(
+                            f"COW-ENTRY t={time.time():.1f} "
+                            f"req={request_id} "
+                            f"grp={type(self).__name__} "
+                            f"idx={block_idx} "
+                            f"src={source_block.block_id}\n"
+                        )
+                except Exception:
+                    pass
             self._apply_cow(request_id, block_idx, source_block, cow_block)
             self.new_block_ids.append(cow_block.block_id)
             cow_blocks.append(cow_block)
@@ -375,6 +428,51 @@ class SingleTypeKVCacheManager(ABC):
             req_blocks.extend(new_blocks)
             if self._record_new_block_ids:
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
+            # ALLOCLOG: which group allocated which block ids, in the
+            # burst windows. Capture-only.
+            # f42: also dump the row's length + tail so we can tell an
+            # APPEND (row grows past the old tail) from a REWRITE of
+            # entries the request already used for writes (the f36
+            # 204->306 mid-row flip at step 2864).
+            if os.environ.get("VLLM_DEBUG_DRIFT_ALLOCLOG") or os.environ.get(
+                "VLLM_DEBUG_DRIFT_FREELOG"
+            ):
+                try:
+                    import vllm.debug_drift_trace as _ddt
+
+                    _st = getattr(_ddt, "_step", -1)
+                    _n = sum(1 for _ in open(
+                        "/tmp/drift-alloclog-"
+                        + os.environ.get("VLLM_DEBUG_DRIFT_TAG", "x")
+                        + ".txt", "a+")) if os.path.exists(
+                            "/tmp/drift-alloclog-"
+                            + os.environ.get("VLLM_DEBUG_DRIFT_TAG", "x")
+                            + ".txt") else 0
+                    if _n < 40000:
+                        _ids = [b.block_id for b in new_blocks]
+                        _row = self.req_to_blocks.get(request_id) or []
+                        _row_ids = [b.block_id for b in _row]
+                        with open(
+                            "/tmp/drift-alloclog-"
+                            + os.environ.get("VLLM_DEBUG_DRIFT_TAG", "x")
+                            + ".txt",
+                            "a",
+                        ) as _f:
+                            import time
+
+                            _f.write(
+                                f"{_st} t={time.time():.1f} req="
+                                f"{request_id} grp="
+                                f"{type(self).__name__} n={len(_ids)} "
+                                f"ids={_ids[:24]} "
+                                f"rowlen={len(_row)} "
+                                f"rowtail={_row_ids[-20:]}\n"
+                            )
+                except Exception as _e:
+                    import sys
+
+                    print(f"[alloclog] ERR {_e!r}", file=sys.stderr,
+                          flush=True)
             return cow_blocks + new_blocks
 
     @property
@@ -438,6 +536,25 @@ class SingleTypeKVCacheManager(ABC):
         assert block_idx < len(req_blocks)
         assert req_blocks[block_idx] is source_block
         assert not source_block.is_null and source_block.ref_cnt > 0
+        # COWLOG: which request's which block gets CoW'd, when.
+        if os.environ.get("VLLM_DEBUG_DRIFT_ALLOCLOG"):
+            try:
+                import time
+
+                with open(
+                    "/tmp/drift-alloclog-"
+                    + os.environ.get("VLLM_DEBUG_DRIFT_TAG", "x")
+                    + ".txt",
+                    "a",
+                ) as _f:
+                    _f.write(
+                        f"COW t={time.time():.1f} req={request_id} "
+                        f"grp={type(self).__name__} idx={block_idx} "
+                        f"src={source_block.block_id} "
+                        f"cow={cow_block.block_id}\n"
+                    )
+            except Exception:
+                pass
         req_blocks[block_idx] = cow_block
         self._pending_cow_copies.append((source_block, cow_block))
         cow_block.ref_cnt += 1
@@ -1648,7 +1765,19 @@ class MambaManager(SingleTypeKVCacheManager):
             # x * block_size + num_lookahead_tokens and breaks the alignment.
             # We can ignore lookahead tokens because current draft models don't have
             # mamba layers.
-            num_tokens = num_tokens_main_model
+            # GLM53 (9/9): mirror allocate_new_blocks — reserve the next
+            # page when the scheduler's +1 decode lookahead crosses the
+            # block boundary, so the free-capacity check matches the
+            # actual allocation (see the allocate_new_blocks comment).
+            _gl53_la = num_tokens - num_tokens_main_model
+            if (
+                _gl53_la >= 1
+                and num_tokens_main_model > 0
+                and num_tokens_main_model % self.block_size == 0
+            ):
+                num_tokens = num_tokens_main_model + self.block_size
+            else:
+                num_tokens = num_tokens_main_model
 
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
@@ -1703,7 +1832,26 @@ class MambaManager(SingleTypeKVCacheManager):
             # x * block_size + num_lookahead_tokens and breaks the alignment.
             # We can ignore lookahead tokens because current draft models don't have
             # mamba layers.
-            num_tokens = num_tokens_main_model
+            # GLM53 (9/9): the scheduler's +1 decode lookahead (bf1e25bb25)
+            # is NOT a spec draft token — it reserves capacity so the NEXT
+            # state page exists in the same schedule that carries the
+            # boundary token. Dropping it here re-introduces the one-
+            # schedule page lag: the boundary token's state write targets
+            # the first state of the next page while the page table still
+            # holds a recycled stale entry → one-step NaN → repetition
+            # lock at every page boundary. Allocate the next page whenever
+            # the lookahead crosses the boundary (main_model ends exactly
+            # on a block boundary), keeping alignment for genuine
+            # spec-decode lookahead.
+            _gl53_la = num_tokens - num_tokens_main_model
+            if (
+                _gl53_la >= 1
+                and num_tokens_main_model > 0
+                and num_tokens_main_model % self.block_size == 0
+            ):
+                num_tokens = num_tokens_main_model + self.block_size
+            else:
+                num_tokens = num_tokens_main_model
             req_blocks: list[KVCacheBlock] = self.req_to_blocks[request_id]
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
