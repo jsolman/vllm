@@ -155,6 +155,9 @@ class SparseIndexerTopk(torch.nn.Module):
         self._cooperative_capable = self._is_cuda and (
             current_platform.has_device_capability(90)
             and not current_platform.is_device_capability_family(120)
+            # Thor/SM110: cooperative_topk's TMA path miscompiles on
+            # Blackwell-family adjacent sm_110 — exclude like family 120.
+            and not current_platform.is_device_capability_family(110)
         )
 
     def resolve_backend(

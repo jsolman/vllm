@@ -24,7 +24,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadata,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
-    MLAAttentionImpl,
+    SparseMLAAttentionImpl,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
     flat_kv_row_view,
@@ -186,8 +186,7 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
         return metadata
 
 
-class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndicesBuffer):
-    is_sparse = True
+class XPUMLASparseImpl(SparseMLAAttentionImpl[XPUMLASparseMetadata]):
 
     def __init__(
         self,

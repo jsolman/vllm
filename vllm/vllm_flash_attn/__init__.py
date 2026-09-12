@@ -31,9 +31,10 @@ from vllm.vllm_flash_attn.flash_attn_interface import (  # noqa: E402
 )
 
 if not (FA2_AVAILABLE or FA3_AVAILABLE):
-    raise ImportError(
-        "vllm.vllm_flash_attn requires the CUDA flash attention extensions "
-        "(_vllm_fa2_C or _vllm_fa3_C). On ROCm, use upstream flash_attn."
+    import warnings
+    warnings.warn(
+        "vllm.vllm_flash_attn CUDA extensions (_vllm_fa2_C or _vllm_fa3_C) "
+        "not available. Using TRITON_MLA backend instead."
     )
 
 __all__ = [
