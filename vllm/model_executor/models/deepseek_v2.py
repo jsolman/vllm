@@ -748,6 +748,7 @@ class Indexer(nn.Module):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
+            n_head=self.n_head,
         )
 
         self.is_inplace_rope = is_inplace_rope
@@ -1658,6 +1659,14 @@ class DeepseekV2Model(nn.Module):
                 name.rsplit(".indexer.", 1)[0] not in indexer_present_prefixes
             ):
                 continue  # this layer has no indexer; drop its checkpoint weights
+
+            if any(
+                f".mlp.experts.{p}" in name
+                for p in ("w13_", "w2_", "w2m_", "w2c_", "nvfp4_", "hyb_")
+            ):
+                name = name.replace(
+                    ".mlp.experts.", ".mlp.experts.routed_experts."
+                )
 
             is_fusion_moe_shared_experts_layer = (
                 self.is_fused_shared_expert_enabled and ("mlp.shared_experts" in name)

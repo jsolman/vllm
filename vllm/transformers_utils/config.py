@@ -136,6 +136,10 @@ _CONFIG_REGISTRY: dict[str, type[PreTrainedConfig]] = LazyConfigDict(
     dots3_note="Dots3NoteConfig",
     k3_dspark="K3DSparkConfig",
     funaudiochat="FunAudioChatConfig",
+    # glm5v uses a vllm-local config class (transformers has no Glm5vConfig).
+    # glm5_next / granite4_vision / hy_v3 configs ship in transformers (>=5.17)
+    # since e3cae8d2ac moved GLM-5.3 configs upstream — no vllm registry entry.
+    glm5v="Glm5vConfig",
     hy_v4="HYV4Config",
     hyperclovax="HyperCLOVAXConfig",  # Upstream class, hub remote code is broken
     isaac="IsaacConfig",

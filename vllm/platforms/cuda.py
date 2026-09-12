@@ -152,6 +152,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHINFER_MLA,
                 AttentionBackendEnum.TRITON_MLA,
                 *sparse_tail,
+                AttentionBackendEnum.TRITON_MLA_SPARSE,
             ]
     else:
         # SM100f defaults to FlashInfer for TRTLLM causal attention, but its non-causal
@@ -737,8 +738,19 @@ class CudaPlatformBase(Platform):
     def is_arch_support_pdl(cls) -> bool:
         try:
             device = torch.cuda.current_device()
-            major, _ = torch.cuda.get_device_capability(device)
+            major, minor = torch.cuda.get_device_capability(device)
         except Exception:
+            return False
+        # SM110 (Tegra Thor): PDL benefit is marginal at 20 SMs, and PDL
+        # semantics (triton launch_pdl, tilelang T.pdl_sync, CuteDSL) were
+        # SUSPECTED (never confirmed) of involvement in kernel wedges inside
+        # piecewise CUDA graphs (98% SM at idle power, zero progress; see
+        # csrc/pdl_sm110_guard.cuh for the csrc side). Disabled by default;
+        # VLLM_SM110_PDL=1 force-enables for A/B testing.
+        import os
+        if os.environ.get("VLLM_SM110_PDL") == "1":
+            pass  # forced on for A/B
+        elif major * 10 + minor == 110:
             return False
         return major >= 9
 

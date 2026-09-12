@@ -38,6 +38,10 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "EAGLEConfig": "vllm.transformers_utils.configs.eagle",
     "FunAudioChatConfig": "vllm.transformers_utils.configs.funaudiochat",
     "FunAudioChatAudioEncoderConfig": "vllm.transformers_utils.configs.funaudiochat",
+    # glm5v config lives in vllm (no transformers equivalent); glm5_next /
+    # granite4_vision / hy_v3 ship in transformers (>=5.17) — no local mapping.
+    "Glm5vConfig": "vllm.transformers_utils.configs.glm5v",
+    "Glm5vVisionConfig": "vllm.transformers_utils.configs.glm5v",
     "HYV4Config": "vllm.transformers_utils.configs.hy_v4",
     "IsaacConfig": "vllm.transformers_utils.configs.isaac",
     # RWConfig is for the original tiiuae/falcon-40b(-instruct) and
@@ -115,6 +119,8 @@ __all__ = [
     "EAGLEConfig",
     "FunAudioChatConfig",
     "FunAudioChatAudioEncoderConfig",
+    "Glm5vConfig",
+    "Glm5vVisionConfig",
     "HYV4Config",
     "HyperCLOVAXConfig",
     "IsaacConfig",
