@@ -1741,6 +1741,21 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         if prefix.endswith(".lm_head"):
             candidates.append("lm_head")
 
+        # MTP/speculative draft models build their layers as plain text-tower
+        # prefixes (``model.layers.45.mtp_block.*`` / ``model.layers.45.*``),
+        # while ``quantized_layers`` keys use the serialized
+        # (ForConditionalGeneration) form ``model.language_model.layers.*``
+        # (mapped at config load to ``language_model.model.layers.*``) and
+        # never contain the draft-only ``mtp_block`` wrapper. Also consider
+        # the un-wrapped prefix and both language-model conventions.
+        stripped = prefix.replace(".mtp_block.", ".")
+        if stripped.startswith("model.layers."):
+            candidates.append(stripped)
+            candidates.append("language_model.model." + stripped[len("model.") :])
+            candidates.append(
+                "model.language_model." + stripped[len("model.") :]
+            )
+
         if prefix.startswith("language_model.model."):
             candidates.append(
                 "model.language_model." + prefix[len("language_model.model.") :]

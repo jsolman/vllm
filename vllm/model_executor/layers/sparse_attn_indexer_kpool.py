@@ -963,7 +963,16 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
+        # DeepGEMM's MQA-logits kernels are Hopper/Blackwell-only; on GPUs it
+        # does not support (e.g. SM110 Thor) the fp8 Triton MQA-logits path is
+        # the drop-in fallback (the kpool cache is plain fp8 e4m3 + fp32
+        # scales, never fp4, so the Triton kernels are equivalent). Only
+        # hard-require deep_gemm where the platform would actually use it.
+        if (
+            current_platform.is_cuda()
+            and current_platform.support_deep_gemm()
+            and not has_deep_gemm()
+        ):
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
             )
@@ -976,6 +985,16 @@ class SparseAttnIndexerKpool(CustomOp):
         ):
             raise NotImplementedError(
                 "SparseAttnIndexerKpool does not support PCP+DCP."
+            )
+        if current_platform.is_cuda() and not is_deep_gemm_supported():
+            if use_fp4_cache:
+                raise RuntimeError(
+                    "kpool indexer: use_fp4_cache requires DeepGEMM (SM90+). "
+                    "This GPU falls back to the fp8 Triton MQA-logits path."
+                )
+            logger.info_once(
+                "Sparse Attention Indexer: DeepGEMM unavailable on this GPU; "
+                "using the Triton fp8 MQA-logits fallback."
             )
 
         # Pre-size the shared workspace at model construction (eager, before
