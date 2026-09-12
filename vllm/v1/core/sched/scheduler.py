@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -829,11 +830,44 @@ class Scheduler(SchedulerInterface):
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
+                # GLM53 drift fix (9/9): reserve one token of lookahead
+                # capacity for every scheduled decode token. The
+                # compressed KV write of the token being scheduled
+                # targets the FIRST compressed state of the NEXT pool
+                # page when the request sits exactly on a 2176-token
+                # page boundary, but that page was previously allocated
+                # only in the NEXT schedule() — one full forward too
+                # late under the async pipeline (the worker executes
+                # the boundary token while its page id is still absent
+                # from the gathered block table; with stale tails it
+                # wrote a ghost page, with the gather-tail fix it
+                # writes page 0 and destroys state 0 — the residual
+                # one-step NaN at 2863/4365/5867/...). A +1 token of
+                # lookahead makes num_tokens_need_slot cross the page
+                # boundary ONE schedule early, so the page exists in
+                # the same schedOut that carries the boundary token.
+                # Cost: zero extra blocks except exactly at the
+                # boundary (cdiv granularity).
+                _gl53_lookahead = self.num_lookahead_tokens
+                # Only reserve the boundary page ahead when spec decode is
+                # active: without a drafter there is no next-page state
+                # write racing the boundary, and the extra reservation
+                # changes preemption timing upstream tests encode
+                # (test_priority_scheduling_preemption_and_resumption_when_
+                # out_of_kv), which the MTP-f2 admission mirror would
+                # otherwise mirror into an off-by-one block budget.
+                if (
+                    _gl53_lookahead < 1
+                    and self.num_spec_tokens > 0
+                    and not self.use_pp
+                    and request.is_prefill_chunk is False
+                ):
+                    _gl53_lookahead = 1
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=_gl53_lookahead,
                     )
 
                     if new_blocks is not None:
@@ -1633,6 +1667,47 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        # SCHEDLOG (f43b): scheduler-side allocation timing at the MLA
+        # 2176-block boundaries. Log per running request the MLA group's
+        # block-id tail + num_computed_tokens whenever the request's
+        # computed position is within 8 tokens of a 2176 boundary, plus
+        # every step in a small window (caught via the boundary flag).
+        if os.environ.get("VLLM_DEBUG_DRIFT_SCHEDLOG"):
+            try:
+                # sched_step_seq only advances with defer_block_free (not
+                # active here); maintain a dedicated counter for the probe.
+                self._schedlog_seq = getattr(self, "_schedlog_seq", -1) + 1
+                _seq = self._schedlog_seq
+                for _rid in num_scheduled_tokens:
+                    _req = self.requests.get(_rid)
+                    if _req is None:
+                        continue
+                    _blocks = self.kv_cache_manager.get_block_ids(_rid)
+                    # Dump EVERY group's tail: group-0 ids [1,7,12] turned
+                    # out to be the ragged-wrapper ledger (+5..6 per ~1300
+                    # steps), NOT the 2176-page MLA group. The MLA group
+                    # (which holds the boundary pages 306..322 in f36) is
+                    # one of the other indices.
+                    _pos = _req.num_computed_tokens
+                    _near = (_pos % 2176) < 16 or 2176 - (_pos % 2176) < 16
+                    _tails = "|".join(
+                        f"{i}:{len(b)}:{b[-6:]}" for i, b in enumerate(_blocks)
+                    )
+                    if _near:
+                        with open(
+                            "/tmp/drift-schedlog-"
+                            + os.environ.get("VLLM_DEBUG_DRIFT_TAG", "x")
+                            + ".txt",
+                            "a",
+                        ) as _f:
+                            _f.write(
+                                f"{_seq} req={_rid} pos={_pos} "
+                                f"groups={_tails}\n"
+                            )
+            except Exception as _e:
+                import sys
+
+                print(f"[schedlog] ERR {_e!r}", file=sys.stderr, flush=True)
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -2196,22 +2271,49 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
-            if scheduled_spec_token_ids and (
-                generated_token_ids or self.num_sampled_tokens_per_step == 0
+            # Account any materialized or rejected output slots for this
+            # speculative step. Empty output rows previously leaked both
+            # num_computed_tokens and num_output_placeholders (PR #47928).
+            # Skip a stale frame still pending discard
+            # (async_tokens_to_discard > 0): its pre-reset rejection count
+            # would underflow the counters.
+            if (
+                scheduled_spec_token_ids
+                and not output_is_stale
+                and not request.drop_stale_output
             ):
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_sampled = self.num_sampled_tokens_per_step
-                num_accepted = max(len(generated_token_ids) - num_sampled, 0)
-                num_rejected = num_draft_tokens - num_accepted
-                # Rejections roll back num_computed_tokens (and, under async
-                # scheduling, num_output_placeholders, which covers the spec
-                # tokens). A stale rejection count predates the preemption
-                # rollback and must not apply.
-                if not output_is_stale:
-                    if request.num_computed_tokens > 0:
-                        request.num_computed_tokens -= num_rejected
-                    if request.num_output_placeholders > 0:
-                        request.num_output_placeholders -= num_rejected
+                num_materialized = len(generated_token_ids)
+                num_accepted = max(num_materialized - num_sampled, 0)
+                num_accepted = min(num_accepted, num_draft_tokens)
+                num_scheduled_output_slots = num_sampled + num_draft_tokens
+                num_scheduled_output_slots = min(
+                    num_scheduled_output_slots,
+                    num_scheduled_tokens.get(req_id, num_scheduled_output_slots),
+                )
+                num_unmaterialized = max(
+                    num_scheduled_output_slots - num_materialized, 0
+                )
+                # num_computed_tokens represents the number of tokens
+                # processed in the current step, considering scheduled
+                # tokens and rejections. If some tokens are rejected,
+                # num_computed_tokens is decreased by the number of rejected
+                # tokens.
+                if request.num_computed_tokens > 0:
+                    request.num_computed_tokens -= min(
+                        num_unmaterialized, request.num_computed_tokens
+                    )
+                # If async scheduling, num_output_placeholders also includes
+                # the scheduled sampled/spec token slots and so is similarly
+                # adjusted. When generated_token_ids is empty,
+                # _update_request_with_output() does not drain the sampled
+                # slot, so it is included in num_unmaterialized.
+                if request.num_output_placeholders > 0:
+                    request.num_output_placeholders -= min(
+                        num_unmaterialized,
+                        request.num_output_placeholders,
+                    )
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
@@ -2232,6 +2334,41 @@ class Scheduler(SchedulerInterface):
                         num_draft_tokens=adj_draft_tokens,
                         num_accepted=num_accepted,
                         detailed=self.spec_decode_metrics_level == "detailed",
+                    )
+
+            elif (
+                not scheduled_spec_token_ids
+                and not generated_token_ids
+                and not output_is_stale
+            ):
+                # Non-spec empty output row: the sampled slot reserved at
+                # schedule time never materializes and nothing else drains
+                # it (PR #47928 covers only the spec path). Refund it to
+                # keep num_output_placeholders from leaking one slot per
+                # occurrence, which inflates num_new_tokens and keeps
+                # is_prefill_chunk set past the real prefill.
+                refund = min(
+                    self.num_sampled_tokens_per_step,
+                    num_tokens_scheduled,
+                    request.num_output_placeholders,
+                )
+                if refund > 0:
+                    logger.warning(
+                        "Non-spec empty output row: refunding %d output "
+                        "placeholder(s) for request %s "
+                        "(num_computed_tokens=%d, num_output_placeholders=%d).",
+                        refund,
+                        req_id,
+                        request.num_computed_tokens,
+                        request.num_output_placeholders,
+                    )
+                    request.num_output_placeholders -= refund
+                    # The refunded sampled slot was counted in
+                    # num_computed_tokens when it was scheduled. Roll it back
+                    # too, or the next schedule under-counts by `refund`
+                    # tokens.
+                    request.num_computed_tokens = max(
+                        request.num_computed_tokens - refund, 0
                     )
 
             # Free encoder inputs only after the step has actually executed.

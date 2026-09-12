@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
+import sys
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
