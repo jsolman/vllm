@@ -758,7 +758,10 @@ def mhc_pre_broadcast_tilelang(
         fn_broadcast,
         hidden_size=hidden_size,
         hc_mult=hc_mult,
-        use_tilelang_fallback=False,
+        # Thor/SM110: is_deep_gemm_supported() is False (no DeepGEMM on
+        # sm_110) — must keep the tilelang GEMM fallback; the caller-side
+        # n_splits/DeepGEMM-vs-fallback selection lives inside the helper.
+        use_tilelang_fallback=True,
     )
     _MHC_PRE_BIG_FUSE_TILELANG_KERNEL(
         gemm_out_mul,
