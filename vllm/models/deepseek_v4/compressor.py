@@ -42,6 +42,16 @@ def _prefer_two_stage_compressor() -> bool:
     return current_platform.is_rocm()
 
 
+def _cutedsl_compressor_available() -> bool:
+    # CuTeDSL compressor kernels are not validated on SM110 (AGX Thor):
+    # NVVM ICEs there for other CuTeDSL kernels and the C128A compressor
+    # path is implicated in decode NaNs. Fall back to the Triton variant
+    # (same one ROCm uses) when CuTeDSL is not enabled cluster-wide.
+    from vllm.utils.import_utils import has_cutedsl
+
+    return has_cutedsl()
+
+
 def _get_c128_boundary(metadata: CommonAttentionMetadata) -> bool | None:
     seq_lens_cpu = metadata.seq_lens_cpu_upper_bound
     if seq_lens_cpu is None:
@@ -444,14 +454,17 @@ class DeepseekCompressor(nn.Module):
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
+        if (
+            current_platform.is_cuda()
+            and self.head_dim == 512
+            and _cutedsl_compressor_available()
+        ):
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 _SPARSE_ATTN_COMPRESSOR_CUTEDSL_KERNEL,
             )
 
-            # head=512 on CUDA always uses cutedsl, for both the fp8_ds_mla
-            # layout and the plain full-cache layout. The full-cache flags
-            # are consumed only here.
+            # CuTeDSL's sparse compressor requires SM90+. It handles both
+            # the fp8_ds_mla layout and the plain full-cache layout.
             compress_norm_rope_store_fn = _SPARSE_ATTN_COMPRESSOR_CUTEDSL_KERNEL
             extra_kwargs: dict[str, Any] = dict(
                 store_full_kv=store_full_kv,
@@ -468,7 +481,13 @@ class DeepseekCompressor(nn.Module):
                 "compress_scratch": self._compress_scratch,
             }
         else:
-            # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
+            # Indexer path, non-CUDA GPUs, or pre-SM90 CUDA. The latter uses
+            # the portable Triton sparse compressor for fp8_ds_mla.
+            if current_platform.is_cuda() and self.head_dim == 512 and store_full_kv:
+                raise NotImplementedError(
+                    "DeepSeek V4 full-row KV cache on pre-SM90 CUDA requires "
+                    "the CuTeDSL sparse compressor; use fp8_ds_mla KV cache"
+                )
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
             extra_kwargs = {}
 

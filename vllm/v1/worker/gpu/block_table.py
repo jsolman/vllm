@@ -274,6 +274,16 @@ def _gather_block_tables_kernel(
         offset = i + tl.arange(0, BLOCK_SIZE)
         block_ids = tl.load(src_row_ptr + offset, mask=offset < num_blocks)
         tl.store(dst_row_ptr + offset, block_ids, mask=offset < num_blocks)
+    # Zero the tail beyond num_blocks: this buffer is persistent and shared
+    # across requests (the same dst row is reused by different requests over
+    # time), so leftover block ids from a previous longer request would leak
+    # into downstream consumers that read past the row's live length (e.g.
+    # strided/block-compressed views of the table). Start exactly at
+    # num_blocks (the live-copy loop's masked stores leave [num_blocks,
+    # next BLOCK_SIZE boundary) stale); padded rows are zeroed above.
+    for i in tl.range(num_blocks, max_num_blocks, BLOCK_SIZE):
+        offset = i + tl.arange(0, BLOCK_SIZE)
+        tl.store(dst_row_ptr + offset, 0, mask=offset < max_num_blocks)
 
 
 @triton.jit
@@ -346,15 +356,23 @@ def _compute_slot_mappings_kernel(
             is_local = ~sharded | is_local
 
         block_indices = tl.where(mapping_enabled, local_positions // kv_block_size, 0)
+        # Guard against block indices beyond this group's block-table row
+        # width: a narrow cache group's table does not span the sequence in
+        # raw token positions, so a deep position can produce an index past
+        # the row end. The unguarded load would read out of bounds and the
+        # `other=0` fallback would fabricate a valid-looking slot in block 0.
+        block_indices_ok = block_indices < block_table_stride
         block_offsets = local_positions % kv_block_size
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices,
-            mask=is_local & is_real_req,
+            mask=is_local & is_real_req & block_indices_ok,
             other=0,
         )
         slot_ids = block_numbers * kv_block_size + block_offsets
         if CP_SIZE != 1:
             slot_ids = tl.where(is_local, slot_ids, PAD_ID)
 
-        slot_ids = tl.where(mapping_enabled & is_real_req, slot_ids, PAD_ID)
+        slot_ids = tl.where(
+            mapping_enabled & is_real_req & block_indices_ok, slot_ids, PAD_ID
+        )
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
