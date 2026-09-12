@@ -831,9 +831,14 @@ class MessageQueue:
             if len(raw_buf) < 1024 * 1024:
                 # In-line buffers smaller than 1MiB.
                 return True
-            all_buffers.append(raw_buf)
+            # Copy: raw_buf aliases the live tensor's memory. With ZMQ
+            # send_multipart(copy=False) the message would reference memory the
+            # scheduler mutates/reuses after enqueue() returns, racing the
+            # async ZMQ send (observed as "_pickle.UnpicklingError: pickle
+            # data was truncated" on remote workers, thor20 2026-08-20).
+            all_buffers.append(bytes(raw_buf))
             nonlocal total_bytes
-            total_bytes += len(raw_buf) + 4
+            total_bytes += len(all_buffers[-1]) + 4
             return False
 
         # CPU tensors are routed through `_reduce_tensor` so that their
