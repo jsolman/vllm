@@ -44,7 +44,12 @@ def _triton_kernel_moe_supports_current_device() -> bool:
         # Keep the original `(9, 0) <= cap < (11, 0)` window on
         # CUDA (covers Hopper SM90 and Blackwell SM100, excludes
         # SM120) — this PR is ROCm-scoped and the broader CUDA
-        # range was not validated.
+        # range was not validated. SM110 (Thor/Tegra Blackwell) is
+        # included: the OAI triton_kernels are plain Triton and
+        # compile for any Triton-supported arch; validated on
+        # AGX Thor (sm_110) for DeepSeek-V4-Flash MXFP4 experts.
+        if cap is not None and (cap.major, cap.minor) == (11, 0):
+            return True
         return cap is not None and (9, 0) <= (cap.major, cap.minor) < (11, 0)
     if p.is_rocm():
         from vllm.platforms.rocm import on_gfx1x, on_gfx9

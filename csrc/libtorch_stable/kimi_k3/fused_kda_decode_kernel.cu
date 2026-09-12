@@ -10,6 +10,7 @@
 
 #include "../torch_utils.h"
 #include "../../cuda_compat.h"
+#include "libtorch_stable/pdl_sm110_guard.cuh"
 
 namespace {
 
@@ -757,9 +758,9 @@ void launch_kda_decode_many_heads_raw(
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  attrs[0].val.programmaticStreamSerializationAllowed = vllm_stable::disable_pdl_sm110() ? 0 : 1;
   config.attrs = attrs;
-  config.numAttrs = 1;
+  config.numAttrs = vllm_stable::disable_pdl_sm110() ? 0 : 1;
   cudaLaunchKernelEx(&config, kernel,
                      reinterpret_cast<const __nv_bfloat16*>(x_q),
                      reinterpret_cast<const __nv_bfloat16*>(x_k),

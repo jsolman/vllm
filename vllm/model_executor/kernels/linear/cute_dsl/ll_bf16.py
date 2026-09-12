@@ -24,6 +24,12 @@ def is_available() -> bool:
         import cutlass  # noqa: F401
         import cutlass.cute  # noqa: F401
 
+        from vllm.utils.import_utils import has_cutedsl
+        if not has_cutedsl():
+            _cutedsl_available = False
+            logger.info("cuteDSL disabled on this platform, ll_bf16_gemm disabled")
+            return _cutedsl_available
+
         _cutedsl_available = True
     except ImportError:
         _cutedsl_available = False
