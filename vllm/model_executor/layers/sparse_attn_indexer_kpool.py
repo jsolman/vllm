@@ -564,8 +564,15 @@ def sparse_attn_indexer_kpool(
             # expand each pool back to its kpool constituent tokens.
             select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
             if index_kpool > 1:
-                pool_topk = torch.empty(
-                    (num_rows, select_k), dtype=torch.int32, device=logits.device
+                # Initialize to the -1 sentinel: the top-k kernels are only
+                # guaranteed to fill exactly the selected entries; unwritten
+                # slots in an `torch.empty` destination would hold arbitrary
+                # positive values that the pool expansion below would treat as
+                # valid pool IDs and expand into out-of-range token indices
+                # (silent sparse-attention corruption, drifts under long
+                # generations with tightly-clustered scores).
+                pool_topk = torch.full(
+                    (num_rows, select_k), -1, dtype=torch.int32, device=logits.device
                 )
                 topk_dst = pool_topk
             else:
@@ -846,8 +853,11 @@ def sparse_attn_indexer_kpool(
         # then expand each pool back to its kpool tokens.
         select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
         if index_kpool > 1:
-            pool_topk = torch.empty(
-                (num_rows, select_k), dtype=torch.int32, device=logits.device
+            # Same -1 sentinel rationale as the prefill path above: unwritten
+            # top-k slots must not carry arbitrary positive garbage into the
+            # pool expansion.
+            pool_topk = torch.full(
+                (num_rows, select_k), -1, dtype=torch.int32, device=logits.device
             )
             topk_dst = pool_topk
         else:

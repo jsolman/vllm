@@ -430,6 +430,7 @@ def test_deepseek_v4_encode_messages_rejects_invalid_arguments(kwargs):
         encode_messages([{"role": "user", "content": "Hello"}], **kwargs)
 
 
+def _request_tools():
     return [
         {
             "type": "function",
