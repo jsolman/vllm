@@ -283,6 +283,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
     MLAAttentionImpl,
+    SparseMLAAttentionImpl,
 )
 from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 from vllm.v1.attention.backends.mla.prefill import (
@@ -950,14 +951,23 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         ):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
-        assert (
-            attn_metadata.num_decodes is not None
-            and attn_metadata.num_prefills is not None
-            and attn_metadata.num_decode_tokens is not None
-        )
-        num_mqa_tokens = attn_metadata.num_decode_tokens
-        num_mha_tokens = q.size(0) - num_mqa_tokens
-        use_mha = True
+        is_sparse_impl = isinstance(self.impl, SparseMLAAttentionImpl)
+
+        if is_sparse_impl:
+            num_mqa_tokens = q.size(0)
+            num_mha_tokens = 0
+        else:
+            assert (
+                attn_metadata.num_decodes is not None
+                and attn_metadata.num_prefills is not None
+                and attn_metadata.num_decode_tokens is not None
+            )
+            num_mqa_tokens = attn_metadata.num_decode_tokens
+            num_mha_tokens = q.size(0) - num_mqa_tokens
+
+        # Non-sparse metadata exposes per-decode fields; sparse metadata does
+        # not, so the DCP combine path below must use the top-level seq_lens.
+        use_mha = not is_sparse_impl
 
         if self.impl.is_sparse and num_mha_tokens > 0:
             use_mha = self._use_sparse_mha(attn_metadata)
@@ -1184,7 +1194,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
     def _use_sparse_mha(self, attn_metadata: "MLACommonMetadata") -> bool:
         if self.hisparse_cache is not None:
             return False
-        prefill = attn_metadata.prefill
+        # XPUMLASparseMetadata (TRITON_MLA_SPARSE builder) serves all tokens
+        # through the sparse MQA path and carries no .prefill object.
+        prefill = getattr(attn_metadata, "prefill", None)
         if prefill is None:
             return False
         use_masked_mha = (
