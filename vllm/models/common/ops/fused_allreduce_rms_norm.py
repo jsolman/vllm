@@ -12,6 +12,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.platforms import current_platform
 from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
     _AR_RESIDUAL_RMS_NORM,
     _can_use_flashinfer,
@@ -36,6 +37,17 @@ def fused_allreduce_rms_norm(
     tp_size = get_tensor_model_parallel_world_size()
     if tp_size == 1:
         return norm(hidden_states, residual)
+
+    # SM110 (Tegra Thor): the trtllm fused allreduce launches with PDL
+    # (launch_with_pdl=True below). PDL benefit is marginal at 20 SMs and it
+    # was SUSPECTED (never confirmed) of contributing to instability inside
+    # piecewise CUDA graphs on SM110 - same caution as the tilelang kernels
+    # (pdl_sm110_guard.cuh) and the python-side triton launches
+    # (platforms/cuda.py is_arch_support_pdl). Falls back to the explicit
+    # allreduce + norm path when PDL is unavailable or gated off.
+    if not current_platform.is_arch_support_pdl():
+        reduced = tensor_model_parallel_all_reduce(hidden_states)
+        return norm(reduced, residual)
 
     if flashinfer_trtllm_fused_allreduce_norm is not None:
         ok, max_token_num = _can_use_flashinfer(hidden_states, tp_size)

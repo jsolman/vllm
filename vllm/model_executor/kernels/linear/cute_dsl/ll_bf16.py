@@ -24,6 +24,13 @@ logger = logging.getLogger(__name__)
 
 
 def is_available() -> bool:
+    # G1 carry-over: consult the platform gate (has_cutedsl returns False on
+    # SM110 — CuTeDSL NVVM compilation ICEs there) in addition to upstream's
+    # plain import check, which has no platform awareness.
+    from vllm.utils.import_utils import has_cutedsl
+    if not has_cutedsl():
+        logger.info("cuteDSL disabled on this platform, ll_bf16_gemm disabled")
+        return False
     return is_cutedsl_available("ll_bf16_gemm")
 
 

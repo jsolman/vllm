@@ -36,6 +36,11 @@ def is_fused_q_cutedsl_supported(
     if not (
         current_platform.has_device_capability(100)
         and q_pe.dtype == torch.bfloat16
+        # SM110 (Tegra Thor): the CuTeDSL fused_q is only validated on
+        # SM100; on SM110 it produced garbage (NaN) outputs under
+        # piecewise capture in the 9/5-era validation. Fall back to the
+        # Triton kernel on SM110; revisit if CuTeDSL is re-validated there.
+        and current_platform.get_device_capability()[0] != 11
         and q_pe.shape[-1] == 64
         and (
             not quantize_mqa

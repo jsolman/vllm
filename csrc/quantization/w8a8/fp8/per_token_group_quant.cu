@@ -17,6 +17,7 @@
 #include "quantization/vectorization_utils.cuh"
 #include "dispatch_utils.h"
 #include "torch_utils.h"
+#include "../../../pdl_sm110_guard.cuh"
 
 __device__ __forceinline__ float GroupReduceMax(float val) {
 #ifdef USE_ROCM
@@ -410,7 +411,7 @@ static void per_token_group_quant_8bit(const torch::stable::Tensor& input,
       cudaLaunchAttribute attrs[1];                                         \
       attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;     \
       attrs[0].val.programmaticStreamSerializationAllowed = 1;              \
-      config.numAttrs = 1;                                                  \
+      config.numAttrs = vllm_stable::disable_pdl_sm110() ? 0 : 1;           \
       config.attrs = attrs;                                                 \
       cudaLaunchKernelEx(                                                   \
           &config,                                                          \
@@ -455,7 +456,7 @@ static void per_token_group_quant_8bit(const torch::stable::Tensor& input,
       cudaLaunchAttribute attrs[1];                                           \
       attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;       \
       attrs[0].val.programmaticStreamSerializationAllowed = 1;                \
-      config.numAttrs = 1;                                                    \
+      config.numAttrs = vllm_stable::disable_pdl_sm110() ? 0 : 1;             \
       config.attrs = attrs;                                                   \
       cudaLaunchKernelEx(                                                     \
           &config,                                                            \
@@ -818,7 +819,7 @@ void per_token_group_quant_8bit_packed(const torch::stable::Tensor& input,
       cudaLaunchAttribute attrs[1];                                     \
       attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; \
       attrs[0].val.programmaticStreamSerializationAllowed = 1;          \
-      config.numAttrs = 1;                                              \
+      config.numAttrs = vllm_stable::disable_pdl_sm110() ? 0 : 1;                                              \
       config.attrs = attrs;                                             \
       cudaLaunchKernelEx(                                               \
           &config,                                                      \
