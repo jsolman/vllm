@@ -42,6 +42,16 @@ def _prefer_two_stage_compressor() -> bool:
     return current_platform.is_rocm()
 
 
+def _cutedsl_compressor_available() -> bool:
+    # CuTeDSL compressor kernels are not validated on SM110 (AGX Thor):
+    # NVVM ICEs there for other CuTeDSL kernels and the C128A compressor
+    # path is implicated in decode NaNs. Fall back to the Triton variant
+    # (same one ROCm uses) when CuTeDSL is not enabled cluster-wide.
+    from vllm.utils.import_utils import has_cutedsl
+
+    return has_cutedsl()
+
+
 def _get_c128_boundary(metadata: CommonAttentionMetadata) -> bool | None:
     seq_lens_cpu = metadata.seq_lens_cpu_upper_bound
     if seq_lens_cpu is None:
@@ -445,8 +455,8 @@ class DeepseekCompressor(nn.Module):
         compress_norm_rope_store_fn: Any
         if (
             current_platform.is_cuda()
-            and current_platform.has_device_capability(90)
             and self.head_dim == 512
+            and _cutedsl_compressor_available()
         ):
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 _SPARSE_ATTN_COMPRESSOR_CUTEDSL_KERNEL,
