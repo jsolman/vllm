@@ -25,6 +25,7 @@ from vllm.utils.deep_gemm import (
     get_paged_mqa_logits_metadata,
     get_paged_mqa_page_sizes,
     has_deep_gemm,
+    is_deep_gemm_supported,
     native_next_n_supported,
 )
 from vllm.utils.math_utils import round_down
@@ -958,7 +959,11 @@ def _supports_native_decode(next_n: int) -> bool:
     the KV tile once per row.
     """
     if not (current_platform.is_cuda() and has_deep_gemm()):
-        return next_n in (1, 2)
+        # Without DeepGEMM the consumers are the Triton fallback kernels,
+        # which are implemented over flattened per-token rows (1-D context
+        # lens); a native 2-D [B, next_n] layout cannot feed them. keep
+        # next_n==1 native only.
+        return next_n == 1
     if current_platform.is_device_capability_family(100):
         return True
     if current_platform.is_device_capability_family(90):
@@ -1740,7 +1745,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            if current_platform.is_cuda() and is_deep_gemm_supported():
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.num_states,

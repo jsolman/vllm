@@ -26,6 +26,7 @@ import dataclasses
 import functools
 import gc
 import logging
+import os
 import threading
 import weakref
 from collections.abc import Callable, Hashable
@@ -179,9 +180,11 @@ class BreakableCUDAGraphCapture:
         assert not self._capturing
         g = torch.cuda.CUDAGraph()
         if self.pool is not None:
-            g.capture_begin(pool=self.pool)
+            # thread_local: helper threads' CUDA work must not invalidate
+            # this thread's capture (NCCL progress threads, offloaders).
+            g.capture_begin(pool=self.pool, capture_error_mode="thread_local")
         else:
-            g.capture_begin()
+            g.capture_begin(capture_error_mode="thread_local")
         self._current_graph = g
         self._capturing = True
 
@@ -213,8 +216,17 @@ class BreakableCUDAGraphCapture:
     # --- replay ----------------------------------------------------------
 
     def replay(self) -> None:
+        # Per-segment sync: joining the graph's internal streams before the
+        # next eager segment reads its outputs (without it, eager break
+        # kernels race in-flight internal-stream work — intermittent NaN on
+        # multi-node TP). Env-gated for A/B: CUDA graph launches already
+        # join internal streams onto the launch stream, so the sync may be
+        # redundant; it also serializes GPU/CPU each segment (~50/step).
+        do_sync = envs.VLLM_BREAKABLE_SEGMENT_SYNC
         for r in self.segments:
             r()
+            if do_sync:
+                torch.cuda.synchronize()
 
     # --- introspection ---------------------------------------------------
 
@@ -288,7 +300,10 @@ class BreakableCUDAGraphWrapper:
         self.key_fn = key_fn
         self.compilation_config = vllm_config.compilation_config
         self.graph_pool = current_platform.get_global_graph_pool()
-        self.is_debugging_mode = logger.isEnabledFor(logging.DEBUG)
+        self.is_debugging_mode = (
+            logger.isEnabledFor(logging.DEBUG)
+            or bool(int(os.environ.get("VLLM_DEBUG_BRK_ADDRCHECK", "0") or 0))
+        )
 
         self.entries: dict[Hashable, _BreakableEntry] = {}
         BreakableCUDAGraphWrapper._all_instances.add(self)
@@ -396,14 +411,17 @@ class BreakableCUDAGraphWrapper:
             # segment open, so the join is captured into the graph (otherwise
             # we get an "unjoined stream" error on subsequent forwards).
             get_offloader().join_after_forward()
-            # Convert output to a weak ref *inside* the capture context so the
-            # strong ref is dropped before the last segment closes, letting
-            # the cudagraph pool reclaim/reuse that memory immediately for
-            # the next batch descriptor's capture.
-            output = weak_ref_tensors(output)
+            # NOTE: unlike the FULL-graph wrapper (compilation/cuda_graph.py),
+            # the model output here must NOT be weak-refed. Multiple batch
+            # descriptors share one graph pool; a weak-refed output lets the
+            # pool hand the output buffer to the NEXT descriptor's capture, and
+            # that descriptor's replay then overwrites the model output the
+            # sampler still has to read (observed as jibberish GLM-5.3 output
+            # only under PIECEWISE). Keep a strong reference: the cost is one
+            # [max_batch, hidden] buffer per descriptor.
 
         entry.capture = capture
-        entry.output = weak_ref_tensors(output)
+        entry.output = output
 
         logger.debug(
             "Captured breakable cudagraph for %s: %r",

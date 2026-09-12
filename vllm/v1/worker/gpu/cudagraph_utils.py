@@ -496,7 +496,13 @@ class CudaGraphManager:
                         with (
                             capture_pool(self.pool, self.vllm_config) as pool,
                             torch.cuda.graph(
-                                graph, pool, stream=self._capture_stream(desc)
+                                graph,
+                                pool,
+                                stream=self._capture_stream(desc),
+                                # thread_local capture_error_mode: unrelated
+                                # in-flight work on other streams must not
+                                # abort capture on Thor/SM110.
+                                capture_error_mode="thread_local",
                             ),
                         ):
                             forward_fn(CUDAGraphMode.NONE)
@@ -691,6 +697,18 @@ class ModelCudaGraphManager(CudaGraphManager):
                 "intermediate_tensors": None,
                 **model_state.prepare_dummy_inputs(num_reqs, num_tokens),
             }
+            # Multimodal models are served through inputs_embeds: execute_model
+            # drops input_ids whenever inputs_embeds is prepared and the model
+            # does not require raw tokens. The captured graph must see the SAME
+            # kwarg structure as replay, otherwise replay feeds stale capture-
+            # time buffers (baked token ids -> corrupted output). Mirror the
+            # execute_model rule here: with dummy inputs_embeds present, drop
+            # input_ids exactly like execute_model does.
+            if (
+                model_inputs.get("inputs_embeds") is not None
+                and not requires_raw_input_tokens(model)
+            ):
+                model_inputs["input_ids"] = None
             if not self.is_first_pp_rank:
                 # Update for non-first PP ranks.
                 if not requires_raw_input_tokens(model):
