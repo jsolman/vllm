@@ -34,6 +34,7 @@ from vllm.model_executor.utils import (
     set_weight_attrs,
 )
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -433,13 +434,18 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        # Call the decorated eager break directly so host-side prefill branches
-        # are not captured by PIECEWISE CUDA graphs.
-        self._forward(
-            qkv_proj_states=qkv,
-            g1=g1,
-            beta=beta,
-            core_attn_out=core_attn_out,
+        # Run the KDA core through a registered custom op that declares the
+        # in-place mutation of `core_attn_out`. Without the declaration the
+        # compiler cannot see the write (the core writes the buffer by raw
+        # pointer inside triton kernels), so the value read downstream is
+        # uninitialized memory -> zeros/NaN, which corrupts the residual
+        # stream from the very first layer.
+        torch.ops.vllm.kda_attn_with_output(
+            qkv,
+            g1,
+            beta,
+            core_attn_out,
+            self.prefix,
         )
         core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
@@ -734,3 +740,47 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
                     0, :num_actual_tokens
                 ]
+
+
+def kda_attn_with_output(
+    qkv_proj_states: torch.Tensor,
+    g1: torch.Tensor,
+    beta: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """KDA core writing into a caller-provided buffer, as a custom op.
+
+    ``core_attn_out`` is mutated in place by the core kernels. Declaring
+    that mutation (``mutates_args``) is required for torch.compile: the
+    write happens inside triton kernels through raw pointers, so without
+    the declaration the compiler treats the buffer as unwritten and reads
+    stale/uninitialized memory downstream.
+    """
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    self._forward(
+        qkv_proj_states=qkv_proj_states,
+        g1=g1,
+        beta=beta,
+        core_attn_out=core_attn_out,
+    )
+
+
+def kda_attn_with_output_fake(
+    qkv_proj_states: torch.Tensor,
+    g1: torch.Tensor,
+    beta: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Fake implementation for torch.compile."""
+    return
+
+
+direct_register_custom_op(
+    op_name="kda_attn_with_output",
+    op_func=kda_attn_with_output,
+    mutates_args=["core_attn_out"],
+    fake_impl=kda_attn_with_output_fake,
+)

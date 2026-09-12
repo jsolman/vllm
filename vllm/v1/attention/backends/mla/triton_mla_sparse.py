@@ -10,7 +10,11 @@ from vllm.config import get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.platform_utils import num_compute_units
-from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport
+from vllm.v1.attention.backend import (
+    AttentionBackend,
+    AttentionCGSupport,
+    MultipleOf,
+)
 from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
     XPUMLASparseImpl,
     XPUMLASparseMetadata,
@@ -40,9 +44,14 @@ _INDEXER_HEAD_DIM = 128
 
 
 class TritonMLASparseMetadataBuilder(XPUMLASparseMetadataBuilder):
-    # XPU base keeps NEVER (not validated under cudagraph); this subclass
-    # claims UNIFORM_BATCH for the CUDA/Triton path.
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    # UNIFORM_BATCH: the CUDA/Triton path builds all per-step attention state
+    # into persistent device buffers (topk indices, req_id_per_token), and the
+    # metadata's python-int fields (num_reqs/max_query_len/max_seq_len) are
+    # dataclass bookkeeping not read by the captured forward path, so uniform
+    # decode batches (spec-decode) replay correctly. Earlier NEVER was due to
+    # a GLM-5.2-era capture bug whose real root cause (capture-time metadata
+    # None baking dummy caches) was fixed separately (PR #54851).
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
 
 class TritonMLASparseImpl(XPUMLASparseImpl):
@@ -130,7 +139,9 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 attn_metadata.block_table,
                 topk_indices,
                 BLOCK_SIZE=attn_metadata.block_size,
-                NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+                # Match the padded topk buffer width (index_topk + kpool-1
+                # rounded up), not the nominal topk_tokens.
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
             )
 
         return_lse = self.need_to_return_lse_for_decode
@@ -206,6 +217,17 @@ class TritonMLASparseBackend(AttentionBackend):
         return "TRITON_MLA_SPARSE"
 
     @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        # The DSA indexer backend requires block size 64 on CUDA and shares
+        # the KV cache group with this backend; the base-class MultipleOf(1)
+        # default lets auto-selection settle on 16, which then fails
+        # select_common_block_size ("No common block size for 16").
+        # MultipleOf(64) (rather than [64]) keeps larger user-specified
+        # sizes like 128 usable, which measurably lowers profile-time peak
+        # memory for very long contexts.
+        return [MultipleOf(64)]
+
+    @staticmethod
     def get_metadata_cls() -> type[XPUMLASparseMetadata]:
         return XPUMLASparseMetadata
 
@@ -239,7 +261,10 @@ class TritonMLASparseBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [_DIM_QK]
+        # 576 = 512 latent + 64 RoPE (DeepSeek-V3.2 / GLM-5 with-rope).
+        # 512 = NoPE MLA (GLM-5.3-Flash, qk_rope_head_dim = 0); the kernel
+        # masks the PE tail out via mask_dpe when BLOCK_DPE == 0.
+        return [512, 576]
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:

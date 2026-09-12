@@ -707,13 +707,21 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
+        # DeepGEMM's MQA-logits kernels are Hopper/Blackwell-only; on GPUs it
+        # does not support (e.g. SM110 Thor) the fp8 Triton MQA-logits path is
+        # the drop-in fallback (the kpool cache is plain fp8 e4m3 + fp32
+        # scales, never fp4, so the Triton kernels are equivalent). Only
+        # hard-require deep_gemm where the platform would actually use it.
         if current_platform.is_cuda() and not has_deep_gemm():
-            # SM110 etc.: DeepGEMM-only MQA-logits kernels do not support this
-            # arch; the Triton fallback below keeps the CUDA path usable.
             if is_deep_gemm_supported():
                 raise RuntimeError(
                     "Sparse Attention Indexer CUDA op requires DeepGEMM to be "
                     "installed."
+                )
+            if use_fp4_cache:
+                raise RuntimeError(
+                    "kpool indexer: use_fp4_cache requires DeepGEMM (SM90+). "
+                    "This GPU falls back to the fp8 Triton MQA-logits path."
                 )
             logger.warning_once(
                 "DeepGEMM unavailable on %s: kpool indexer using the Triton "
@@ -735,7 +743,6 @@ class SparseAttnIndexerKpool(CustomOp):
             raise NotImplementedError(
                 "SparseAttnIndexerKpool does not support PCP+DCP."
             )
-
     def forward_native(
         self,
         hidden_states: torch.Tensor,
