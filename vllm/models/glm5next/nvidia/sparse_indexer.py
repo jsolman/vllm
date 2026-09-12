@@ -34,10 +34,15 @@ from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
     has_deep_gemm,
+    is_deep_gemm_supported,
     mqa_logits_mx_inputs,
     mqa_logits_use_mx_scales,
 )
 from vllm.utils.import_utils import has_cutedsl
+from vllm.v1.attention.ops.mqa_logits_triton import (
+    fp8_mqa_logits_triton,
+    fp8_paged_mqa_logits_triton,
+)
 from vllm.utils.torch_utils import (
     LayerNameType,
     _resolve_layer_name,
@@ -355,9 +360,15 @@ def sparse_attn_indexer_kpool(
                 ).squeeze(-1)
 
             num_rows = q_slice.shape[0]
+            # top-k window args, per logits producer (upstream conventions):
+            # DeepGEMM returns dense rows (valid [0, ke-ks)) → starts=0,
+            # ends=lengths. The Triton fallback returns full-width rows
+            # (valid [ks, ke) in index space) → starts=ks, ends=ke.
+            row_starts = None
+            row_ends = None
             if chunk.local_total_seq_lens == 0:
                 logits = q_slice.new_empty((num_rows, 0), dtype=torch.float32)
-            else:
+            elif is_deep_gemm_supported():
                 q_scale_slice, chunk_weights = mqa_logits_mx_inputs(
                     q_slice_cast, q_scale_slice, weights[row_start:row_end]
                 )
@@ -374,14 +385,38 @@ def sparse_attn_indexer_kpool(
                     ),
                     row_ends,
                 )
+            else:
+                # Triton fallback (DeepGEMM unavailable on this GPU, e.g.
+                # SM110 Thor). kpool cache is plain fp8 e4m3 + fp32 scale.
+                assert not use_fp4_cache, (
+                    "kpool indexer: fp4 index cache needs DeepGEMM; the "
+                    "Triton fallback is fp8-only."
+                )
+                logits = fp8_mqa_logits_triton(
+                    q_slice_cast,
+                    (k_quant_cast, k_scale_cast),
+                    weights[row_start:row_end],
+                    cu_seqlen_ks,
+                    cu_seqlen_ke,
+                    clean_logits=False,
+                )
+                row_starts = cu_seqlen_ks
+                row_ends = cu_seqlen_ke
 
             # kpool: logits are pool-granular (compress_ratio == index_kpool),
             # so topk selects pools. We pick topk_tokens // kpool pools then
             # expand each pool back to its kpool constituent tokens.
             select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
             if index_kpool > 1:
-                pool_topk = torch.empty(
-                    (num_rows, select_k), dtype=torch.int32, device=logits.device
+                # Initialize to the -1 sentinel: the top-k kernels are only
+                # guaranteed to fill exactly the selected entries; unwritten
+                # slots in an `torch.empty` destination would hold arbitrary
+                # positive values that the pool expansion below would treat as
+                # valid pool IDs and expand into out-of-range token indices
+                # (silent sparse-attention corruption, drifts under long
+                # generations with tightly-clustered scores).
+                pool_topk = torch.full(
+                    (num_rows, select_k), -1, dtype=torch.int32, device=logits.device
                 )
                 topk_dst = pool_topk
             else:
@@ -392,7 +427,9 @@ def sparse_attn_indexer_kpool(
             else:
                 torch.ops._C.top_k_per_row_prefill(
                     logits,
-                    torch.zeros_like(row_ends),
+                    torch.zeros_like(row_ends)
+                    if row_starts is None
+                    else row_starts,
                     row_ends,
                     topk_dst,
                     num_rows,
@@ -610,30 +647,59 @@ def sparse_attn_indexer_kpool(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        padded_q_scale, decode_weights = mqa_logits_mx_inputs(
-            padded_q_quant_cast, padded_q_scale, padded_weights[:num_padded_tokens]
-        )
-        # SM100 decode is varlen: one row and context length per token.
-        logits = as_fp32_logits(
-            fp8_fp4_paged_mqa_logits(
-                (padded_q_quant_cast, padded_q_scale),
+        triton_ctx_lens = (
+            seq_lens[:, -1] if seq_lens.dim() == 2 else seq_lens
+        ).to(torch.int32)
+        if is_deep_gemm_supported():
+            padded_q_scale, decode_weights = mqa_logits_mx_inputs(
+                padded_q_quant_cast, padded_q_scale, padded_weights[:num_padded_tokens]
+            )
+            # SM100 decode is varlen: one row and context length per token.
+            logits = as_fp32_logits(
+                fp8_fp4_paged_mqa_logits(
+                    (padded_q_quant_cast, padded_q_scale),
+                    kv_cache,
+                    decode_weights,
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_pool_len,
+                    indices=decode_metadata.indices,
+                ),
+                seq_lens.view(-1),
+            )
+        else:
+            # Triton fallback (DeepGEMM unavailable on this GPU, e.g. SM110
+            # Thor). No schedule_metadata: that is DeepGEMM's persistent-
+            # kernel scheduling, which the Triton paged kernel does not use.
+            # block_table is already pool-granular (the indexer metadata
+            # builder divides it by index_kpool).
+            assert not use_fp4_cache, (
+                "kpool indexer: fp4 index cache needs DeepGEMM; the Triton "
+                "fallback is fp8-only."
+            )
+            logits = fp8_paged_mqa_logits_triton(
+                padded_q_quant_cast.reshape(
+                    -1, 1, padded_q_quant_cast.shape[-2],
+                    padded_q_quant_cast.shape[-1]
+                ),
                 kv_cache,
-                decode_weights,
-                seq_lens,
+                padded_weights[:num_padded_tokens],
+                triton_ctx_lens,
                 decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_pool_len,
-                indices=decode_metadata.indices,
-            ),
-            seq_lens.view(-1),
-        )
+                max_pool_len,
+                clean_logits=False,
+            )
         num_rows = logits.shape[0]
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
         # then expand each pool back to its kpool tokens.
         select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
         if index_kpool > 1:
-            pool_topk = torch.empty(
-                (num_rows, select_k), dtype=torch.int32, device=logits.device
+            # Same -1 sentinel rationale as the prefill path above: unwritten
+            # top-k slots must not carry arbitrary positive garbage into the
+            # pool expansion.
+            pool_topk = torch.full(
+                (num_rows, select_k), -1, dtype=torch.int32, device=logits.device
             )
             topk_dst = pool_topk
         else:
@@ -733,9 +799,26 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
+        # DeepGEMM's MQA-logits kernels are Hopper/Blackwell-only; on GPUs it
+        # does not support (e.g. SM110 Thor) the fp8 Triton MQA-logits path is
+        # the drop-in fallback (the kpool cache is plain fp8 e4m3 + fp32
+        # scales, never fp4, so the Triton kernels are equivalent). Only
+        # hard-require deep_gemm where the platform would actually use it.
         if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
+            if is_deep_gemm_supported():
+                raise RuntimeError(
+                    "Sparse Attention Indexer CUDA op requires DeepGEMM to be "
+                    "installed."
+                )
+            if use_fp4_cache:
+                raise RuntimeError(
+                    "kpool indexer: use_fp4_cache requires DeepGEMM (SM90+). "
+                    "This GPU falls back to the fp8 Triton MQA-logits path."
+                )
+            logger.warning_once(
+                "DeepGEMM unavailable on %s: kpool indexer using the Triton "
+                "MQA-logits fallback.",
+                current_platform.get_device_name(),
             )
         _cfg = get_current_vllm_config_or_none()
         self.topk_backend = (

@@ -283,6 +283,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
     MLAAttentionImpl,
+    SparseMLAAttentionImpl,
 )
 from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 from vllm.v1.attention.backends.mla.prefill import (
@@ -359,6 +360,7 @@ def _detect_output_quant_key(
 def _canonicalize_sparse_mla_kv_cache_dtype(
     attn_backend: type[AttentionBackend],
     kv_cache_dtype: CacheDType,
+    qk_rope_head_dim: int = 64,
 ) -> CacheDType:
     backend_name = attn_backend.get_name()
     if backend_name == "FLASHMLA_SPARSE" and is_quantized_kv_cache(kv_cache_dtype):
@@ -371,6 +373,15 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
         "auto",
         "fp8",
         "fp8_e4m3",
+    ):
+        return "fp8_ds_mla"
+    if (
+        backend_name == "TRITON_MLA_SPARSE"
+        and kv_cache_dtype in ("fp8", "fp8_e4m3")
+        # The fp8_ds_mla layout has a fixed 64-element RoPE tail; NoPE MLA
+        # models (e.g. GLM-5.3-Flash, qk_rope_head_dim == 0) keep the plain
+        # fp8 layout (kv_cache rows = kv_lora_rank + pe_dim).
+        and qk_rope_head_dim == 64
     ):
         return "fp8_ds_mla"
     return kv_cache_dtype
@@ -521,7 +532,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
 
         normalized_kv_cache_dtype = _canonicalize_sparse_mla_kv_cache_dtype(
-            self.attn_backend, kv_cache_dtype
+            self.attn_backend,
+            kv_cache_dtype,
+            qk_rope_head_dim=self.qk_rope_head_dim,
         )
         if normalized_kv_cache_dtype != kv_cache_dtype:
             if cache_config is not None:
@@ -976,14 +989,23 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         ):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
-        assert (
-            attn_metadata.num_decodes is not None
-            and attn_metadata.num_prefills is not None
-            and attn_metadata.num_decode_tokens is not None
-        )
-        num_mqa_tokens = attn_metadata.num_decode_tokens
-        num_mha_tokens = q.size(0) - num_mqa_tokens
-        use_mha = True
+        is_sparse_impl = isinstance(self.impl, SparseMLAAttentionImpl)
+
+        if is_sparse_impl:
+            num_mqa_tokens = q.size(0)
+            num_mha_tokens = 0
+        else:
+            assert (
+                attn_metadata.num_decodes is not None
+                and attn_metadata.num_prefills is not None
+                and attn_metadata.num_decode_tokens is not None
+            )
+            num_mqa_tokens = attn_metadata.num_decode_tokens
+            num_mha_tokens = q.size(0) - num_mqa_tokens
+
+        # Non-sparse metadata exposes per-decode fields; sparse metadata does
+        # not, so the DCP combine path below must use the top-level seq_lens.
+        use_mha = not is_sparse_impl
 
         if self.impl.is_sparse and num_mha_tokens > 0:
             use_mha = self._use_sparse_mha(attn_metadata)
@@ -1213,7 +1235,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
     def _use_sparse_mha(self, attn_metadata: "MLACommonMetadata") -> bool:
         if self.hisparse_cache is not None:
             return False
-        prefill = attn_metadata.prefill
+        # XPUMLASparseMetadata (TRITON_MLA_SPARSE builder) serves all tokens
+        # through the sparse MQA path and carries no .prefill object.
+        prefill = getattr(attn_metadata, "prefill", None)
         if prefill is None:
             return False
         use_masked_mha = (

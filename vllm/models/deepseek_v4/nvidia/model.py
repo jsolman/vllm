@@ -80,7 +80,10 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
 )
-from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
+from vllm.models.deepseek_v4.nvidia.flashmla import (
+    DeepseekV4FlashMLAAttention,
+    DeepseekV4TritonMLAAttention,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.deep_gemm import bf16_mega_gate
@@ -421,6 +424,19 @@ class DeepseekV4MoE(nn.Module):
         self.physical_expert_start = self.experts_start_idx
         self.physical_expert_end = self.experts_end_idx
 
+        num_expert_group = getattr(config, "n_group", None)
+        topk_group = getattr(config, "topk_group", None)
+        use_grouped_topk = (
+            self.scoring_func == "sigmoid"
+            and num_expert_group is not None
+            and topk_group is not None
+            and num_expert_group > 0
+            and topk_group > 0
+        )
+        if not use_grouped_topk:
+            num_expert_group = None
+            topk_group = None
+
         self.experts = FusedMoEFactory(
             reduce_results=self.reduce_results,
             shared_experts=self.shared_experts,
@@ -436,6 +452,9 @@ class DeepseekV4MoE(nn.Module):
             scoring_func=self.scoring_func,
             routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=self.gate.e_score_correction_bias,
+            use_grouped_topk=use_grouped_topk,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
             hash_indices_table=self.gate.tid2eid,
             bias_vl=getattr(self.gate, "bias_vl", None),
             image_sentinel_lo=self.image_sentinel_lo,
@@ -541,9 +560,32 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     so map generic sparse-MLA choices to the DSv4-specialized attention class.
     Without an explicit backend, SM12 defaults to FlashInfer while the other
     CUDA arches keep the FlashMLA path.
+
+    SM8x (Ampere) and SM110 (Thor/Blackwell) route to the portable Triton
+    sparse-MLA backend (``ampere/``), since FlashMLA/cutedsl require
+    Hopper+ (SM90+).
     """
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()
+
+    # SM8x (Ampere) and SM110 (Thor/Blackwell): use portable Triton sparse MLA.
+    # FlashMLA/cutedsl kernels are Hopper+ (SM90+) only.
+    if (
+        device_capability is not None
+        and device_capability.major in [8, 11]
+    ):
+        if backend is not None and backend != AttentionBackendEnum.TRITON_MLA_SPARSE_DSV4:
+            raise ValueError(
+                f"{backend.name} is not supported for DeepSeek V4 on "
+                f"SM{device_capability.major}x; use "
+                "TRITON_MLA_SPARSE_DSV4 (default for this arch)."
+            )
+        from vllm.models.deepseek_v4.ampere.ampere_sparse import (
+            DeepseekV4AmpereMLAAttention,
+        )
+
+        return DeepseekV4AmpereMLAAttention
+
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
@@ -561,10 +603,14 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
         AttentionBackendEnum.FLASHMLA_SPARSE,
         AttentionBackendEnum.FLASHMLA_SPARSE_DSV4,
     ):
+        if device_capability is not None and device_capability.major < 9:
+            return DeepseekV4TritonMLAAttention
         return DeepseekV4FlashMLAAttention
 
     if device_capability is not None and device_capability.major == 12:
         return DeepseekV4FlashInferSM120Attention
+    if device_capability is not None and device_capability.major < 9:
+        return DeepseekV4TritonMLAAttention
     return DeepseekV4FlashMLAAttention
 
 

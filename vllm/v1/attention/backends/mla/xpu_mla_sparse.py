@@ -24,7 +24,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadata,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
-    MLAAttentionImpl,
+    SparseMLAAttentionImpl,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
     align_blocks_to_rows,
@@ -191,8 +191,8 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
         return metadata
 
 
-class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndicesBuffer):
-    is_sparse = True
+class XPUMLASparseImpl(SparseMLAAttentionImpl[XPUMLASparseMetadata],
+                       SharedTopkIndicesBuffer):
 
     def __init__(
         self,
@@ -219,6 +219,12 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndices
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
         self.softmax_scale = scale
         self.init_topk_indices_buffer(indexer, topk_indices_buffer)
+
+    # Sparse-MLA impl API hook called by mla.py / deepseek_v32 attention glue
+    # (indexer-group integration). This impl has no index_group; a no-op is
+    # the correct behavior (matches SparseMLACommonImpl's None-index_group path).
+    def record_logical_topk_ready(self) -> None:
+        pass
 
     def _forward_bf16_kv(
         self,

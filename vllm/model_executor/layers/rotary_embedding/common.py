@@ -220,7 +220,13 @@ class ApplyRotaryEmb(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+        try:
+            from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+        except ImportError:
+            # vllm-flash-attn wheel not installed (e.g. TRITON_MLA-only
+            # deployments): fall back to the native torch implementation
+            # instead of failing the forward.
+            return self.forward_native(x, cos, sin)
 
         x, cos, sin, origin_shape, origin_dtype = self._pre_process(x, cos, sin)
 
