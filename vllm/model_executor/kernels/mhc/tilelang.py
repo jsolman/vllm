@@ -537,7 +537,16 @@ def mhc_pre_broadcast_tilelang(
     residual_flat = residual
     num_tokens = residual.shape[0]
 
-    n_splits = compute_num_split(64, hidden_size, cdiv(num_tokens, 64))
+    from vllm.utils.deep_gemm import is_deep_gemm_supported as _idgs
+
+    if _idgs():
+        n_splits = compute_num_split(64, hidden_size, cdiv(num_tokens, 64))
+    else:
+        # The torch-fallback GEMM below only fills split 0; the kernel sums
+        # n_splits partials, so garbage torch.empty partials would poison the
+        # mixes for small batches (decode) — observed as corrupted layer-0
+        # outputs on SM110. Keep n_splits=1 without DeepGemm.
+        n_splits = 1
 
     residual_out = torch.empty(
         num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=residual.device
@@ -558,15 +567,24 @@ def mhc_pre_broadcast_tilelang(
         n_splits, num_tokens, dtype=torch.float32, device=residual.device
     )
 
-    from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
+    from vllm.utils.deep_gemm import is_deep_gemm_supported
 
-    tf32_hc_prenorm_gemm(
-        residual_flat,
-        fn_broadcast,
-        gemm_out_mul,
-        gemm_out_sqrsum,
-        n_splits,
-    )
+    use_deep_gemm = is_deep_gemm_supported()
+    if use_deep_gemm:
+        from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
+
+        tf32_hc_prenorm_gemm(
+            residual_flat,
+            fn_broadcast,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            n_splits,
+        )
+    else:
+        # Torch fallback: out = x @ fn.T, sqrsum = x^2.sum(-1)
+        x_float = residual_flat.float()
+        gemm_out_mul[0] = x_float @ fn_broadcast.t()
+        gemm_out_sqrsum[0] = x_float.square().sum(dim=-1)
     mhc_pre_big_fuse_broadcast_with_norm_tilelang(
         gemm_out_mul,
         gemm_out_sqrsum,
