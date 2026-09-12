@@ -70,6 +70,7 @@
 #include <cuda_runtime.h>
 #include <cfloat>
 #include <type_traits>
+#include "libtorch_stable/pdl_sm110_guard.cuh"
 
 #ifdef USE_ROCM
 __device__ __forceinline__ uint8_t rocm_cvt_float_to_fp8_e4m3(float val) {
@@ -826,9 +827,9 @@ static void launchPdlSlots(KernelT kernel, int num_tokens, int slots_per_token,
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  attrs[0].val.programmaticStreamSerializationAllowed = vllm_stable::disable_pdl_sm110() ? 0 : 1;
   config.attrs = attrs;
-  config.numAttrs = (sm_version >= 90) ? 1 : 0;
+  config.numAttrs = (!vllm_stable::disable_pdl_sm110() && sm_version >= 90) ? 1 : 0;
   cudaLaunchKernelEx(&config, kernel, args...);
 #else
   // clang-format off

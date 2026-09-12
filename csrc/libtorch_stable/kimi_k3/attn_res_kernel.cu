@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cuda_runtime.h>
 #include <type_traits>
+#include "libtorch_stable/pdl_sm110_guard.cuh"
 
 using bf16_t = __nv_bfloat16;
 
@@ -913,9 +914,9 @@ static void launch_fwd(bf16_t* block_residual, bf16_t* layer_residual,
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  attrs[0].val.programmaticStreamSerializationAllowed = vllm_stable::disable_pdl_sm110() ? 0 : 1;
   config.attrs = attrs;
-  config.numAttrs = 1;
+  config.numAttrs = vllm_stable::disable_pdl_sm110() ? 0 : 1;
   cudaLaunchKernelEx(&config, kernel, block_residual, layer_residual, delta,
                      res_weight, rms_weight, output, T, block_stride_m,
                      block_stride_r, rms_eps, output_norm_weight,

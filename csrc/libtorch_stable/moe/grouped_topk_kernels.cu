@@ -32,6 +32,7 @@
 #include <cuda/std/limits>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include "libtorch_stable/pdl_sm110_guard.cuh"
 namespace cg = cooperative_groups;
 
 namespace vllm {
@@ -1289,7 +1290,7 @@ void invokeNoAuxTc(T* scores, float* topk_values, IdxT* topk_indices,
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
-  config.numAttrs = 1;
+  config.numAttrs = vllm_stable::disable_pdl_sm110() ? 0 : 1;
   config.attrs = attrs;
   if (n_group == 1 && topk_group == 1 &&
       single_group_topk::invoke<T, BiasT, IdxT, SF>(

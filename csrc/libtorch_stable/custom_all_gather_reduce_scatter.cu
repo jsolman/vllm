@@ -7,6 +7,7 @@
 
 #include "custom_all_reduce.cuh"
 #include "custom_all_gather_reduce_scatter.cuh"
+#include "libtorch_stable/pdl_sm110_guard.cuh"
 
 namespace vllm {
 
@@ -61,7 +62,7 @@ void CustomAllreduce::mnnvl_lamport_allgather(cudaStream_t stream, T* input,
 #if !defined(USE_ROCM) && CUDA_VERSION >= 12000
   cudaLaunchAttribute attributes[1]{};
   attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attributes[0].val.programmaticStreamSerializationAllowed = 1;
+  attributes[0].val.programmaticStreamSerializationAllowed = vllm_stable::disable_pdl_sm110() ? 0 : 1;
   cudaLaunchConfig_t config{.gridDim = dim3(blocks),
                             .blockDim = dim3(kMnnvlLamportAgThreads),
                             .dynamicSmemBytes = 0,
@@ -153,7 +154,7 @@ void CustomAllreduce::mnnvl_lamport_reduce_scatter(cudaStream_t stream,
 #if !defined(USE_ROCM) && CUDA_VERSION >= 12000
   cudaLaunchAttribute attributes[1]{};
   attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attributes[0].val.programmaticStreamSerializationAllowed = 1;
+  attributes[0].val.programmaticStreamSerializationAllowed = vllm_stable::disable_pdl_sm110() ? 0 : 1;
   cudaLaunchConfig_t config{.gridDim = dim3(blocks),
                             .blockDim = dim3(kMnnvlLamportRsThreads),
                             .dynamicSmemBytes = 0,

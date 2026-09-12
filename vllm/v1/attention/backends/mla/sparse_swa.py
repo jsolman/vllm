@@ -160,6 +160,20 @@ class DeepseekSparseSWABackend(AttentionBackend):
             )
 
             return DeepseekV4CPUSparseSWAMetadataBuilder
+
+        # SM8x (Ampere) / SM110 (Thor): the portable Triton sparse-MLA path
+        # reuses the ROCm Aiter attention implementation, whose decode
+        # consumes the ROCm ragged SWA metadata (decode_swa_ragged_indices/
+        # _indptr). That builder is pure torch/Triton (no aiter/hip calls),
+        # so it is safe on CUDA. Without it the base metadata object lacks
+        # the ragged attributes and _forward_decode raises AttributeError.
+        capability = current_platform.get_device_capability()
+        if capability is not None and capability.major in [8, 11]:
+            from vllm.models.deepseek_v4.amd.rocm import (
+                DeepseekV4ROCMAiterSparseSWAMetadataBuilder,
+            )
+
+            return DeepseekV4ROCMAiterSparseSWAMetadataBuilder
         return DeepseekSparseSWAMetadataBuilder
 
 
@@ -841,6 +855,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             or current_platform.is_rocm()
             or current_platform.is_xpu()
             or current_platform.is_device_capability_family(120)
+            # SM110 (Thor) has no FlashMLA build; the Triton sparse-MLA
+            # path consumes no tile scheduler metadata, same as ROCm.
+            or current_platform.is_device_capability_family(110)
         ):
             return out
         for layer_type in self._layer_types:
