@@ -177,13 +177,16 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
 class DeepseekV4FlashInferSparseMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
     """Varlen-capable metadata builder for the FlashInfer sparse MLA backend."""
 
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    # The backend's forward zero-outputs when attn_metadata is None, so a
+    # captured graph would bake that zeroing in and replay it for every
+    # decode step. Capture must not span this attention op.
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
 
 
 class DeepseekSparseSWAFlashInferMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
     """SWA metadata for the FlashInfer sparse decode path (varlen decode)."""
 
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
 
 
 class DeepseekSparseSWAFlashInferBackend(DeepseekSparseSWABackend):

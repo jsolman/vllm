@@ -318,6 +318,7 @@ class DeepseekV32Attention(MLAAttention):
         hisparse_cache = self.hisparse_cache
         layer_attn_metadata, _, _, _ = get_attention_context(self.layer_name)
         self.impl.prepare_for_batch(layer_attn_metadata)
+        attn_metadata = layer_attn_metadata
 
         if self.indexer is not None and not self.skip_topk:
             has_indexer = True
@@ -340,12 +341,41 @@ class DeepseekV32Attention(MLAAttention):
             indexer_softmax_scale = 0.0
             indexer_n_head_scale = 0.0
 
-        if forward_context.attn_metadata is None or self.use_pcp:
+        if self.use_pcp:
             mla_kv_cache = None
             mla_k_scale = None
             indexer_k_cache = None
             mla_slot = None
             indexer_slot = None
+        elif attn_metadata is None:
+            # Capture-time break python: the compiled-PIECEWISE capture runs the
+            # model's python with NO attention metadata (the capture runner builds
+            # it only for FULL graphs / eager replays). The captured
+            # fused_norm_rope launch must bake the REAL bound cache views and the
+            # persistent slot-mapping buffer here — NOT dummy/None caches. With
+            # the persistent buffer filled with PAD_SLOT_ID=-1 during capture the
+            # kernel returns early (no write); at replay the same buffer carries
+            # the real per-step slots, so the baked in-graph kernel writes the
+            # correct KV rows. Baking dummy caches here previously starved every
+            # decode replay of its KV-cache write (jibberish root cause).
+            if (
+                mla_slot is not None
+                and self.kv_cache.numel() > 0
+            ):
+                mla_kv_cache = self.kv_cache
+                mla_k_scale = self._k_scale
+            else:
+                mla_kv_cache = None
+                mla_k_scale = None
+                mla_slot = None
+            if (
+                mla_slot is not None
+                and self.indexer is not None
+                and self.indexer.k_cache.kv_cache.numel() > 0
+            ):
+                indexer_k_cache = self.indexer.k_cache.kv_cache
+            else:
+                indexer_k_cache = None
         else:
             mla_kv_cache = None if hisparse_cache is not None else self.kv_cache
             mla_k_scale = self._k_scale
@@ -402,8 +432,25 @@ class DeepseekV32Attention(MLAAttention):
         ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
 
         if self.indexer is not None and not self.skip_topk:
-            index_q = self.indexer.wq_b(q_c)[0]
-            index_q = index_q.view(-1, self.indexer.n_head, self.indexer.head_dim)
+            index_q_raw = self.indexer.wq_b(q_c)[0]
+            # PERSISTENT index_q buffer: the captured fused_q kernel bakes
+            # the index_q pointer at capture time; a fresh eager allocation
+            # at replay would move the data to a new address and the baked
+            # kernel would read the stale capture-time buffer (NaN). Keep a
+            # stable-address buffer and copy the fresh GEMM output into it.
+            _nt = index_q_raw.shape[0]
+            _buf = getattr(self, "_index_q_persistent", None)
+            if (_buf is None or _buf.shape[0] < _nt
+                    or _buf.device != index_q_raw.device):
+                _cap = max(_nt, 64)
+                self._index_q_persistent = torch.empty(
+                    _cap, self.indexer.n_head, self.indexer.head_dim,
+                    dtype=index_q_raw.dtype, device=index_q_raw.device,
+                )
+                _buf = self._index_q_persistent
+            _buf[:_nt].copy_(index_q_raw.view(_nt, self.indexer.n_head,
+                                              self.indexer.head_dim))
+            index_q = _buf[:_nt]
         else:
             index_q = None
 

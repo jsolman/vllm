@@ -290,6 +290,17 @@ def sparse_attn_indexer_kpool(
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
+    # DeepGEMM's MQA-logits kernels are Hopper/Blackwell-only. On GPUs it
+    # does not support (e.g. SM110 Thor) the kpool cache is plain fp8 e4m3 +
+    # fp32 scale (kpool_compress_and_write_cache never emits fp4), so the
+    # Triton kernels are drop-in replacements.
+    # is_deep_gemm_supported() is an lru-cached callable touching
+    # cudaDeviceGetAttribute — dynamo cannot trace it under fullgraph, so
+    # freeze the decision outside the compiled region.
+    if torch.compiler.is_compiling():
+        use_deep_gemm = False
+    else:
+        use_deep_gemm = is_deep_gemm_supported()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
     # assert isinstance(attn_metadata, dict)
@@ -919,6 +930,32 @@ class SparseAttnIndexerKpool(CustomOp):
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
             )
+
+        # Pre-size the shared workspace at model construction (eager, before
+        # any torch.compile tracing or CUDA-graph capture). Resizing inside a
+        # traced/captured region is unsound: empty_cache and
+        # inspect.currentframe are dynamo skip-list entries (tracing aborts),
+        # and an allocation made during capture bakes addresses into the
+        # graph. The profiling-run reserve path alone does not help because
+        # the profiling run is also the first traced call under
+        # torch.compile.
+        try:
+            from vllm.v1.worker.workspace import current_workspace_manager
+
+            values_spec, scales_spec = _gather_workspace_shapes(
+                max_total_seq_len,
+                head_dim,
+                current_platform.fp8_dtype(),
+                use_fp4_cache,
+            )
+            current_workspace_manager().get_simultaneous(
+                values_spec,
+                scales_spec,
+                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+            )
+        except RuntimeError:
+            # Workspace manager not initialized (e.g. non-GPU contexts).
+            pass
 
     def forward_native(
         self,
