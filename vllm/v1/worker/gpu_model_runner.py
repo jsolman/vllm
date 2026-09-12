@@ -3764,8 +3764,16 @@ class GPUModelRunner(
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
             )
 
+        # Disable FULL cudagraph when DCP is active: the NCCL collectives
+        # inside sparse_attn_indexer (_merge_dcp_topk_global) and
+        # unified_mla_attention_with_output (mqa_q all-gather, cp_lse_ag_out_rs)
+        # go through torch.distributed which is not CUDA-graph-safe.
+        # PIECEWISE mode runs these ops eagerly via eager_break_during_capture.
+        disable_full = (
+            use_cascade_attn or has_encoder_output or self.dcp_world_size > 1
+        )
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
-            num_tokens, disable_full=has_encoder_output
+            num_tokens, disable_full=disable_full
         )
         num_tokens_padded = batch_descriptor.num_tokens
 
@@ -4563,12 +4571,12 @@ class GPUModelRunner(
         assert sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1, (
             "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
         )
-        # Skip for chunked prefill: sampled tokens are dummy
-        # and will be discarded, no need to broadcast.
-        if not self._is_all_reqs_chunked_prefill():
-            torch.distributed.broadcast(
-                sampled_token_ids, src=pp.rank, group=pp.device_group
-            )
+        # Always broadcast: the payload is tiny (num_reqs int32) and skipping
+        # causes PP stages to desync when _is_all_reqs_chunked_prefill()
+        # evaluates differently on different ranks under async scheduling.
+        torch.distributed.broadcast(
+            sampled_token_ids, src=pp.rank, group=pp.device_group
+        )
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
         """Receive sampled token ids broadcast from last PP stage"""
@@ -4577,11 +4585,10 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
         recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
-        # skip for chunked prefill.
-        if not self._is_all_reqs_chunked_prefill():
-            self._pp_recv_work = torch.distributed.broadcast(
-                recv, src=pp.last_rank, group=pp.device_group, async_op=True
-            )
+        # Always broadcast: the payload is tiny (num_reqs int32) and skipping
+        # causes PP stages to desync when _is_all_reqs_chunked_prefill()
+        # evaluates differently on different ranks under async scheduling.
+        torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
         self.input_batch.prev_sampled_token_ids = recv
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
@@ -6823,6 +6830,12 @@ class GPUModelRunner(
         )
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.
+        # Disable FULL cudagraph when DCP is active: NCCL collectives inside
+        # sparse_attn_indexer and unified_mla_attention_with_output go through
+        # torch.distributed which is not CUDA-graph-safe.  PIECEWISE mode runs
+        # these ops eagerly via eager_break_during_capture.
+        if self.dcp_world_size > 1 and cudagraph_mode.has_full_cudagraphs():
+            cudagraph_mode = CUDAGraphMode.PIECEWISE
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
             cudagraph_mode, self.uniform_decode_query_len
         )
