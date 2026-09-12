@@ -31,6 +31,7 @@
 #include "minimax_reduce_rms_kernel.h"
 
 #include <algorithm>
+#include "libtorch_stable/pdl_sm110_guard.cuh"
 
 #define FINAL_MASK 0xffffffff
 #define MINIMAX_REDUCE_RMS_WARP_SIZE 32
@@ -673,7 +674,7 @@ void minimax_reduce_rms_kernel_launcher(MiniMaxReduceRMSParams const& params) {
 
   cudaLaunchAttribute attribute[2];
   attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attribute[0].val.programmaticStreamSerializationAllowed = 1;
+  attribute[0].val.programmaticStreamSerializationAllowed = vllm_stable::disable_pdl_sm110() ? 0 : 1;
   attribute[1].id = cudaLaunchAttributeClusterDimension;
   attribute[1].val.clusterDim.x = cluster_size;
   attribute[1].val.clusterDim.y = 1;
@@ -741,7 +742,7 @@ void minimax_reduce_rms_kernel_launcher_float4(
 
   cudaLaunchAttribute attribute[2];
   attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attribute[0].val.programmaticStreamSerializationAllowed = 1;
+  attribute[0].val.programmaticStreamSerializationAllowed = vllm_stable::disable_pdl_sm110() ? 0 : 1;
   attribute[1].id = cudaLaunchAttributeClusterDimension;
   attribute[1].val.clusterDim.x = cluster_size;
   attribute[1].val.clusterDim.y = 1;
