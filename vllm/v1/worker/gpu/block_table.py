@@ -271,6 +271,16 @@ def _gather_block_tables_kernel(
         offset = i + tl.arange(0, BLOCK_SIZE)
         block_ids = tl.load(src_row_ptr + offset, mask=offset < num_blocks)
         tl.store(dst_row_ptr + offset, block_ids, mask=offset < num_blocks)
+    # Zero the tail beyond num_blocks: this buffer is persistent and shared
+    # across requests (the same dst row is reused by different requests over
+    # time), so leftover block ids from a previous longer request would leak
+    # into downstream consumers that read past the row's live length (e.g.
+    # strided/block-compressed views of the table). Start exactly at
+    # num_blocks (the live-copy loop's masked stores leave [num_blocks,
+    # next BLOCK_SIZE boundary) stale); padded rows are zeroed above.
+    for i in tl.range(num_blocks, max_num_blocks, BLOCK_SIZE):
+        offset = i + tl.arange(0, BLOCK_SIZE)
+        tl.store(dst_row_ptr + offset, 0, mask=offset < max_num_blocks)
 
 
 @triton.jit

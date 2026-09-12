@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
+import sys
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -1752,7 +1754,19 @@ class MambaManager(SingleTypeKVCacheManager):
             # x * block_size + num_lookahead_tokens and breaks the alignment.
             # We can ignore lookahead tokens because current draft models don't have
             # mamba layers.
-            num_tokens = num_tokens_main_model
+            # GLM53 (9/9): mirror allocate_new_blocks — reserve the next
+            # page when the scheduler's +1 decode lookahead crosses the
+            # block boundary, so the free-capacity check matches the
+            # actual allocation (see the allocate_new_blocks comment).
+            _gl53_la = num_tokens - num_tokens_main_model
+            if (
+                _gl53_la >= 1
+                and num_tokens_main_model > 0
+                and num_tokens_main_model % self.block_size == 0
+            ):
+                num_tokens = num_tokens_main_model + self.block_size
+            else:
+                num_tokens = num_tokens_main_model
 
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
@@ -1824,7 +1838,26 @@ class MambaManager(SingleTypeKVCacheManager):
             # x * block_size + num_lookahead_tokens and breaks the alignment.
             # We can ignore lookahead tokens because current draft models don't have
             # mamba layers.
-            num_tokens = num_tokens_main_model
+            # GLM53 (9/9): the scheduler's +1 decode lookahead (bf1e25bb25)
+            # is NOT a spec draft token — it reserves capacity so the NEXT
+            # state page exists in the same schedule that carries the
+            # boundary token. Dropping it here re-introduces the one-
+            # schedule page lag: the boundary token's state write targets
+            # the first state of the next page while the page table still
+            # holds a recycled stale entry → one-step NaN → repetition
+            # lock at every page boundary. Allocate the next page whenever
+            # the lookahead crosses the boundary (main_model ends exactly
+            # on a block boundary), keeping alignment for genuine
+            # spec-decode lookahead.
+            _gl53_la = num_tokens - num_tokens_main_model
+            if (
+                _gl53_la >= 1
+                and num_tokens_main_model > 0
+                and num_tokens_main_model % self.block_size == 0
+            ):
+                num_tokens = num_tokens_main_model + self.block_size
+            else:
+                num_tokens = num_tokens_main_model
             req_blocks: list[KVCacheBlock] = self.req_to_blocks[request_id]
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
