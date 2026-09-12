@@ -23,7 +23,11 @@ from vllm.models.glm5next.common.sparse_indexer import (
 )
 from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
 from vllm.platforms import current_platform
-from vllm.utils.deep_gemm import has_deep_gemm
+from vllm.utils.deep_gemm import has_deep_gemm, is_deep_gemm_supported
+from vllm.v1.attention.ops.mqa_logits_triton import (
+    fp8_mqa_logits_triton,
+    fp8_paged_mqa_logits_triton,
+)
 from vllm.utils.torch_utils import (
     LayerNameType,
     _resolve_layer_name,
@@ -312,16 +316,32 @@ def sparse_attn_indexer_kpool(
                 q_slice_cast = q_slice
                 k_quant_cast = k_quant
                 k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-            from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
+            if is_deep_gemm_supported():
+                from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
 
-            logits = fp8_fp4_mqa_logits(
-                (q_slice_cast, q_scale_slice),
-                (k_quant_cast, k_scale_cast),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                clean_logits=False,
-            )
+                logits = fp8_fp4_mqa_logits(
+                    (q_slice_cast, q_scale_slice),
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    clean_logits=False,
+                )
+            else:
+                # Triton fallback (DeepGEMM unavailable on this GPU, e.g.
+                # SM110 Thor). kpool cache is plain fp8 e4m3 + fp32 scale.
+                assert not use_fp4_cache, (
+                    "kpool indexer: fp4 index cache needs DeepGEMM; the "
+                    "Triton fallback is fp8-only."
+                )
+                logits = fp8_mqa_logits_triton(
+                    q_slice_cast,
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    clean_logits=False,
+                )
             num_rows = logits.shape[0]
 
             # kpool: logits are pool-granular (compress_ratio == index_kpool),
@@ -547,19 +567,48 @@ def sparse_attn_indexer_kpool(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
+        # 2-D context lens ([B, next_n], native spec path) fold into 1-D per
+        # batch since the Triton kernel reads context per batch row; the
+        # flattened path (no DeepGEMM) supplies 1-D per-token lens already.
+        triton_ctx_lens = (
+            seq_lens[:, -1] if seq_lens.dim() == 2 else seq_lens
+        ).to(torch.int32)
+        if is_deep_gemm_supported():
+            from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
 
-        logits = fp8_fp4_paged_mqa_logits(
-            (padded_q_quant_cast, padded_q_scale),
-            kv_cache,
-            padded_weights[:num_padded_tokens],
-            seq_lens,
-            decode_metadata.block_table,
-            decode_metadata.schedule_metadata,
-            max_model_len=max_pool_len,
-            clean_logits=False,
-            indices=decode_metadata.indices,
-        )
+            logits = fp8_fp4_paged_mqa_logits(
+                (padded_q_quant_cast, padded_q_scale),
+                kv_cache,
+                padded_weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                decode_metadata.schedule_metadata,
+                max_model_len=max_pool_len,
+                clean_logits=False,
+                indices=decode_metadata.indices,
+            )
+        else:
+            # Triton fallback (DeepGEMM unavailable on this GPU, e.g. SM110
+            # Thor). No schedule_metadata: that is DeepGEMM's persistent-
+            # kernel scheduling, which the Triton paged kernel does not use.
+            # block_table is already pool-granular (the indexer metadata
+            # builder divides it by index_kpool).
+            assert not use_fp4_cache, (
+                "kpool indexer: fp4 index cache needs DeepGEMM; the Triton "
+                "fallback is fp8-only."
+            )
+            logits = fp8_paged_mqa_logits_triton(
+                padded_q_quant_cast.reshape(
+                    -1, 1, padded_q_quant_cast.shape[-2],
+                    padded_q_quant_cast.shape[-1]
+                ),
+                kv_cache,
+                padded_weights[:num_padded_tokens],
+                triton_ctx_lens,
+                decode_metadata.block_table,
+                max_pool_len,
+                clean_logits=False,
+            )
         num_rows = logits.shape[0]
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
         # then expand each pool back to its kpool tokens.
@@ -659,8 +708,17 @@ class SparseAttnIndexerKpool(CustomOp):
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
         if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
+            # SM110 etc.: DeepGEMM-only MQA-logits kernels do not support this
+            # arch; the Triton fallback below keeps the CUDA path usable.
+            if is_deep_gemm_supported():
+                raise RuntimeError(
+                    "Sparse Attention Indexer CUDA op requires DeepGEMM to be "
+                    "installed."
+                )
+            logger.warning_once(
+                "DeepGEMM unavailable on %s: kpool indexer using the Triton "
+                "MQA-logits fallback.",
+                current_platform.get_device_name(),
             )
         _cfg = get_current_vllm_config_or_none()
         self.topk_backend = (

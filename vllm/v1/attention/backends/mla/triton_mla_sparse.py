@@ -42,7 +42,7 @@ _INDEXER_HEAD_DIM = 128
 class TritonMLASparseMetadataBuilder(XPUMLASparseMetadataBuilder):
     # XPU base keeps NEVER (not validated under cudagraph); this subclass
     # claims UNIFORM_BATCH for the CUDA/Triton path.
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
 
 
 class TritonMLASparseImpl(XPUMLASparseImpl):

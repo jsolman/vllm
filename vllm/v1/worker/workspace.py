@@ -32,14 +32,24 @@ _GiB = 1024**3
 # Global workspace manager instance
 _manager: "WorkspaceManager | None" = None
 _workspace_lane: ContextVar[int] = ContextVar("vllm_workspace_lane", default=0)
+# Plain-global shadow of "is any non-default lane active". Dynamocannot trace
+# ContextVar.get(), but it CAN guard on a module-level bool: compiled code
+# reading this flag constant-folds the False branch (lane 0) with a guard, so
+# the first non-default use_workspace_lane() forces a recompile that hits the
+# ContextVar path and fails loudly under fullgraph instead of silently using
+# workspace slot 0.
+_workspace_lane_active = False
 
 
 @contextmanager
 def use_workspace_lane(lane: int) -> Iterator[None]:
     """Select an independent workspace owner for this execution context."""
+    global _workspace_lane_active
     if lane < 0:
         raise ValueError(f"Workspace lane must be non-negative, got {lane}.")
     token = _workspace_lane.set(lane)
+    if lane != 0:
+        _workspace_lane_active = True
     try:
         yield
     finally:
@@ -119,7 +129,12 @@ class WorkspaceManager:
         return self._locked
 
     def _get_workspace_id(self) -> int:
-        lane = _workspace_lane.get()
+        # Dynamo cannot trace ContextVar.get(); guard on the module-level
+        # flag so compiled code constant-folds the lane-0 branch with a
+        # guard: the first non-default use_workspace_lane() forces a
+        # recompile that hits the ContextVar path (and fails loudly under
+        # fullgraph instead of silently using workspace slot 0).
+        lane = _workspace_lane.get() if _workspace_lane_active else 0
         if lane >= self._num_lanes:
             raise RuntimeError(
                 f"Workspace lane {lane} is not configured; manager has "
@@ -221,6 +236,12 @@ class WorkspaceManager:
 
             def get_caller_info() -> str:
                 """Find first frame outside WorkspaceManager."""
+                if torch.compiler.is_compiling():
+                    # inspect.currentframe() -> sys._getframe is on dynamo's
+                    # skip-list; calling it while tracing aborts every compiled
+                    # graph mode. The caller name is only used for logs/errors,
+                    # so return a placeholder instead.
+                    return "compiling"
                 curr_frame = inspect.currentframe()
                 if curr_frame is None:
                     return "unknown"
@@ -260,7 +281,13 @@ class WorkspaceManager:
             # allocation below. Without this, each resize may leave a
             # dead segment in reserved memory which can cause higher peak
             # memory usage.
-            torch.accelerator.empty_cache()
+            # NOTE: empty_cache() is on the dynamo skip-list, so calling it
+            # while tracing aborts every compiled graph mode ("Attempted to
+            # call function marked as skipped"). The resize itself is
+            # traceable, so skip only the cache flush while compiling; the
+            # segment is reclaimed when the profiling run ends.
+            if not torch.compiler.is_compiling():
+                torch.accelerator.empty_cache()
             self._current_workspaces[workspace_id] = torch.empty(
                 (required_bytes,), dtype=torch.uint8, device=self._device
             )
