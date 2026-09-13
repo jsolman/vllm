@@ -215,6 +215,15 @@ class XPUMLASparseImpl(SparseMLAAttentionImpl[XPUMLASparseMetadata],
         self.softmax_scale = scale
         self.init_topk_indices_buffer(indexer, topk_indices_buffer)
 
+    # Sparse-MLA impl API hooks called by mla.py / deepseek_v32 attention glue
+    # (indexer-group integration). This impl has no index_group; no-ops are the
+    # correct behavior (matches SparseMLACommonImpl's None-index_group path).
+    def record_logical_topk_ready(self) -> None:
+        pass
+
+    def prepare_for_batch(self, attn_metadata: object | None) -> None:
+        pass
+
     def _forward_bf16_kv(
         self,
         q: torch.Tensor,  # [sq, heads, d_qk]
