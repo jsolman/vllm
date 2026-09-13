@@ -186,7 +186,8 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
         return metadata
 
 
-class XPUMLASparseImpl(SparseMLAAttentionImpl[XPUMLASparseMetadata]):
+class XPUMLASparseImpl(SparseMLAAttentionImpl[XPUMLASparseMetadata],
+                       SharedTopkIndicesBuffer):
 
     def __init__(
         self,
