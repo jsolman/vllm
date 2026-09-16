@@ -254,6 +254,10 @@ void per_token_group_quant_8bit(const torch::stable::Tensor& input,
           &config,                                                          \
           per_token_group_quant_8bit_kernel<T, DST_DTYPE, COL_MAJOR, UE8M0, \
                                             float, CHECK_BOUNDS>,           \
+          static_cast<T*>(input.data_ptr()), output_q.data_ptr(),           \
+          static_cast<float*>(output_s.data_ptr()), group_size, num_groups, \
+          groups_per_block, (float)eps, (float)min_8bit, (float)max_8bit,   \
+          scale_num_rows, scale_stride);                                    \
     } while (0)
 #else
   #define LAUNCH_KERNEL_IMPL(T, DST_DTYPE, COL_MAJOR, UE8M0, CHECK_BOUNDS,     \
