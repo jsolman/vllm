@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
+
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -36,6 +38,25 @@ class AsyncScheduler(Scheduler):
             # bonus token (num_sampled_tokens_per_step == 0) — only the canvas
             # (spec) tokens.
             cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
+            # Debug-level ledger of every placeholder add (the underflow
+            # detector below stays at WARNING: it is the recurrence
+            # detector for the finished-request double-drain bug).
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "MTP placeholder add: req=%s add=%d (sampled=%d spec=%d) "
+                    "pre_ph=%d post_ph=%d computed=%d chunk=%s out_toks=%d",
+                    req_id,
+                    self.num_sampled_tokens_per_step + cur_num_spec_tokens,
+                    self.num_sampled_tokens_per_step,
+                    cur_num_spec_tokens,
+                    request.num_output_placeholders,
+                    request.num_output_placeholders
+                    + self.num_sampled_tokens_per_step
+                    + cur_num_spec_tokens,
+                    request.num_computed_tokens,
+                    request.is_prefill_chunk,
+                    len(request._output_token_ids),
+                )
             request.num_output_placeholders += (
                 self.num_sampled_tokens_per_step + cur_num_spec_tokens
             )
@@ -58,9 +79,37 @@ class AsyncScheduler(Scheduler):
 
         # Placeholders were zeroed at preemption; a stale delivery must not
         # decrement them (it would underflow).
-        if not is_stale:
-            request.num_output_placeholders -= len(new_token_ids)
-            assert request.num_output_placeholders >= 0
+        #
+        # FIX (MTP placeholder underflow, 9/17): a finished request (e.g.
+        # FINISHED_LENGTH_CAPPED hit mid-step) can still receive an in-flight
+        # async output row from a schedule issued before the finish was
+        # detected. That row's placeholders were already consumed by the
+        # finish-time accounting; draining again double-counts, asserts (or,
+        # clamped, corrupts num_computed/placeholders -> wrong cache_blocks
+        # offset -> poisoned prefix-cache blocks). Skip both the drain and the
+        # re-cache for finished requests. Also clamp defensively: a negative
+        # balance here must never assert-crash the engine.
+        if not is_stale and not request.is_finished():
+            _remaining = request.num_output_placeholders
+            _drain = len(new_token_ids)
+            if _drain > _remaining:
+                logger.warning(
+                    "MTP placeholder underflow probe: request %s would drain "
+                    "%d placeholder(s) but only %d remain "
+                    "(num_computed_tokens=%d, status=%s, "
+                    "output_token_ids=%d). Clamping to %d; this delivery is "
+                    "double-accounted \u2014 investigate spec-reject/stop trim "
+                    "interaction.",
+                    request.request_id,
+                    _drain,
+                    _remaining,
+                    request.num_computed_tokens,
+                    request.status,
+                    len(request._output_token_ids),
+                    _remaining,
+                )
+                _drain = _remaining
+            request.num_output_placeholders -= _drain
 
         # Cache the new tokens. Preempted requests should be skipped.
         if status_before_update == RequestStatus.RUNNING:
