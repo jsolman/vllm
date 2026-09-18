@@ -1894,6 +1894,29 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_skipped_blocks = (
                     num_required_blocks - self.num_speculative_blocks - 1
                 )
+                # GLM53 (Thor SM110, 9/18): num_skipped_blocks must track
+                # the MAIN-model sequence length, not the lookahead-
+                # inflated num_tokens. The lookahead page reserve
+                # (num_tokens = num_tokens_main_model + block_size when
+                # the main model ends exactly on a page boundary) is
+                # capacity for the NEXT page, not a skipped page of the
+                # current sequence: padding a null for it displaced the
+                # real running-state column.
+                # Concrete failure: a prefill chunk ending at exactly a
+                # page boundary (e.g. a prefix-cache junction at 2176)
+                # produced row=[null, page1, spec] while the worker's
+                # running-state index is cdiv(2176, bs) - 1 = 0, i.e. the
+                # null slot. The next chunk's state pre-copy then chained
+                # from the null slot, the recurrent state was garbage from
+                # that point on, and spec-decode acceptance collapsed to 0
+                # for that request permanently. Without the lookahead
+                # inflation num_tokens == num_tokens_main_model, so this
+                # correction is a no-op for upstream behavior.
+                if num_tokens != num_tokens_main_model:
+                    num_skipped_blocks = max(
+                        cdiv(num_tokens_main_model, self.block_size) - 1,
+                        0,
+                    )
                 # null blocks
                 if prev_block_len < num_skipped_blocks:
                     # minus the internal checkpoint block
@@ -1918,6 +1941,11 @@ class MambaManager(SingleTypeKVCacheManager):
                 max_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
                 if not blocks_allocated or checkpoint_block:
                     max_new_blocks += self.num_speculative_blocks
+                # GLM53 (Thor SM110, 9/18): with the lookahead page
+                # reserve, the reserve page is materialized as a real
+                # allocated block (not a null), so the budget grows by one.
+                if num_tokens != num_tokens_main_model:
+                    max_new_blocks += 1
                 assert num_new_blocks <= max_new_blocks
                 new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
                 returned_blocks = req_blocks[prev_block_len:]
