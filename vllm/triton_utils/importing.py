@@ -19,6 +19,10 @@ HAS_TRITON = (
 if HAS_TRITON:
     try:
         from triton.backends import backends
+    except Exception:
+        # TRITON_INTERPRET=1: the interpreter never invokes a real driver, so
+        # a partially-broken backend import env must not disable triton.
+        backends = {} if os.environ.get("TRITON_INTERPRET") == "1" else None
 
         # It's generally expected that x.driver exists and has
         # an is_active method.
@@ -69,8 +73,13 @@ if HAS_TRITON:
                 "Triton found 0 active drivers in distributed environment. "
                 "This is expected during initialization."
             )
-        elif not is_distributed_env and len(active_drivers) != 1:
-            # Strict check for non-distributed environments
+        elif not is_distributed_env and len(active_drivers) != 1 and not (
+            len(active_drivers) == 0
+            and os.environ.get("TRITON_INTERPRET") == "1"
+        ):
+            # Strict check for non-distributed environments; TRITON_INTERPRET=1
+            # is exempt: the interpreter never invokes a driver, so 0 active
+            # drivers is expected on driverless hosts.
             logger.info(
                 "Triton is installed but %d active driver(s) found "
                 "(expected 1). Disabling Triton to prevent runtime errors.",
