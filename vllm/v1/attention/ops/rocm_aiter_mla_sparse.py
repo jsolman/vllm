@@ -4156,6 +4156,20 @@ def _rocm_sparse_attn_decode_ragged_triton(
             num_warps=8,
             **launch_kwargs,
         )
+        # This path has no reduce epilogue, so the inverse GPT-J RoPE the
+        # split-K path fuses is still owed: the Q-side RoPE rotated the
+        # trailing rope lanes of the attention output and the o_proj
+        # einsum expects them rotated back. The NoPE lanes take cos=1/sin=0.
+        if inv_rope_positions is not None:
+            assert inv_rope_cos_sin_cache is not None
+            assert inv_rope_cos_sin_cache.shape[-1] == rope_head_dim
+            _fused_inverse_rope_gptj(
+                out,
+                inv_rope_positions,
+                inv_rope_cos_sin_cache,
+                rope_head_dim,
+                out=out,
+            )
         return out
 
     block_k = 32  # KV tokens walked per split-K iteration. Tuned on gfx950.
