@@ -204,8 +204,32 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     Without an explicit backend: SM12 takes FlashInfer, SM100 takes mega
     attention where the topology allows it, and everything else keeps the
     FlashMLA path.
+
+    SM8x (Ampere) and SM110 (Thor/Blackwell) route to the portable Triton
+    sparse-MLA backend (``ampere/``), since the native FlashMLA/mega
+    kernels require SM90+/SM100.
     """
     backend = vllm_config.attention_config.backend
+    device_capability = current_platform.get_device_capability()
+
+    # SM8x (Ampere) and SM110 (Thor/Blackwell): use portable Triton sparse
+    # MLA. The FlashMLA mega/sparse kernels are SM90+/SM100 only.
+    if (
+        device_capability is not None
+        and device_capability.major in [8, 11]
+    ):
+        if backend is not None and backend != AttentionBackendEnum.TRITON_MLA_SPARSE_DSV41:
+            raise ValueError(
+                f"{backend.name} is not supported for DeepSeek V4.1 on "
+                f"SM{device_capability.major}x; use "
+                "TRITON_MLA_SPARSE_DSV41 (default for this arch)."
+            )
+        from vllm.models.deepseek_v41.ampere.ampere_sparse import (
+            DeepseekV41AmpereMLAAttention,
+        )
+
+        return DeepseekV41AmpereMLAAttention
+
     if vllm_config.parallel_config.prefill_context_parallel_size > 1:
         if backend not in (
             None,
