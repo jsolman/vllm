@@ -1695,8 +1695,19 @@ def _get_cached_wo_a_bf16(
         wo_a_weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
             torch.float32
         )
+        if wo_a_scale_param.ndim == 1:
+            # Post-register layout: the ModelOpt mxfp8 loader expands the
+            # checkpoint's grouped e8m0 scale per-element along the output
+            # dim, so per-rank it is flat [out_pp, k_blocks] =
+            # [n_local_groups * o_lora_rank, hidden_dim // 32].
+            wo_a_scale_2d = wo_a_scale_param.reshape(
+                n_local_groups, o_lora_rank, hidden_dim // 32)
+        else:
+            # Checkpoint-layout grouped scale [n_out_groups, k_blocks].
+            wo_a_scale_2d = wo_a_scale_param.reshape(
+                n_local_groups, -1, wo_a_scale_param.shape[-1])
         wo_a_scale = _expand_2d_block_scales(
-            wo_a_scale_param.view(n_local_groups, -1, wo_a_scale_param.shape[-1]),
+            wo_a_scale_2d,
             o_lora_rank,
             hidden_dim,
         )
