@@ -23,6 +23,9 @@ from vllm.models.deepseek_v41.amd.rocm import (
     DeepseekV41ROCMAiterMLASparseBackend,
     DeepseekV41ROCMAiterSparseSWABackend,
 )
+from vllm.models.deepseek_v41.ampere.woa_dequant import (
+    DequantizedBf16LinearMethod,
+)
 from vllm.platforms.interface import DeviceCapability
 
 class DeepseekV41AmpereMLASparseBackend(
@@ -53,3 +56,13 @@ class DeepseekV41AmpereMLAAttention(
 
     backend_cls = DeepseekV41AmpereMLASparseBackend
     swa_backend_cls = DeepseekV41AmpereSparseSWABackend
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # The einsum/dequant o_proj path reads wo_a's retained FP8 block
+        # scale, which the Marlin repack on SM8x/SM110 destroys. Dequantize
+        # wo_a to BF16 at load instead (this runs before post-load
+        # processing); the helper's BF16 branch consumes it directly.
+        # wo_b keeps its quantized runtime (plain linear apply).
+        if getattr(self.wo_a, "weight_block_size", None):
+            self.wo_a.quant_method = DequantizedBf16LinearMethod()
