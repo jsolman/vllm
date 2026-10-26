@@ -42,8 +42,13 @@ from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
     has_deep_gemm,
+    is_deep_gemm_supported,
     mqa_logits_mx_inputs,
     mqa_logits_use_mx_scales,
+)
+from vllm.v1.attention.ops.mqa_logits_triton import (
+    fp8_mqa_logits_triton,
+    fp8_paged_mqa_logits_triton,
 )
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.torch_utils import (
@@ -724,17 +729,26 @@ def sparse_attn_indexer(
                         q_slice_cast, q_scale_slice, weights[row_start:row_end]
                     )
                     row_ends = cu_seqlen_ke - cu_seqlen_ks
-                    logits = as_fp32_logits(
-                        fp8_fp4_mqa_logits(
-                            (q_slice_cast, q_scale_slice),
+                    if use_deep_gemm():
+                        logits = as_fp32_logits(
+                            fp8_fp4_mqa_logits(
+                                (q_slice_cast, q_scale_slice),
+                                (k_quant_cast, k_scale_cast),
+                                chunk_weights,
+                                cu_seqlen_ks,
+                                cu_seqlen_ke,
+                                chunk.max_seqlen_k,
+                            ),
+                            row_ends,
+                        )
+                    else:
+                        logits = fp8_mqa_logits_triton(
+                            q_slice_cast,
                             (k_quant_cast, k_scale_cast),
-                            chunk_weights,
+                            weights[row_start:row_end].float(),
                             cu_seqlen_ks,
                             cu_seqlen_ke,
-                            chunk.max_seqlen_k,
-                        ),
-                        row_ends,
-                    )
+                        )
                 num_rows = logits.shape[0]
                 if candidate_blocks is not None:
                     # Two-level selection (v4.1): the candidate source
@@ -877,16 +891,36 @@ def sparse_attn_indexer(
             padded_q_scale, decode_weights = mqa_logits_mx_inputs(
                 padded_q_quant_cast, padded_q_scale, weights[:num_padded_tokens]
             )
-            logits = fp8_fp4_paged_mqa_logits(
-                (padded_q_quant_cast, padded_q_scale),
-                kv_cache,
-                decode_weights,
-                seq_lens,
-                decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
-                indices=decode_metadata.indices,
-            )
+            if use_deep_gemm():
+                logits = fp8_fp4_paged_mqa_logits(
+                    (padded_q_quant_cast, padded_q_scale),
+                    kv_cache,
+                    decode_weights,
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_model_len,
+                    indices=decode_metadata.indices,
+                )
+            else:
+                # Triton fallback (fp32 scales, fp32 weights off SM100).
+                # No DCP varlen support: single-GPU-per-node serving only.
+                if decode_metadata.indices is not None:
+                    raise NotImplementedError(
+                        "fp8_paged_mqa_logits triton fallback has no varlen "
+                        "indices path (decode-context-parallel)."
+                    )
+                context_lens = (
+                    seq_lens[:, -1].contiguous() if seq_lens.ndim == 2 else seq_lens
+                )
+                logits = fp8_paged_mqa_logits_triton(
+                    padded_q_quant_cast,
+                    kv_cache,
+                    weights[:num_padded_tokens].float(),
+                    context_lens,
+                    decode_metadata.block_table,
+                    max_model_len,
+                )
             # Keeping bf16 halves top-k/candidate reads; other top-k backends and
             # DCP need fp32. SM100 decode is varlen: one context length per row.
             if topk_backend != "deep_select" or dcp_world_size != 1:
@@ -955,6 +989,11 @@ def sparse_attn_indexer(
             )
 
     return topk_indices_buffer
+
+
+def use_deep_gemm() -> bool:
+    """DeepGEMM MQA-logits kernels, honoring VLLM_USE_DEEP_GEMM=0."""
+    return has_deep_gemm() and is_deep_gemm_supported()
 
 
 def sparse_attn_indexer_fake(
@@ -1058,10 +1097,17 @@ class SparseAttnIndexer(CustomOp):
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
         self._cp_kv_cache_interleave_size: int | None = None
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if (
+            current_platform.is_cuda()
+            and not has_deep_gemm()
+            and self.use_fp4_cache
+        ):
+            # FP8 K caches have a Triton fallback (mqa_logits_triton) that
+            # matches the non-MX format this layer produces off SM100; the
+            # FP4/mx-scaled path has no fallback (SM100-class hardware).
             raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
-                "the current vLLM environment."
+                "Sparse Attention Indexer CUDA op requires DeepGEMM support "
+                "in the current vLLM environment for MXFP4 indexer caches."
             )
 
         if vllm_config.kernel_config.enable_jit_warmup:
