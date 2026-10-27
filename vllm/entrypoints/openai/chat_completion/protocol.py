@@ -757,6 +757,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
             except ValueError:
                 parsed = 0
             if parsed >= 0:
+                # The thinking budget is drawn from the same token pool as
+                # max_tokens, so a budget larger than the request's own
+                # max_tokens would let reasoning consume the entire response
+                # and leave the content channel empty. Cap it at a fraction
+                # of max_tokens so the answer always has room.
+                limit = self.max_tokens
+                if limit is None:
+                    limit = self.max_completion_tokens
+                if limit is not None and limit > 0:
+                    parsed = min(parsed, max(1, int(limit * 0.75)))
                 self.thinking_token_budget = parsed
 
         max_temp = os.environ.get("VLLM_REASONING_MAX_TEMPERATURE")
