@@ -90,10 +90,13 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         if role == "tool":
             # Convert tool message to a user message with tool_result block
+            content = msg.get("content", "")
+            if msg.get("content_blocks") and not isinstance(content, str):
+                content = msg["content_blocks"]
             tool_block = {
                 "type": "tool_result",
                 "tool_use_id": msg.get("tool_call_id", ""),
-                "content": msg.get("content", ""),
+                "content": content,
                 "_image_indices": msg.get("_image_indices", []),
             }
             # Merge into previous message if it's already a user (merged tool)
@@ -113,13 +116,27 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         elif role == "user":
             content_blocks = msg.get("content_blocks")
             if content_blocks is None:
-                content_blocks = [
-                    {
-                        "type": "text",
-                        "text": msg.get("content", ""),
-                        "_image_indices": msg.get("_image_indices", []),
-                    }
-                ]
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    # Already a list of content blocks (e.g. the OpenAI
+                    # [{"type": "text", "text": ...}, ...] form). Pass it
+                    # through instead of wrapping it in a single text block,
+                    # which would nest the list inside "text" and break
+                    # rendering.
+                    content_blocks = [
+                        block
+                        if isinstance(block, dict)
+                        else {"type": "text", "text": str(block)}
+                        for block in content
+                    ]
+                else:
+                    content_blocks = [
+                        {
+                            "type": "text",
+                            "text": content,
+                            "_image_indices": msg.get("_image_indices", []),
+                        }
+                    ]
             if (
                 merged
                 and merged[-1].get("role") == "user"
