@@ -299,6 +299,16 @@ class OpenAIServingChat(GenerateBaseServing):
         if not path:
             return
         try:
+            # Rotate when the file grows past the limit, so a long-lived
+            # server cannot fill the disk with request bodies (which may
+            # contain whole documents).
+            limit = int(os.environ.get("VLLM_LOG_CHAT_REQUESTS_MAX_BYTES",
+                                       64 * 1024 * 1024))
+            try:
+                if os.path.exists(path) and os.path.getsize(path) > limit:
+                    os.replace(path, path + ".1")
+            except OSError:
+                pass
             with open(path, "a") as f:
                 f.write(json.dumps(request.model_dump(exclude_none=False),
                                    default=str) + "\n")
