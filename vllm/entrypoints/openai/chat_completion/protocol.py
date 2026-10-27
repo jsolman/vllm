@@ -727,11 +727,53 @@ class ChatCompletionRequest(OpenAIBaseModel):
             self.response_format,
         )
 
+    def _apply_reasoning_guards(self) -> None:
+        """Guard against runaway reasoning on reasoning models.
+
+        A reasoning model asked to produce a long, self-verifying output (a
+        word count, a summary of a very long conversation) can enter a
+        repetition loop inside its reasoning trace and spend the whole
+        ``max_tokens`` budget there, leaving the content channel empty.
+
+        Two optional server-side guards, both disabled by default:
+
+        * ``VLLM_REASONING_MAX_THINKING_TOKENS`` (int): cap the number of
+          tokens the model may spend reasoning. Equivalent to the request
+          field ``thinking_token_budget``, but applies to every request that
+          does not set one.
+        * ``VLLM_REASONING_MAX_TEMPERATURE`` (float): clamp the sampling
+          temperature to at most this value. Guards against clients that send
+          a high default temperature, which makes the repetition loop far
+          more likely.
+
+        A request that explicitly sets the corresponding field always wins.
+        """
+        import os
+
+        budget = os.environ.get("VLLM_REASONING_MAX_THINKING_TOKENS")
+        if budget and self.thinking_token_budget is None:
+            try:
+                parsed = int(budget)
+            except ValueError:
+                parsed = 0
+            if parsed >= 0:
+                self.thinking_token_budget = parsed
+
+        max_temp = os.environ.get("VLLM_REASONING_MAX_TEMPERATURE")
+        if max_temp and self.temperature is not None:
+            try:
+                limit = float(max_temp)
+            except ValueError:
+                limit = None
+            if limit is not None and limit >= 0 and self.temperature > limit:
+                self.temperature = limit
+
     def to_sampling_params(
         self,
         max_tokens: int,
         default_sampling_params: dict,
     ) -> SamplingParams:
+        self._apply_reasoning_guards()
         # Priority: user -> server default -> OpenAI default
         sampling_params = {
             name: (
