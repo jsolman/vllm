@@ -3,6 +3,8 @@
 
 import asyncio
 import itertools
+import json
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -281,6 +283,28 @@ class OpenAIServingChat(GenerateBaseServing):
 
         return await self.online_renderer.render_chat(request)
 
+    def _maybe_log_request(self, request: ChatCompletionRequest) -> None:
+        """Append the raw request to a JSONL file when asked to.
+
+        Enabled by setting ``VLLM_LOG_CHAT_REQUESTS`` to a file path. This
+        dumps one JSON object per request, which is useful when a client
+        reports a problem that cannot be reproduced locally: the exact
+        messages and sampling parameters that reached the server are then
+        available for replay.
+
+        Off by default. Failures are swallowed - logging must never break a
+        request.
+        """
+        path = os.environ.get("VLLM_LOG_CHAT_REQUESTS")
+        if not path:
+            return
+        try:
+            with open(path, "a") as f:
+                f.write(json.dumps(request.model_dump(exclude_none=False),
+                                   default=str) + "\n")
+        except Exception:
+            pass
+
     async def create_chat_completion(
         self,
         request: ChatCompletionRequest,
@@ -302,6 +326,7 @@ class OpenAIServingChat(GenerateBaseServing):
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
         # Streaming response
+        self._maybe_log_request(request)
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
         chat_template_kwargs = self._effective_chat_template_kwargs(request)
