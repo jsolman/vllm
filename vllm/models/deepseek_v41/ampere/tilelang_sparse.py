@@ -172,51 +172,92 @@ def dequantise_swa_pages(
     return rows, valid
 
 
+def _gather_rows(
+    cache: torch.Tensor,
+    slots: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather the packed rows a set of queries selects, into a dense KV.
+
+    The reference kernel indexes a single dense KV per batch entry, so the
+    rows every query selects must live in ONE tensor and each query's
+    index list must point into it. We therefore build the dense KV from
+    the slots in slot order: the first query's slots come first, then the
+    slots the later queries add, deduplicated. The returned index is the
+    POSITION within that dense tensor, which is what the kernel wants.
+
+    Args:
+        cache: the packed paged cache ``[blocks, block, bytes]``.
+        slots: ``[num_queries, topk]`` slot ids.
+
+    Returns:
+        ``(rows, positions)`` where ``rows`` is ``[n_unique, head_dim]``
+        bf16 and ``positions`` is ``[num_queries, topk]`` int32 - the
+        index of each slot within ``rows``, or -1 when the slot is out of
+        range.
+    """
+    num_queries, topk = slots.shape
+    flat = slots.reshape(-1).long()
+    uniq, inv = torch.unique(flat, return_inverse=True)
+    rows, valid = dequantise_swa_pages(cache, uniq)
+    positions = inv.reshape(num_queries, topk).to(torch.int32)
+    # An out-of-range slot is not in the cache: mark it invalid.
+    positions = torch.where(valid[inv.reshape(num_queries, topk)],
+                            positions,
+                            torch.full((num_queries, topk), -1,
+                                       device=slots.device, dtype=torch.int32))
+    return rows, positions
+
+
 def tilelang_sparse_attn_decode(
     q: torch.Tensor,
     swa_k_cache: torch.Tensor,
     swa_slots: torch.Tensor,
     attn_sink: torch.Tensor | None,
     scale: float,
+    extra_k_cache: torch.Tensor | None = None,
+    extra_slots: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run the reference TileLang sparse_attn over the packed SWA cache.
+    """Run the reference TileLang sparse_attn over the packed KV caches.
+
+    The reference concatenates the window KV and the compressed KV into ONE
+    sequence and issues a single sparse_attn over it, so the two sources
+    share one softmax and one attn_sink. We reproduce that: the window
+    rows come first, then the compressed rows, and each query's index
+    list selects across both.
 
     Args:
         q: ``[num_queries, num_heads, head_dim]`` bf16.
-        swa_k_cache: the packed paged cache ``[blocks, block, bytes]``.
-        swa_slots: flat slot ids, ``[num_queries, topk]`` int32.
+        swa_k_cache: the packed paged SWA cache ``[blocks, block, bytes]``.
+        swa_slots: the window slot ids, ``[num_queries, topk_swa]`` int32.
         attn_sink: per-head sink logits, ``[num_heads]`` fp32, or None.
         scale: the softmax scale.
+        extra_k_cache: the packed paged compressed cache, same layout.
+        extra_slots: the compressed slot ids, ``[num_queries, topk_extra]``.
 
     Returns:
         ``[num_queries, num_heads, head_dim]`` bf16.
     """
     num_queries, num_heads, head_dim = q.shape
-    topk = swa_slots.shape[1]
 
     # The reference kernel's KV is the CONCATENATED (window, compressed)
-    # sequence and its topk_idxs index into that. For the SWA-only case
-    # the window is the whole KV, and each query's index list selects its
-    # own window slots. So we pass the dequantised window as the dense KV
-    # and express each query's slots as positions within that window.
-    #
-    # Build the dense window from the UNIQUE slots the queries reference,
-    # then map each query's slot to its position in that window.
-    flat_slots = swa_slots.reshape(-1).long()
-    uniq, inv = torch.unique(flat_slots, return_inverse=True)
-    dense_rows, dense_valid = dequantise_swa_pages(swa_k_cache, uniq)
+    # sequence and its topk_idxs index into that. So build the dense KV as
+    # [window rows | compressed rows] and express each query's slots as
+    # positions within that concatenation.
+    window_rows, window_idxs = _gather_rows(swa_k_cache, swa_slots)
+    num_window = window_rows.shape[0]
 
-    # torch.unique sorts, so a slot that is out of range still appears in
-    # `uniq`; dense_valid marks those.
-    pos_in_uniq = inv.reshape(num_queries, topk)
-    slot_valid = dense_valid[pos_in_uniq]
-
-    # The reference treats an index of -1 as "no valid position": it
-    # writes -inf into the scores for that slot.
-    topk_idxs = torch.where(slot_valid,
-                             pos_in_uniq.to(torch.int32),
-                             torch.full((num_queries, topk), -1,
-                                        device=q.device, dtype=torch.int32))
+    if extra_k_cache is not None and extra_slots is not None:
+        extra_rows, extra_idxs = _gather_rows(extra_k_cache, extra_slots)
+        dense_rows = torch.cat([window_rows, extra_rows], dim=0)
+        # the compressed indices are offset by the window length, exactly
+        # as the reference does (`idxs + offset`)
+        extra_idxs = torch.where(extra_idxs >= 0, extra_idxs + num_window,
+                                 extra_idxs)
+        topk_idxs = torch.cat([window_idxs, extra_idxs], dim=1)
+    else:
+        dense_rows = window_rows
+        topk_idxs = window_idxs
+    topk_idxs = topk_idxs.to(torch.int32)
 
     num_heads_padded = 16 if num_heads < 16 else num_heads
     q_p = q

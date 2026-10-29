@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -93,6 +94,69 @@ def _aiter_sparse_mla_enabled(has_kv_transfer: bool) -> bool:
         logger.warning_once(
             "VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA is ignored with a KV "
             "connector; DeepSeek V4 keeps the Triton sparse attention."
+        )
+        return False
+    return True
+
+
+def _ragged_to_2d(
+    indices: torch.Tensor,
+    indptr: torch.Tensor,
+    num_rows: int,
+) -> torch.Tensor:
+    """Turn a ragged (flat indices, indptr) pair into a dense [rows, width].
+
+    The TileLang path needs a rectangular index list per query. The ragged
+    form has a per-query length; we use the maximum width and pad the
+    shorter rows with -1, which the reference kernel treats as "no valid
+    position".
+    """
+    lengths = (indptr[1:] - indptr[:-1]).to(torch.int64)
+    width = int(lengths.max().item()) if lengths.numel() else 0
+    if width == 0:
+        return torch.zeros((num_rows, 0), dtype=torch.int32,
+                           device=indices.device)
+    out = torch.full((num_rows, width), -1, dtype=torch.int32,
+                     device=indices.device)
+    for r in range(num_rows):
+        start = int(indptr[r].item())
+        end = int(indptr[r + 1].item())
+        n = min(end - start, width)
+        if n > 0:
+            out[r, :n] = indices[start:start + n].to(torch.int32)
+    return out
+
+
+def _tilelang_sparse_mla_enabled() -> bool:
+    """Whether the reference TileLang sparse attention should be used.
+
+    Enabled with VLLM_DSV41_USE_TILELANG_SPARSE=1. The reference's TileLang
+    kernels compile and run natively on SM110 (all six of them, with
+    CUDA_HOME pointing at a CUDA whose nvcc matches its headers), so this
+    is a real alternative to the Triton sparse attention - not a stub.
+
+    It is a DIAGNOSTIC path: the reference kernel wants a dense bf16 KV
+    tensor, so we dequantise the packed fp8 cache into one. For decode
+    that gather is small (topk x head_dim x 2 bytes per query).
+    """
+    if os.environ.get("VLLM_DSV41_USE_TILELANG_SPARSE", "0") not in ("1", "true"):
+        return False
+    from vllm.models.deepseek_v41.ampere.tilelang_sparse import (
+        _reference_kernel_module,
+        _tilelang_available,
+    )
+
+    if not _tilelang_available():
+        logger.warning_once(
+            "VLLM_DSV41_USE_TILELANG_SPARSE=1 but TileLang is unavailable; "
+            "keeping the Triton sparse attention."
+        )
+        return False
+    if _reference_kernel_module() is None:
+        logger.warning_once(
+            "VLLM_DSV41_USE_TILELANG_SPARSE=1 but the reference kernel module "
+            "was not found (set VLLM_DSV41_REFERENCE_MODEL to the model dir); "
+            "keeping the Triton sparse attention."
         )
         return False
     return True
@@ -555,6 +619,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
     backend_cls = DeepseekV41ROCMAiterMLASparseBackend
     swa_backend_cls = DeepseekV41ROCMAiterSparseSWABackend
     _use_aiter_sparse_mla = False
+    _use_tilelang_sparse_mla = False
 
     def _indexer_cls(
         self, k_cache: DeepseekV4IndexerCache | None
@@ -599,6 +664,18 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                     "are not supported."
                 )
         self._use_aiter_sparse_mla = _aiter_sparse_mla_enabled(self._has_kv_transfer)
+        # The reference TileLang sparse attention (diagnostic path): the
+        # reference's own kernel, run over our packed fp8 caches.
+        self._use_tilelang_sparse_mla = (
+            _tilelang_sparse_mla_enabled()
+            and not self._use_aiter_sparse_mla
+            and not self._has_kv_transfer
+        )
+        if self._use_tilelang_sparse_mla:
+            logger.info_once(
+                "Using the reference TileLang sparse attention for DSv4.1 "
+                "(VLLM_DSV41_USE_TILELANG_SPARSE)."
+            )
         if self.compressor is None and self.indexer is None:
             # Dense layers have nothing to overlap; keep the base serial path.
             self.aux_stream_list = None
@@ -1194,6 +1271,44 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 )
                 return q.shape[0]
             # The aiter kernel leaves the inverse RoPE to the caller.
+            return 0
+
+        if self._use_tilelang_sparse_mla:
+            # The reference's TileLang sparse attention over the packed fp8
+            # caches. It wants a dense bf16 KV, so the module dequantises
+            # the selected rows and concatenates the window and compressed
+            # sources exactly as the reference does (one softmax, one
+            # attn_sink). The inverse RoPE is left to the caller, as with
+            # the Triton path.
+            from vllm.models.deepseek_v41.ampere.tilelang_sparse import (
+                tilelang_sparse_attn_decode,
+            )
+
+            assert swa_metadata.decode_swa_ragged_indices is not None
+            assert swa_metadata.decode_swa_ragged_indptr is not None
+            swa_slots = _ragged_to_2d(
+                swa_metadata.decode_swa_ragged_indices,
+                swa_metadata.decode_swa_ragged_indptr,
+                q.shape[0],
+            )
+            extra_slots = None
+            if not swa_only and topk_ragged_indices is not None:
+                extra_slots = _ragged_to_2d(
+                    topk_ragged_indices,
+                    topk_ragged_indptr,
+                    q.shape[0],
+                )
+            out = tilelang_sparse_attn_decode(
+                q=q,
+                swa_k_cache=self.swa_cache_layer.kv_cache,
+                swa_slots=swa_slots,
+                attn_sink=self.attn_sink,
+                scale=self.scale,
+                extra_k_cache=kv_cache if not swa_only else None,
+                extra_slots=extra_slots,
+            )
+            if output is not None:
+                output[:out.shape[0], :out.shape[1]] = out
             return 0
 
         return rocm_sparse_attn_decode(
