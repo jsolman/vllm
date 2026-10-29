@@ -180,28 +180,31 @@ def _gather_rows(
 
     The reference kernel indexes a single dense KV per batch entry, so the
     rows every query selects must live in ONE tensor and each query's
-    index list must point into it. We therefore build the dense KV from
-    the slots in slot order: the first query's slots come first, then the
-    slots the later queries add, deduplicated. The returned index is the
-    POSITION within that dense tensor, which is what the kernel wants.
+    index list must point into it.
+
+    We do NOT deduplicate: each query's slots are laid out contiguously, so
+    query r's row j is at position r * topk + j. The rows a query selects
+    twice would be gathered twice - that is a few hundred KB of extra
+    traffic, and it avoids the torch.unique SORT that py-spy showed was
+    hot in the decode loop (a sort of ~1000 int64s per layer per step).
 
     Args:
         cache: the packed paged cache ``[blocks, block, bytes]``.
         slots: ``[num_queries, topk]`` slot ids.
 
     Returns:
-        ``(rows, positions)`` where ``rows`` is ``[n_unique, head_dim]``
-        bf16 and ``positions`` is ``[num_queries, topk]`` int32 - the
-        index of each slot within ``rows``, or -1 when the slot is out of
-        range.
+        ``(rows, positions)`` where ``rows`` is
+        ``[num_queries * topk, head_dim]`` bf16 and ``positions`` is
+        ``[num_queries, topk]`` int32 - the index of each slot within
+        ``rows``, or -1 when the slot is out of range.
     """
     num_queries, topk = slots.shape
     flat = slots.reshape(-1).long()
-    uniq, inv = torch.unique(flat, return_inverse=True)
-    rows, valid = dequantise_swa_pages(cache, uniq)
-    positions = inv.reshape(num_queries, topk).to(torch.int32)
+    rows, valid = dequantise_swa_pages(cache, flat)
+    positions = torch.arange(flat.numel(), device=slots.device,
+                             dtype=torch.int32).reshape(num_queries, topk)
     # An out-of-range slot is not in the cache: mark it invalid.
-    positions = torch.where(valid[inv.reshape(num_queries, topk)],
+    positions = torch.where(valid.reshape(num_queries, topk),
                             positions,
                             torch.full((num_queries, topk), -1,
                                        device=slots.device, dtype=torch.int32))
