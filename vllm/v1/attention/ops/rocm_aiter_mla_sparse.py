@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from collections.abc import Callable
 from importlib.util import find_spec
 
@@ -4193,6 +4194,22 @@ def _rocm_sparse_attn_decode_ragged_triton(
         num_splits = _decode_num_splits(
             num_queries, heads_blocks, avg_main_len, avg_extra_len, block_k
         )
+        # Optional override for the decode split count. The upstream
+        # reference implementation (the TileLang kernel shipped in the
+        # DeepSeek-V4.1 checkpoint) processes the whole top-k in ONE fused
+        # pass, with no split-K. Our path splits the selected positions
+        # across num_splits workgroups and combines the partial (m, l, acc)
+        # states, which is mathematically equivalent but sums in a different
+        # order. Setting VLLM_SPARSE_DECODE_NUM_SPLITS=1 makes the decode
+        # match the reference's single-pass structure (slower).
+        _forced_splits = os.environ.get("VLLM_SPARSE_DECODE_NUM_SPLITS")
+        if _forced_splits:
+            try:
+                _forced = int(_forced_splits)
+            except ValueError:
+                _forced = 0
+            if _forced >= 1:
+                num_splits = _forced
 
     base_workgroups = num_queries * heads_blocks
     adaptive_splits = (
