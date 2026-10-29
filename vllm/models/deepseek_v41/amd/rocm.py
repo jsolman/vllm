@@ -110,6 +110,14 @@ def _ragged_to_2d(
     form has a per-query length; we use the maximum width and pad the
     shorter rows with -1, which the reference kernel treats as "no valid
     position".
+
+    VECTORISED on purpose: the first version looped over the rows and
+    called .item() on each, which is a GPU->CPU sync per row and made the
+    decode step ~35x slower than the Triton path (0.2 tok/s vs 7). This
+    builds the same result with one scatter and no sync.
+
+    The width has to be known on the host to allocate the output, so there
+    is one .item() here - a single sync per step, not one per row.
     """
     lengths = (indptr[1:] - indptr[:-1]).to(torch.int64)
     width = int(lengths.max().item()) if lengths.numel() else 0
@@ -118,12 +126,19 @@ def _ragged_to_2d(
                            device=indices.device)
     out = torch.full((num_rows, width), -1, dtype=torch.int32,
                      device=indices.device)
-    for r in range(num_rows):
-        start = int(indptr[r].item())
-        end = int(indptr[r + 1].item())
-        n = min(end - start, width)
-        if n > 0:
-            out[r, :n] = indices[start:start + n].to(torch.int32)
+    # The position of each flat index within its row, and the row it
+    # belongs to: both are pure arithmetic on the device.
+    starts = indptr[:-1].to(torch.int64)
+    total = int(indices.numel())
+    if total == 0:
+        return out
+    row_ids = torch.repeat_interleave(
+        torch.arange(num_rows, device=indices.device),
+        lengths,
+    )
+    offsets = torch.arange(total, device=indices.device) - starts[row_ids]
+    keep = offsets < width
+    out[row_ids[keep], offsets[keep]] = indices[keep].to(torch.int32)
     return out
 
 
