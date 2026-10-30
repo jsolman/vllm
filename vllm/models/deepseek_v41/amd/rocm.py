@@ -1320,7 +1320,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                     output is not None,
                     tuple(c.shape),
                     tuple(c.stride()),
-                    q[0, 0, -ROPE_DIM:].float().tolist()[:4],
+                    q[0, 0, -self.rope_head_dim:].float().tolist()[:4],
                 )
             # The reference's TileLang sparse attention over the packed fp8
             # caches. It wants a dense bf16 KV, so the module dequantises
