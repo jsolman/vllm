@@ -1321,8 +1321,8 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                     None if _ri is None else _ri.numel(),
                     None if _rp is None else _rp[:4].tolist(),
                     None if _di is None else tuple(_di.shape),
-                    None if _di is None else _di[0][:8].tolist(),
-                    None if _ri is None else _ri[:8].tolist(),
+                    None if _di is None else tuple(_di[0][:8].tolist()),
+                    None if _ri is None else tuple(_ri[:8].tolist()),
                 )
                 logger.warning_once(
                     "TILELANG DECODE BRANCH REACHED: q rows=%d "
