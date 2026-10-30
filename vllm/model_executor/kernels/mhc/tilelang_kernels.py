@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from functools import cache
 from typing import Any
@@ -61,6 +62,10 @@ def compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
 # optimum is ~1-2%, while one fixed config gives up to 18% at the top of the
 # range.
 _FUSED_POST_PRE_N_THR = 128
+# Debug/fix switch: force the projection tile size so the mHC GEMM's
+# accumulation order does not depend on the batch's token count.
+# VLLM_MHC_TILE_N=2 (or 6) makes every batch shape use the same tile.
+_MHC_TILE_N_FIXED = int(os.environ.get("VLLM_MHC_TILE_N", "0") or 0) or None
 _FUSED_POST_PRE_MAX_TOKENS = 32
 
 
@@ -82,7 +87,18 @@ def mhc_fused_post_pre_split_config(
     # The projection tiles supply the parallelism a small token count cannot,
     # so the tile grows with the batch: 1.3x at one token and 1.03x at 32
     # against a split-k GEMM given the split its own estimator computes.
-    if num_tokens < 16:
+    #
+    # The tile shape MUST NOT depend on num_tokens: a different tile shape
+    # is a different float accumulation order, so the SAME tokens would
+    # give different results in a different batch size (and the same
+    # request would give different results run to run, because the batch
+    # it lands in varies). The tile is chosen from the hidden size alone;
+    # the parallelism for a small batch comes from the split count, which
+    # is a power of two and does not change the accumulation order per
+    # element the way the tile does.
+    if _MHC_TILE_N_FIXED:
+        tile_n, n_splits = _MHC_TILE_N_FIXED, 8
+    elif num_tokens < 16:
         tile_n, n_splits = 2, 8
     else:
         tile_n, n_splits = 6, 8
