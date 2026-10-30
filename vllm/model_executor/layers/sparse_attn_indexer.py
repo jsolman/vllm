@@ -785,6 +785,26 @@ def sparse_attn_indexer(
                     logits.stride(1),
                     topk_tokens,
                 )
+                if os.environ.get("VLLM_DSV41_LOG_TOPK", "0") == "1":
+                    # Debug: the indexer's SCORES and the SELECTION they
+                    # produce (the prefill path). The selection is the
+                    # discrete choice the attention consumes, so if it
+                    # differs between two runs of the SAME request, the
+                    # scores differ.
+                    _lg = logits.detach().float()
+                    logger.warning(
+                        "DSV41 ILOGITS shape=%s sum=%.10g absmax=%.10g",
+                        tuple(_lg.shape),
+                        float(_lg.sum()),
+                        float(_lg.abs().amax()),
+                    )
+                    _tk = topk_indices.detach().to(torch.int64)
+                    for _r in range(min(_tk.shape[0], 4)):
+                        _v = _tk[_r].tolist()
+                        logger.warning(
+                            "DSV41 TOPK row=%d sum=%d first=%s",
+                            _r, sum(int(x) for x in _v if x >= 0), _v[:12],
+                        )
 
             if deinterleave_idx is None:
                 # Under the PCP path the top-k already ran over the whole
