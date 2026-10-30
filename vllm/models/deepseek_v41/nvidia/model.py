@@ -140,6 +140,28 @@ def _dsv41_flag(name: str) -> bool:
     return False
 
 
+def _dsv41_int(name: str, default: int) -> int:
+    """Read an integer setting from the env or from /tmp/dsv41-flags
+    (``NAME=value``), with a default."""
+    val = os.environ.get(name)
+    if val is None:
+        try:
+            with open("/tmp/dsv41-flags") as f:
+                for line in f:
+                    k, _, v = line.strip().partition("=")
+                    if k == name:
+                        val = v
+                        break
+        except OSError:
+            pass
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
 
 # Debug: log a per-layer checksum of the hidden states.
 _DSV41_LOG_LAYER_SUMS = _dsv41_flag("VLLM_DSV41_LOG_LAYER_SUMS")
@@ -151,12 +173,12 @@ logger.warning("DSV41 PROBE row_diff=%s layer_sums=%s",
 # SAME token across requests).
 _DSV41_ROW_DIFF_REQS = int(os.environ.get("VLLM_DSV41_ROW_DIFF_REQS", "4") or 4)
 # Which layer's tokens to log, and how many tokens per pass.
-_DSV41_LOG_LAYER = int(os.environ.get("VLLM_DSV41_LOG_LAYER", "0") or 0)
-_DSV41_LOG_MAX_TOKENS = int(os.environ.get("VLLM_DSV41_LOG_MAX_TOKENS", "32") or 32)
+_DSV41_LOG_LAYER = _dsv41_int("VLLM_DSV41_LOG_LAYER", 0)
+_DSV41_LOG_MAX_TOKENS = _dsv41_int("VLLM_DSV41_LOG_MAX_TOKENS", 32)
 # A hard cap on the probe's total output per process, so a debug run can
 # never fill the disk (the profile run alone would emit 4096 tokens x 40
 # layers x every request).
-_DSV41_LOG_BUDGET = int(os.environ.get("VLLM_DSV41_LOG_BUDGET", "4000") or 4000)
+_DSV41_LOG_BUDGET = _dsv41_int("VLLM_DSV41_LOG_BUDGET", 4000)
 _dsv41_log_used = 0
 
 
