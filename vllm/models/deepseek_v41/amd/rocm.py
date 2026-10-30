@@ -1360,7 +1360,12 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 self.rotary_emb.cos_sin_cache,
                 self.rope_head_dim,
             )
-            return 0
+            # The return value is how many decode rows are ALREADY rotated.
+            # We rotated them above, so the caller must not rotate them
+            # again: returning 0 would make it apply the standalone pass
+            # over output[0:] and double-rotate the decode rows (which
+            # produces garbage output).
+            return q.shape[0]
 
         return rocm_sparse_attn_decode(
             q=q,
