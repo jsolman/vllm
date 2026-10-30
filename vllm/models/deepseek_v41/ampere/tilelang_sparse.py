@@ -163,9 +163,15 @@ def dequantise_swa_pages(
     decoded = torch.pow(2.0, enc - 127.0)          # exp2(enc - 127)
     tile = decoded.repeat_interleave(64, dim=1)     # [n, 448]
     nope = nope * tile
+    # The fp8 e4m3 byte 0x7F is the NaN encoding, and it DOES occur in the
+    # cache. The Triton decode scrubs it to zero
+    # (tl.where(k_nope == k_nope, k_nope, zero_nope)); without that here a
+    # single NaN byte poisons the whole attention output.
+    nope = torch.where(nope == nope, nope, torch.zeros_like(nope))
 
     # 64 RoPE dims: stored raw bf16.
     rope = vals[:, NOPE_DIM:].contiguous().view(torch.bfloat16).to(torch.float32)
+    rope = torch.where(rope == rope, rope, torch.zeros_like(rope))
 
     rows = torch.cat([nope, rope], dim=1).to(torch.bfloat16)
     rows = torch.where(valid[:, None], rows, torch.zeros_like(rows))
