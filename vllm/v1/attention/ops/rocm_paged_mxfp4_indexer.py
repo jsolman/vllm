@@ -12,6 +12,9 @@ the whole context: the pool is resolved once per step and shared by all of
 them.
 """
 
+import os
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 import functools
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -610,11 +613,28 @@ def rocm_mxfp4_sparse_attn_indexer(
     )
     metadata = layer.metadata
     topk_indices_buffer[: hidden_states.shape[0]] = -1
+    if os.environ.get("VLLM_DSV41_LOG_TOPK", "0") == "1":
+        # Debug: the PUBLISHED top-k block indices. This is the discrete
+        # selection the NEXT layer consumes. If it differs between two runs
+        # of the SAME request, the indexer's scores differ.
+        logger.warning(
+            "DSV41 TOPK-PRE n=%d topk=%d", hidden_states.shape[0], topk_tokens
+        )
     if metadata.prefill is not None:
         for chunk, plan in zip(metadata.prefill.chunks, metadata.prefill_plans):
             _dense_prefill(layer, chunk, plan, candidate_write)
     if metadata.decode is not None:
         _dense_decode(layer, max_model_len, candidate_write)
+    if os.environ.get("VLLM_DSV41_LOG_TOPK", "0") == "1":
+        # Debug: the top-k INDICES now written, per row. The next layer
+        # consumes exactly this selection.
+        _t = topk_indices_buffer[: hidden_states.shape[0], :topk_tokens]
+        for _r in range(min(_t.shape[0], 6)):
+            _v = _t[_r].detach().to(torch.int64).tolist()
+            logger.warning(
+                "DSV41 TOPK row=%d sum=%d first=%s",
+                _r, sum(int(x) for x in _v if x >= 0), _v[:12],
+            )
     return topk_indices_buffer
 
 
