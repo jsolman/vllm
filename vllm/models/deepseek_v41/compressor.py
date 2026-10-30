@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import dataclass
 from typing import Any, ClassVar, cast
 
@@ -18,6 +19,7 @@ from vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache import (
     rope_quant_insert,
     save_ring_rows,
 )
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
@@ -28,6 +30,11 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
+
+logger = init_logger(__name__)
+
+# Debug: log a per-token checksum of the compressor's pooled latent.
+_DSV41_LOG_COMPRESSOR = os.environ.get("VLLM_DSV41_LOG_COMPRESSOR", "0") == "1"
 
 
 class CompressorBackend(AttentionBackend):
@@ -381,6 +388,18 @@ class DeepseekCompressor(nn.Module):
         if prev_rows is not None:
             assert state_cache is not None and ring_write_slots is not None
             save_ring_rows(prev_rows, ring_write_slots, state_cache)
+        if _DSV41_LOG_COMPRESSOR and latent is not None and latent.numel():
+            # Debug: a per-token checksum of the POOLED latent, so two runs
+            # of the same request can be compared offline. The latent is
+            # filled only at the group boundaries, so the tokens that
+            # differ are exactly the ones whose pooled row differs.
+            lf = latent.detach().float()
+            sums = lf.sum(dim=1)
+            for ti in range(lf.shape[0]):
+                logger.warning(
+                    "DSV41 COMP tok=%d sum=%.10g absmax=%.10g",
+                    ti, float(sums[ti]), float(lf[ti].abs().max()),
+                )
         return latent
 
     def insert_cache(
