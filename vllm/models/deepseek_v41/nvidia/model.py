@@ -1247,65 +1247,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 _ck("res", residual)
                 _ck("post", post_mix)
                 _ck("resmix", res_mix)
-                if _DSV41_LOG_ROW_DIFF:
-                    h0 = hidden_states
-                    if not isinstance(h0, torch.Tensor):
-                        # A MoEOutput carries the un-reduced routed output
-                        # and the shared-expert output separately.
-                        routed = getattr(h0, "routed", None)
-                        shared = getattr(h0, "shared_output", None)
-                        parts = [t for t in (routed, shared)
-                                 if isinstance(t, torch.Tensor)]
-                        if parts:
-                            h0 = parts[0] if len(parts) == 1 else sum(parts)
-                        else:
-                            h0 = None
-                    hidden_states = h0 if isinstance(h0, torch.Tensor) else None
                 if _DSV41_LOG_ROW_DIFF and isinstance(hidden_states, torch.Tensor):
-                    # Debug: how do the ROWS of one batch differ? A row that
-                    # differs from row 0 in only a FEW elements points at a
-                    # localised kernel; a row that differs everywhere points
-                    # at an input that was computed differently.
+                    # Debug: a per-TOKEN checksum of every layer's hidden
+                    # state, so the two requests of a batch can be compared
+                    # OFFLINE (the token layout in the batch is not known
+                    # here, and the batch also holds the decode tokens).
                     h = hidden_states.detach().float()
-                    if h.dim() == 2 and h.shape[0] > 1:
-                        # (T, dim): T is the flattened token axis. A batch of
-                        # R requests of L tokens each is R*L rows, so row i
-                        # and row i+L are the SAME token of two different
-                        # requests. Compare across the REQUESTS, not down
-                        # the tokens: with a batch of R requests, compare
-                        # row i with row i+L for every i < L.
-                        t = h.shape[0]
-                        nreq = _DSV41_ROW_DIFF_REQS
-                        if nreq > 1 and t % nreq == 0:
-                            L = t // nreq
-                            for i in range(L):
-                                for r in range(1, nreq):
-                                    a = h[i]
-                                    b = h[i + r * L]
-                                    d = (a - b).abs()
-                                    ndiff = int((d > 0).sum())
-                                    if ndiff:
-                                        logger.warning(
-                                            "DSV41 ROWDIFF layer=%d "
-                                            "tok=%d req=%d vs req=%d "
-                                            "ndiff=%d/%d max=%.6g",
-                                            idx, i, 0, r, ndiff, d.numel(),
-                                            float(d.max()),
-                                        )
-                                        break
-                                else:
-                                    continue
-                                break
-                    elif h.dim() == 3 and h.shape[0] > 1:
-                        r0 = h[0]
-                        for i in range(1, h.shape[0]):
-                            d = (h[i] - r0).abs()
-                            ndiff = int((d > 0).sum())
+                    if h.dim() == 2:
+                        sums = h.sum(dim=1)
+                        mx = h.abs().amax(dim=1)
+                        for ti in range(h.shape[0]):
                             logger.warning(
-                                "DSV41 ROWDIFF layer=%d row=%d ndiff=%d/%d "
-                                "max=%.6g",
-                                idx, i, ndiff, d.numel(),
-                                float(d.max()) if d.numel() else 0.0,
+                                "DSV41 TOK layer=%d tok=%d sum=%.10g "
+                                "absmax=%.10g",
+                                idx, ti, float(sums[ti]), float(mx[ti]),
                             )
         assert residual is not None and post_mix is not None
         assert res_mix is not None and pre_mix is not None
