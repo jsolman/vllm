@@ -1235,7 +1235,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 def _ck(tag, t):
                     if isinstance(t, torch.Tensor) and t.numel():
                         v = t.detach().float()
-                        logger.info(
+                        logger.warning(
                             "DSV41 LAYER %d %s sum=%.10g absmax=%.10g",
                             idx, tag, float(v.sum()), float(v.abs().max()),
                         )
@@ -1274,7 +1274,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         for i in range(1, h.shape[0]):
                             d = (h[i] - r0).abs()
                             ndiff = int((d > 0).sum())
-                            logger.info(
+                            logger.warning(
                                 "DSV41 ROWDIFF layer=%d row=%d ndiff=%d/%d "
                                 "max=%.6g",
                                 idx, i, ndiff, d.numel(),
@@ -1285,7 +1285,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         for i in range(1, h.shape[0]):
                             d = (h[i] - r0).abs()
                             ndiff = int((d > 0).sum())
-                            logger.info(
+                            logger.warning(
                                 "DSV41 ROWDIFF layer=%d row=%d ndiff=%d/%d "
                                 "max=%.6g",
                                 idx, i, ndiff, d.numel(),
