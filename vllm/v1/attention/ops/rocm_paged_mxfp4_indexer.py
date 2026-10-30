@@ -680,6 +680,13 @@ def rocm_mxfp4_sparse_mqa_indexer(
     )
     metadata = layer.metadata
     topk_indices_buffer[: hidden_states.shape[0]] = -1
+    if os.environ.get("VLLM_DSV41_LOG_TOPK", "0") == "1":
+        # Debug: the PUBLISHED top-k block indices (the discrete selection
+        # the NEXT layer consumes). If it differs between two runs of the
+        # SAME request, the indexer's scores differ.
+        logger.warning(
+            "DSV41 TOPK-MQA n=%d topk=%d", hidden_states.shape[0], topk_tokens
+        )
     if metadata.prefill is not None:
         for chunk, plan in zip(metadata.prefill.chunks, metadata.prefill_plans):
             if not plan.use_gather:
@@ -693,4 +700,14 @@ def rocm_mxfp4_sparse_mqa_indexer(
             _gather_decode(layer, num_candidate_cols)
         else:
             _dense_decode(layer, max_model_len, candidate_write=False)
+    if os.environ.get("VLLM_DSV41_LOG_TOPK", "0") == "1":
+        # Debug: the top-k INDICES now written, per row. The next layer
+        # consumes exactly this selection.
+        _t = topk_indices_buffer[: hidden_states.shape[0], :topk_tokens]
+        for _r in range(min(_t.shape[0], 6)):
+            _v = _t[_r].detach().to(torch.int64).tolist()
+            logger.warning(
+                "DSV41 TOPK row=%d sum=%d first=%s",
+                _r, sum(int(x) for x in _v if x >= 0), _v[:12],
+            )
     return topk_indices_buffer
