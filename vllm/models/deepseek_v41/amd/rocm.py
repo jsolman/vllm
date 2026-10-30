@@ -1314,26 +1314,23 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 _ri = swa_metadata.decode_swa_ragged_indices
                 _rp = swa_metadata.decode_swa_ragged_indptr
                 _di = swa_metadata.decode_swa_indices
-                logger.warning_once(
-                    "TILELANG INPUTS: ragged_idx_numel=%s ragged_indptr=%s "
-                    "dense_idx_shape=%s dense_row0=%s "
-                    "ragged_first8=%s",
-                    None if _ri is None else _ri.numel(),
-                    None if _rp is None else tuple(_rp[:4].tolist()),
-                    None if _di is None else tuple(_di.shape),
-                    None if _di is None else tuple(_di[0][:8].tolist()),
-                    None if _ri is None else tuple(_ri[:8].tolist()),
+                logger.warning(
+                    "TILELANG INPUTS: "
+                    f"ragged_idx_numel={None if _ri is None else _ri.numel()} "
+                    f"ragged_indptr={None if _rp is None else _rp[:4].tolist()} "
+                    f"dense_idx_shape={None if _di is None else tuple(_di.shape)} "
+                    f"dense_row0={None if _di is None else _di[0][:8].tolist()} "
+                    f"ragged_first8={None if _ri is None else _ri[:8].tolist()}"
                 )
-                logger.warning_once(
-                    "TILELANG DECODE BRANCH REACHED: q rows=%d "
-                    "output_mxfp8=%s output=%s cache_shape=%s "
-                    "cache_stride=%s q_head0_rope=%s",
-                    q.shape[0],
-                    output_mxfp8 is not None,
-                    output is not None,
-                    tuple(c.shape),
-                    tuple(c.stride()),
-                    tuple(q[0, 0, -self.rope_head_dim:].float().tolist()[:4]),
+                logger.warning(
+                    "TILELANG DECODE BRANCH REACHED: "
+                    f"q rows={q.shape[0]} "
+                    f"output_mxfp8={output_mxfp8 is not None} "
+                    f"output={output is not None} "
+                    f"cache_shape={tuple(c.shape)} "
+                    f"cache_stride={tuple(c.stride())} "
+                    f"q_head0_rope="
+                    f"{q[0, 0, -self.rope_head_dim:].float().tolist()[:4]}"
                 )
             # The reference's TileLang sparse attention over the packed fp8
             # caches. It wants a dense bf16 KV, so the module dequantises
@@ -1398,15 +1395,15 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                     )
                     torch.cuda.synchronize()
                     d = (out.float() - ref_out.float()).abs()
-                    logger.warning_once(
-                        "TILELANG vs TRITON: max err %s mean %s  tl[0]=%s tr[0]=%s",
-                        f"{d.max().item():.6f}",
-                        f"{d.mean().item():.6f}",
-                        tuple(out[0, 0, :4].float().tolist()),
-                        tuple(ref_out[0, 0, :4].float().tolist()),
+                    logger.warning(
+                        "TILELANG vs TRITON: "
+                        f"max err {d.max().item():.6f} "
+                        f"mean {d.mean().item():.6f} "
+                        f"tl[0]={out[0, 0, :4].float().tolist()} "
+                        f"tr[0]={ref_out[0, 0, :4].float().tolist()}"
                     )
                 except Exception as e:
-                    logger.warning_once("TILELANG COMPARE failed: %s", repr(e))
+                    logger.warning(f"TILELANG COMPARE failed: {e!r}")
             if output is not None:
                 output[:out.shape[0], :out.shape[1]] = out
             # The reference's sparse_attn does NOT rotate its output: the
