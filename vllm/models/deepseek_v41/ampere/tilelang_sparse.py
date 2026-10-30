@@ -147,14 +147,19 @@ def dequantise_swa_pages(
     page_stride = swa_k_cache.stride(0)
     flat = swa_k_cache.view(-1) if swa_k_cache.is_contiguous() else None
     if flat is None:
-        # Build a flat VIEW of the PHYSICAL storage: the kernel addresses the
-        # raw bytes (base + block*stride(0) + offset), so our indices must be
-        # physical byte offsets too. Take the underlying storage (which is
-        # contiguous) and view it flat, then offset by the tensor's own
-        # storage_offset.
+        # Build a flat VIEW of the PHYSICAL storage: the kernel addresses
+        # the raw bytes (base + block*stride(0) + offset), so our indices
+        # must be physical byte offsets too.
+        #
+        # The view must not over-claim the storage: the allocation is
+        # [storage_offset, storage_offset + nbytes) and the tensor occupies
+        # only part of it, so size the view by what the tensor's own
+        # extents need (the last block's page end), not the whole storage.
+        last_page = (blocks - 1) * page_stride
+        used = last_page + block * (ROW_BYTES + SCALE_BYTES)
         base = swa_k_cache.storage()
-        flat = torch.as_strided(swa_k_cache, (base.nbytes(),), (1,),
-                                swa_k_cache.storage_offset())
+        offset = swa_k_cache.storage_offset()
+        flat = torch.as_strided(swa_k_cache, (used,), (1,), offset)
         flat = flat.view(torch.uint8)
 
     block_ids = torch.div(slots, block, rounding_mode="floor").long()
