@@ -1225,22 +1225,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 if self.use_sequence_parallel:
                     previous_aux = sp_all_gather(previous_aux)[:full_num_tokens]
                 aux_hidden_by_layer[idx] = previous_aux
-            if _DSV41_LOG_LAYER_SUMS and hidden_states is not None:
-                # Debug: a per-layer checksum of the hidden states, so a
-                # run-to-run divergence can be localised to the first layer
-                # that differs.
-                h = hidden_states
-                if not isinstance(h, torch.Tensor):
-                    h = h[0] if isinstance(h, (tuple, list)) else None
-                if isinstance(h, torch.Tensor) and h.numel():
-                    v = h.detach().float()
-                    logger.info(
-                        "DSV41 LAYER %d sum=%.10g absmax=%.10g shape=%s",
-                        idx,
-                        float(v.sum()),
-                        float(v.abs().max()),
-                        tuple(v.shape),
-                    )
+            if _DSV41_LOG_LAYER_SUMS:
+                # Debug: a per-layer checksum of EVERY stream the layer
+                # carries (the hidden state AND the three MHC streams), so
+                # a run-to-run divergence can be localised to the first
+                # layer and the first stream that differs.
+                def _ck(tag, t):
+                    if isinstance(t, torch.Tensor) and t.numel():
+                        v = t.detach().float()
+                        logger.info(
+                            "DSV41 LAYER %d %s sum=%.10g absmax=%.10g",
+                            idx, tag, float(v.sum()), float(v.abs().max()),
+                        )
+
+                _ck("x", hidden_states)
+                _ck("res", residual)
+                _ck("post", post_mix)
+                _ck("resmix", res_mix)
         assert residual is not None and post_mix is not None
         assert res_mix is not None and pre_mix is not None
         return hidden_states, residual, post_mix, res_mix, pre_mix
