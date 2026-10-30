@@ -1244,6 +1244,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 _ck("res", residual)
                 _ck("post", post_mix)
                 _ck("resmix", res_mix)
+                if _DSV41_LOG_ROW_DIFF:
+                    h0 = hidden_states
+                    if not isinstance(h0, torch.Tensor):
+                        # A MoEOutput carries the un-reduced routed output
+                        # and the shared-expert output separately.
+                        routed = getattr(h0, "routed", None)
+                        shared = getattr(h0, "shared_output", None)
+                        parts = [t for t in (routed, shared)
+                                 if isinstance(t, torch.Tensor)]
+                        if parts:
+                            h0 = parts[0] if len(parts) == 1 else sum(parts)
+                        else:
+                            h0 = None
+                    hidden_states = h0 if isinstance(h0, torch.Tensor) else None
                 if _DSV41_LOG_ROW_DIFF and isinstance(hidden_states, torch.Tensor):
                     # Debug: how do the ROWS of one batch differ? A row that
                     # differs from row 0 in only a FEW elements points at a
