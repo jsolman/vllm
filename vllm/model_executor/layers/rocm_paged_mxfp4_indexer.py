@@ -97,6 +97,8 @@ class RocmSparseMQAIndexer(nn.Module):
         weights: torch.Tensor,
     ) -> torch.Tensor:
         assert k is None, "the model writes the indexer K cache"
+        import sys as _sys
+        print(f"DSV41 ROCM-IDX forward() called", file=_sys.stderr, flush=True)
         q_values, q_scale = q_quant
         return rocm_mxfp4_sparse_mqa_indexer(
             hidden_states,
