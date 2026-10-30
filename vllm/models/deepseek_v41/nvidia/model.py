@@ -153,6 +153,20 @@ _DSV41_ROW_DIFF_REQS = int(os.environ.get("VLLM_DSV41_ROW_DIFF_REQS", "4") or 4)
 # Which layer's tokens to log, and how many tokens per pass.
 _DSV41_LOG_LAYER = int(os.environ.get("VLLM_DSV41_LOG_LAYER", "0") or 0)
 _DSV41_LOG_MAX_TOKENS = int(os.environ.get("VLLM_DSV41_LOG_MAX_TOKENS", "64") or 64)
+# A hard cap on the probe's total output per process, so a debug run can
+# never fill the disk (the profile run alone would emit 4096 tokens x 40
+# layers x every request).
+_DSV41_LOG_BUDGET = int(os.environ.get("VLLM_DSV41_LOG_BUDGET", "20000") or 20000)
+_dsv41_log_used = 0
+
+
+def _dsv41_log(fmt: str, *args) -> None:
+    """Log a probe line, within a per-process line budget."""
+    global _dsv41_log_used
+    if _dsv41_log_used >= _DSV41_LOG_BUDGET:
+        return
+    _dsv41_log_used += 1
+    logger.warning(fmt, *args)
 
 
 class DeepseekV4MoE(DeepseekV4MoEBase):
@@ -684,7 +698,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # and only a few, or the profile run floods the log
                 _nz = (_m > 0).nonzero().flatten()
                 for _ti in _nz[:_DSV41_LOG_MAX_TOKENS].tolist():
-                    logger.warning(
+                    _dsv41_log(
                         "DSV41 ATN tok=%d sum=%.10g absmax=%.10g",
                         _ti, float(_s[_ti]), float(_m[_ti]),
                     )
@@ -1300,14 +1314,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         hf = h.detach().float()
                         sums = hf.sum(dim=1)
                         mx = hf.abs().amax(dim=1)
-                        for ti in range(hf.shape[0]):
-                            logger.warning(
+                        # only the non-padding tokens, and only a few
+                        nz = (mx > 0).nonzero().flatten()
+                        for ti in nz[:_DSV41_LOG_MAX_TOKENS].tolist():
+                            _dsv41_log(
                                 "DSV41 TOK layer=%d tok=%d sum=%.10g "
                                 "absmax=%.10g",
                                 idx, ti, float(sums[ti]), float(mx[ti]),
                             )
                     else:
-                        logger.warning(
+                        _dsv41_log(
                             "DSV41 TOK layer=%d type=%s",
                             idx, type(hidden_states).__name__,
                         )
