@@ -1250,7 +1250,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     # localised kernel; a row that differs everywhere points
                     # at an input that was computed differently.
                     h = hidden_states.detach().float()
-                    if h.dim() == 3 and h.shape[0] > 1:
+                    if h.dim() == 2 and h.shape[0] > 1:
+                        # (T, dim): T is the flattened token axis, so a
+                        # batch of R requests of L tokens is R*L rows.
+                        # Compare each row with the FIRST row of its own
+                        # request is not possible here, so compare every
+                        # row with row 0 and report the count.
+                        r0 = h[0]
+                        for i in range(1, h.shape[0]):
+                            d = (h[i] - r0).abs()
+                            ndiff = int((d > 0).sum())
+                            logger.info(
+                                "DSV41 ROWDIFF layer=%d row=%d ndiff=%d/%d "
+                                "max=%.6g",
+                                idx, i, ndiff, d.numel(),
+                                float(d.max()) if d.numel() else 0.0,
+                            )
+                    elif h.dim() == 3 and h.shape[0] > 1:
                         r0 = h[0]
                         for i in range(1, h.shape[0]):
                             d = (h[i] - r0).abs()
