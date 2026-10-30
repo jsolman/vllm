@@ -278,16 +278,6 @@ class CoreEngineProcManager:
 
             # Start EngineCore in background process.
             local_dp_ranks.append(local_index)
-            if os.environ.get("VLLM_DSV41_DUMP_ENV"):
-                # Debug: what does the child's environ actually contain?
-                import sys as _sys
-                _keep = ("VLLM_DSV41", "VLLM_MHC", "VLLM_REASONING",
-                         "VLLM_SPARSE_DECODE", "VLLM_USE_BREAKABLE")
-                _d = {k: v for k, v in os.environ.items()
-                      if any(k.startswith(pfx) for pfx in _keep)}
-                print(f"DSV41 ENVDUMP ppid={os.getpid()} "
-                      f"n_all={len(os.environ)} matching={sorted(_d.items())}",
-                      file=_sys.stderr, flush=True)
             self.processes.append(
                 context.Process(
                     target=EngineCoreProc.run_engine_core,
