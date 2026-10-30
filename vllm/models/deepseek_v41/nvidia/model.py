@@ -124,9 +124,6 @@ if typing.TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Debug: log a per-layer checksum of the hidden states.
-_DSV41_LOG_LAYER_SUMS = _dsv41_flag("VLLM_DSV41_LOG_LAYER_SUMS")
-# Debug: log how the rows of one batch differ from each other.
 def _dsv41_flag(name: str) -> bool:
     """Read a debug flag from the env OR from /tmp/dsv41-flags (one name
     per line). The engine process does not inherit every env var, so the
@@ -143,6 +140,10 @@ def _dsv41_flag(name: str) -> bool:
     return False
 
 
+
+# Debug: log a per-layer checksum of the hidden states.
+_DSV41_LOG_LAYER_SUMS = _dsv41_flag("VLLM_DSV41_LOG_LAYER_SUMS")
+# Debug: log how the rows of one batch differ from each other.
 _DSV41_LOG_ROW_DIFF = _dsv41_flag("VLLM_DSV41_LOG_ROW_DIFF")
 # How many requests the row-diff probe's batch has (so it can compare the
 # SAME token across requests).
