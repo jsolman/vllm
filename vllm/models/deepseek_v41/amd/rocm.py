@@ -1359,6 +1359,41 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 extra_k_cache=kv_cache if not swa_only else None,
                 extra_slots=extra_slots,
             )
+            # DIAGNOSTIC: run the Triton path on the same inputs and diff.
+            if os.environ.get("VLLM_DSV41_TL_COMPARE", "0") == "1":
+                ref_out = torch.zeros_like(out)
+                try:
+                    rocm_sparse_attn_decode(
+                        q=q,
+                        kv_cache=kv_cache,
+                        swa_k_cache=self.swa_cache_layer.kv_cache,
+                        swa_only=swa_only,
+                        topk_indices=None,
+                        topk_lens=topk_lens,
+                        swa_indices=swa_metadata.decode_swa_indices,
+                        swa_lens=swa_metadata.decode_swa_lens,
+                        swa_ragged_indices=swa_metadata.decode_swa_ragged_indices,
+                        swa_ragged_indptr=swa_metadata.decode_swa_ragged_indptr,
+                        topk_ragged_indices=topk_ragged_indices,
+                        topk_ragged_indptr=topk_ragged_indptr,
+                        attn_sink=self.attn_sink,
+                        scale=self.scale,
+                        head_dim=self.head_dim,
+                        nope_head_dim=self.nope_head_dim,
+                        rope_head_dim=self.rope_head_dim,
+                        output=ref_out,
+                    )
+                    torch.cuda.synchronize()
+                    d = (out.float() - ref_out.float()).abs()
+                    logger.warning_once(
+                        "TILELANG vs TRITON: max err %s mean %s  tl[0]=%s tr[0]=%s",
+                        f"{d.max().item():.6f}",
+                        f"{d.mean().item():.6f}",
+                        tuple(out[0, 0, :4].float().tolist()),
+                        tuple(ref_out[0, 0, :4].float().tolist()),
+                    )
+                except Exception as e:
+                    logger.warning_once("TILELANG COMPARE failed: %s", repr(e))
             if output is not None:
                 output[:out.shape[0], :out.shape[1]] = out
             # The reference's sparse_attn does NOT rotate its output: the
