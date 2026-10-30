@@ -1319,7 +1319,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                     "dense_idx_shape=%s dense_row0=%s "
                     "ragged_first8=%s",
                     None if _ri is None else _ri.numel(),
-                    None if _rp is None else _rp[:4].tolist(),
+                    None if _rp is None else tuple(_rp[:4].tolist()),
                     None if _di is None else tuple(_di.shape),
                     None if _di is None else tuple(_di[0][:8].tolist()),
                     None if _ri is None else tuple(_ri[:8].tolist()),
