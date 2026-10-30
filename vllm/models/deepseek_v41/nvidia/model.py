@@ -145,6 +145,8 @@ def _dsv41_flag(name: str) -> bool:
 _DSV41_LOG_LAYER_SUMS = _dsv41_flag("VLLM_DSV41_LOG_LAYER_SUMS")
 # Debug: log how the rows of one batch differ from each other.
 _DSV41_LOG_ROW_DIFF = _dsv41_flag("VLLM_DSV41_LOG_ROW_DIFF")
+logger.warning("DSV41 PROBE row_diff=%s layer_sums=%s",
+               _DSV41_LOG_ROW_DIFF, _DSV41_LOG_LAYER_SUMS)
 # How many requests the row-diff probe's batch has (so it can compare the
 # SAME token across requests).
 _DSV41_ROW_DIFF_REQS = int(os.environ.get("VLLM_DSV41_ROW_DIFF_REQS", "4") or 4)
