@@ -126,6 +126,8 @@ logger = init_logger(__name__)
 
 # Debug: log a per-layer checksum of the hidden states.
 _DSV41_LOG_LAYER_SUMS = os.environ.get("VLLM_DSV41_LOG_LAYER_SUMS", "0") == "1"
+# Debug: log how the rows of one batch differ from each other.
+_DSV41_LOG_ROW_DIFF = os.environ.get("VLLM_DSV41_LOG_ROW_DIFF", "0") == "1"
 
 
 class DeepseekV4MoE(DeepseekV4MoEBase):
@@ -1242,6 +1244,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 _ck("res", residual)
                 _ck("post", post_mix)
                 _ck("resmix", res_mix)
+                if _DSV41_LOG_ROW_DIFF and isinstance(hidden_states, torch.Tensor):
+                    # Debug: how do the ROWS of one batch differ? A row that
+                    # differs from row 0 in only a FEW elements points at a
+                    # localised kernel; a row that differs everywhere points
+                    # at an input that was computed differently.
+                    h = hidden_states.detach().float()
+                    if h.dim() == 3 and h.shape[0] > 1:
+                        r0 = h[0]
+                        for i in range(1, h.shape[0]):
+                            d = (h[i] - r0).abs()
+                            ndiff = int((d > 0).sum())
+                            logger.info(
+                                "DSV41 ROWDIFF layer=%d row=%d ndiff=%d/%d "
+                                "max=%.6g",
+                                idx, i, ndiff, d.numel(),
+                                float(d.max()) if d.numel() else 0.0,
+                            )
         assert residual is not None and post_mix is not None
         assert res_mix is not None and pre_mix is not None
         return hidden_states, residual, post_mix, res_mix, pre_mix
