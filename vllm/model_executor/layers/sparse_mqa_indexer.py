@@ -158,18 +158,6 @@ class SparseMQAIndexer(nn.Module):
         if metadata.num_prefills > 0:
             prefill = metadata.prefill
             sparse_chunks = metadata.sparse_prefill
-            if _DSV41_LOG_TOPK:
-                # Debug: the PUBLISHED top-k, in the PREFILL branch. The
-                # selection is the discrete choice the next layer consumes.
-                _pt = topk_indices_buffer[: prefill.chunks[0].token_end
-                                          if prefill.chunks else 0,
-                                          :topk_tokens]
-                for _r in range(min(_pt.shape[0], 6)):
-                    _v = _pt[_r].detach().to(torch.int64).tolist()
-                    logger.warning(
-                        "DSV41 TOPK-P row=%d sum=%d first=%s",
-                        _r, sum(int(x) for x in _v if x >= 0), _v[:12],
-                    )
             assert prefill is not None and sparse_chunks is not None
             k_quant_full, k_scale_full = _prefill_k_workspaces(
                 self.max_total_seq_len, self.head_dim
@@ -206,20 +194,6 @@ class SparseMQAIndexer(nn.Module):
             assert decode_rows.row_indices is not None
             num_rows = decode_rows.row_ke.shape[0]
             if num_rows > 0:
-                if _DSV41_LOG_TOPK and num_rows:
-                    # Debug: the PUBLISHED top-k block indices. This is the
-                    # discrete selection the next layer consumes. If it
-                    # differs between two runs of the SAME request, the
-                    # indexer's scores differ, and the divergence is in the
-                    # indexer path (not the attention).
-                    _t = topk_indices_buffer[:num_rows, :topk_tokens]
-                    for _r in range(min(num_rows, 4)):
-                        _v = _t[_r].detach().to(torch.int64).tolist()
-                        _s = sum(int(x) for x in _v if x >= 0)
-                        logger.warning(
-                            "DSV41 TOPK row=%d sum=%d first=%s",
-                            _r, _s, _v[:12],
-                        )
                 decode_rows.kernel_metadata = sparse_mqa_logits_paged_decode(
                     q_values[:num_rows].view(torch.int8).unsqueeze(1),
                     q_scale[:num_rows].unsqueeze(1),
@@ -238,5 +212,17 @@ class SparseMQAIndexer(nn.Module):
                     end=decode_rows.end,
                     col_indices=decode_rows.col_indices,
                     kernel_metadata=decode_rows.kernel_metadata,
+                )
+        if _DSV41_LOG_TOPK and hidden_states.shape[0]:
+            # Debug: the PUBLISHED top-k block indices, AFTER both branches
+            # have written them. This is the discrete selection the NEXT
+            # layer consumes. If it differs between two runs of the SAME
+            # request, the indexer's scores differ.
+            _t = topk_indices_buffer[: hidden_states.shape[0], :topk_tokens]
+            for _r in range(min(_t.shape[0], 8)):
+                _v = _t[_r].detach().to(torch.int64).tolist()
+                logger.warning(
+                    "DSV41 TOPK row=%d sum=%d first=%s",
+                    _r, sum(int(x) for x in _v if x >= 0), _v[:12],
                 )
         return topk_indices_buffer
