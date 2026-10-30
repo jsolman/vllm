@@ -1347,6 +1347,19 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             )
             if output is not None:
                 output[:out.shape[0], :out.shape[1]] = out
+            # The reference's sparse_attn does NOT rotate its output: the
+            # reference's Attention.forward applies the inverse GPT-J RoPE
+            # to the output separately (apply_rotary_emb(o[..., -rd:], ...,
+            # True)). The Triton decode fuses that rotation into its
+            # reduce epilogue, but the TileLang kernel has no such
+            # epilogue, so we owe it here. Without it the output keeps the
+            # query's rotation and the model emits garbage.
+            rocm_inverse_rope_rows_(
+                out,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.rope_head_dim,
+            )
             return 0
 
         return rocm_sparse_attn_decode(
