@@ -34,7 +34,23 @@ from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
 logger = init_logger(__name__)
 
 # Debug: log a per-token checksum of the compressor's pooled latent.
-_DSV41_LOG_COMPRESSOR = os.environ.get("VLLM_DSV41_LOG_COMPRESSOR", "0") == "1"
+def _dsv41_flag(name: str) -> bool:
+    """Read a debug flag from the env OR from /tmp/dsv41-flags (one name
+    per line). The engine process does not inherit every env var, so the
+    file is the reliable channel for a live experiment."""
+    if os.environ.get(name, "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            for line in f:
+                if line.strip() == name:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+_DSV41_LOG_COMPRESSOR = _dsv41_flag("VLLM_DSV41_LOG_COMPRESSOR")
 # A hard cap on the probe's output per process (a debug run must never
 # fill the disk).
 _DSV41_LOG_MAX_TOKENS = int(os.environ.get("VLLM_DSV41_LOG_MAX_TOKENS", "64") or 64)
