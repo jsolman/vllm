@@ -52,6 +52,13 @@ def compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
         num_block_k = cdiv(k, block_k)
         split_k = min(split_k, num_block_k // 4)
     split_k = max(split_k, 1)
+    if _MHC_SPLIT_K_FIXED:
+        # A split-K GEMM sums its partials in the split's order, so a
+        # different split count is a different accumulation order and the
+        # SAME tokens give different results in a different batch size
+        # (grid_size is ceil(num_tokens/block_k)). Fixing the split count
+        # makes the arithmetic independent of the batch shape.
+        split_k = min(split_k, _MHC_SPLIT_K_FIXED)
     return split_k
 
 
@@ -66,6 +73,9 @@ _FUSED_POST_PRE_N_THR = 128
 # accumulation order does not depend on the batch's token count.
 # VLLM_MHC_TILE_N=2 (or 6) makes every batch shape use the same tile.
 _MHC_TILE_N_FIXED = int(os.environ.get("VLLM_MHC_TILE_N", "0") or 0) or None
+# Debug/fix switch: fix the mHC GEMM's split-K so it does not depend on
+# the batch's token count (see compute_num_split).
+_MHC_SPLIT_K_FIXED = int(os.environ.get("VLLM_MHC_SPLIT_K", "0") or 0) or None
 _FUSED_POST_PRE_MAX_TOKENS = 32
 
 
