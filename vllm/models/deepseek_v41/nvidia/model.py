@@ -1264,21 +1264,33 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 _ck("res", residual)
                 _ck("post", post_mix)
                 _ck("resmix", res_mix)
-                if _DSV41_LOG_ROW_DIFF and isinstance(hidden_states, torch.Tensor):
+                if _DSV41_LOG_ROW_DIFF:
                     # Debug: a per-TOKEN checksum of every layer's hidden
                     # state, so the two requests of a batch can be compared
                     # OFFLINE (the token layout in the batch is not known
                     # here, and the batch also holds the decode tokens).
-                    h = hidden_states.detach().float()
-                    if h.dim() == 2:
-                        sums = h.sum(dim=1)
-                        mx = h.abs().amax(dim=1)
-                        for ti in range(h.shape[0]):
+                    h = hidden_states
+                    if not isinstance(h, torch.Tensor):
+                        routed = getattr(h, "routed", None)
+                        shared = getattr(h, "shared_output", None)
+                        parts = [t for t in (routed, shared)
+                                 if isinstance(t, torch.Tensor)]
+                        h = parts[0] if parts else None
+                    if isinstance(h, torch.Tensor) and h.dim() == 2:
+                        hf = h.detach().float()
+                        sums = hf.sum(dim=1)
+                        mx = hf.abs().amax(dim=1)
+                        for ti in range(hf.shape[0]):
                             logger.warning(
                                 "DSV41 TOK layer=%d tok=%d sum=%.10g "
                                 "absmax=%.10g",
                                 idx, ti, float(sums[ti]), float(mx[ti]),
                             )
+                    else:
+                        logger.warning(
+                            "DSV41 TOK layer=%d type=%s",
+                            idx, type(hidden_states).__name__,
+                        )
         assert residual is not None and post_mix is not None
         assert res_mix is not None and pre_mix is not None
         return hidden_states, residual, post_mix, res_mix, pre_mix
