@@ -35,6 +35,19 @@ logger = init_logger(__name__)
 
 # Debug: log a per-token checksum of the compressor's pooled latent.
 _DSV41_LOG_COMPRESSOR = os.environ.get("VLLM_DSV41_LOG_COMPRESSOR", "0") == "1"
+# A hard cap on the probe's output per process (a debug run must never
+# fill the disk).
+_DSV41_LOG_MAX_TOKENS = int(os.environ.get("VLLM_DSV41_LOG_MAX_TOKENS", "64") or 64)
+_DSV41_LOG_BUDGET = int(os.environ.get("VLLM_DSV41_LOG_BUDGET", "20000") or 20000)
+_dsv41_log_used = 0
+
+
+def _dsv41_log(fmt: str, *args) -> None:
+    global _dsv41_log_used
+    if _dsv41_log_used >= _DSV41_LOG_BUDGET:
+        return
+    _dsv41_log_used += 1
+    logger.warning(fmt, *args)
 
 
 class CompressorBackend(AttentionBackend):
@@ -395,10 +408,12 @@ class DeepseekCompressor(nn.Module):
             # differ are exactly the ones whose pooled row differs.
             lf = latent.detach().float()
             sums = lf.sum(dim=1)
-            for ti in range(lf.shape[0]):
-                logger.warning(
+            mx = lf.abs().amax(dim=1)
+            nz = (mx > 0).nonzero().flatten()
+            for ti in nz[:_DSV41_LOG_MAX_TOKENS].tolist():
+                _dsv41_log(
                     "DSV41 COMP tok=%d sum=%.10g absmax=%.10g",
-                    ti, float(sums[ti]), float(lf[ti].abs().max()),
+                    ti, float(sums[ti]), float(mx[ti]),
                 )
         return latent
 
