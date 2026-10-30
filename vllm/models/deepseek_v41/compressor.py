@@ -394,6 +394,20 @@ class DeepseekCompressor(nn.Module):
                 prev_row_indices = state_metadata.prev_row_indices
                 ring_write_slots = state_metadata.ring_write_slots
 
+        if _DSV41_LOG_COMPRESSOR and kv_score is not None and kv_score.numel():
+            # Debug: the compressor's INPUT, before the pooling. If this is
+            # identical across runs but the latent is not, the pooling (the
+            # ring) is the culprit; if it differs, the divergence is
+            # upstream in the FFN/MoE.
+            kf = kv_score.detach().float()
+            sums = kf.sum(dim=1)
+            mx = kf.abs().amax(dim=1)
+            nz = (mx > 0).nonzero().flatten()
+            for ti in nz[:_DSV41_LOG_MAX_TOKENS].tolist():
+                _dsv41_log(
+                    "DSV41 CIN tok=%d sum=%.10g absmax=%.10g",
+                    ti, float(sums[ti]), float(mx[ti]),
+                )
         latent = torch.empty(
             kv_score.shape[0],
             self.head_dim,
