@@ -125,9 +125,25 @@ if typing.TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # Debug: log a per-layer checksum of the hidden states.
-_DSV41_LOG_LAYER_SUMS = os.environ.get("VLLM_DSV41_LOG_LAYER_SUMS", "0") == "1"
+_DSV41_LOG_LAYER_SUMS = _dsv41_flag("VLLM_DSV41_LOG_LAYER_SUMS")
 # Debug: log how the rows of one batch differ from each other.
-_DSV41_LOG_ROW_DIFF = os.environ.get("VLLM_DSV41_LOG_ROW_DIFF", "0") == "1"
+def _dsv41_flag(name: str) -> bool:
+    """Read a debug flag from the env OR from /tmp/dsv41-flags (one name
+    per line). The engine process does not inherit every env var, so the
+    file is the reliable channel for a live experiment."""
+    if os.environ.get(name, "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            for line in f:
+                if line.strip() == name:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+_DSV41_LOG_ROW_DIFF = _dsv41_flag("VLLM_DSV41_LOG_ROW_DIFF")
 # How many requests the row-diff probe's batch has (so it can compare the
 # SAME token across requests).
 _DSV41_ROW_DIFF_REQS = int(os.environ.get("VLLM_DSV41_ROW_DIFF_REQS", "4") or 4)
