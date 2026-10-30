@@ -88,6 +88,9 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 logger = init_logger(__name__)
 
+# Debug switch: skip the Engram's contribution to the residual entirely.
+_DSV41_NO_ENGRAM = os.environ.get("VLLM_DSV41_NO_ENGRAM", "0") == "1"
+
 # Per-rank token slot from which the Engram DP exchange switches from peer
 # reads to all-to-all.
 ENGRAM_A2A_MIN_SLOT = 128
@@ -2000,6 +2003,11 @@ class Engram(nn.Module):
         """hidden_states: [T, hc_mult, dim]; hash_ids: [T, n_hash_cols] (all
         tokens, pre sequence-parallel shard); token_mask: [T], False shuts
         the gate so those positions pass through untouched."""
+        if _DSV41_NO_ENGRAM:
+            # Debug switch: the Engram contributes nothing to the residual, so
+            # the model runs without its n-gram recall. Used to A/B the
+            # Engram against the rest of the serving path.
+            return hidden_states
         if self._batch is not None:
             kv = self.wkv(self._batch.wkv_input(self, hash_ids.shape[0]))
         else:
