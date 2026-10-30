@@ -89,7 +89,23 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 logger = init_logger(__name__)
 
 # Debug switch: skip the Engram's contribution to the residual entirely.
-_DSV41_NO_ENGRAM = os.environ.get("VLLM_DSV41_NO_ENGRAM", "0") == "1"
+def _dsv41_flag(name: str) -> bool:
+    """Read a debug flag from the env OR from /tmp/dsv41-flags (one name
+    per line). The engine process does not inherit every env var, so the
+    file is the reliable channel for a live experiment."""
+    if os.environ.get(name, "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            for line in f:
+                if line.strip() == name:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+_DSV41_NO_ENGRAM = _dsv41_flag("VLLM_DSV41_NO_ENGRAM")
 
 # Per-rank token slot from which the Engram DP exchange switches from peer
 # reads to all-to-all.
