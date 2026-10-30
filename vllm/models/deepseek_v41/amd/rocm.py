@@ -103,6 +103,7 @@ def _ragged_to_2d(
     indices: torch.Tensor,
     indptr: torch.Tensor,
     num_rows: int,
+    max_width: int | None = None,
 ) -> torch.Tensor:
     """Turn a ragged (flat indices, indptr) pair into a dense [rows, width].
 
@@ -113,32 +114,50 @@ def _ragged_to_2d(
 
     VECTORISED on purpose: the first version looped over the rows and
     called .item() on each, which is a GPU->CPU sync per row and made the
-    decode step ~35x slower than the Triton path (0.2 tok/s vs 7). This
-    builds the same result with one scatter and no sync.
+    decode step ~35x slower than the Triton path (0.2 tok/s vs 7).
 
-    The width has to be known on the host to allocate the output, so there
-    is one .item() here - a single sync per step, not one per row.
+    The width is taken from ``max_width`` when given, so there is NO
+    device->host sync at all: the caller knows the packed width (it built
+    the dense form), and the ragged form was derived from it. Without it
+    we fall back to lengths.max(), which costs one sync per step - still
+    far better than one per row, but it serialises the step.
+
+    The row count comes from the indptr, not from num_rows: the ragged
+    metadata can describe FEWER rows than the query count (the warmup
+    batch is 128 tokens wide but the metadata covers 3 rows). The extra
+    rows of ``out`` stay -1.
     """
     lengths = (indptr[1:] - indptr[:-1]).to(torch.int64)
-    width = int(lengths.max().item()) if lengths.numel() else 0
+    if max_width is None:
+        max_width = int(lengths.max().item()) if lengths.numel() else 0
+    width = int(max_width)
     if width == 0:
         return torch.zeros((num_rows, 0), dtype=torch.int32,
                            device=indices.device)
     out = torch.full((num_rows, width), -1, dtype=torch.int32,
                      device=indices.device)
-    # The position of each flat index within its row, and the row it
-    # belongs to: both are pure arithmetic on the device.
-    starts = indptr[:-1].to(torch.int64)
-    total = int(indices.numel())
-    if total == 0:
-        return out
+    n_rows = int(lengths.numel())
+    starts = indptr[:n_rows].to(torch.int64)
+    # Per FLAT INDEX, the row it belongs to and its offset within that
+    # row. Both are repeat_interleave over the per-row lengths, so they
+    # have one entry per flat index - not one per row. Their LENGTH is the
+    # true entry count (sum of the lengths), which is also how much of the
+    # over-long indices buffer is real data: the buffer is a slice of a
+    # fixed-capacity graph buffer (see _copy_ragged_to_graph_buffers), so
+    # indices.numel() is the CAPACITY, not the data length.
     row_ids = torch.repeat_interleave(
-        torch.arange(num_rows, device=indices.device),
+        torch.arange(n_rows, device=indices.device),
         lengths,
     )
-    offsets = torch.arange(total, device=indices.device) - starts[row_ids]
+    starts_per_index = torch.repeat_interleave(starts, lengths)
+    total = starts_per_index.numel()
+    if total == 0 or n_rows == 0:
+        return out
+    offsets = torch.arange(total, device=indices.device) - starts_per_index
     keep = offsets < width
-    out[row_ids[keep], offsets[keep]] = indices[keep].to(torch.int32)
+    # A row beyond num_rows would index out of `out`; drop it.
+    keep = keep & (row_ids < num_rows)
+    out[row_ids[keep], offsets[keep]] = indices[:total][keep].to(torch.int32)
     return out
 
 
@@ -1301,10 +1320,14 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
 
             assert swa_metadata.decode_swa_ragged_indices is not None
             assert swa_metadata.decode_swa_ragged_indptr is not None
+            # decode_swa_width is the packed dense width the ragged form was
+            # derived from, so passing it avoids a device->host sync.
+            swa_width = getattr(swa_metadata, 'decode_swa_width', None)
             swa_slots = _ragged_to_2d(
                 swa_metadata.decode_swa_ragged_indices,
                 swa_metadata.decode_swa_ragged_indptr,
                 q.shape[0],
+                max_width=swa_width,
             )
             extra_slots = None
             if not swa_only and topk_ragged_indices is not None:
