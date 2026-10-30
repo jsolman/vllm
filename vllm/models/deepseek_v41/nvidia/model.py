@@ -150,6 +150,9 @@ logger.warning("DSV41 PROBE row_diff=%s layer_sums=%s",
 # How many requests the row-diff probe's batch has (so it can compare the
 # SAME token across requests).
 _DSV41_ROW_DIFF_REQS = int(os.environ.get("VLLM_DSV41_ROW_DIFF_REQS", "4") or 4)
+# Which layer's tokens to log, and how many tokens per pass.
+_DSV41_LOG_LAYER = int(os.environ.get("VLLM_DSV41_LOG_LAYER", "0") or 0)
+_DSV41_LOG_MAX_TOKENS = int(os.environ.get("VLLM_DSV41_LOG_MAX_TOKENS", "64") or 64)
 
 
 class DeepseekV4MoE(DeepseekV4MoEBase):
@@ -677,7 +680,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             if isinstance(_h, torch.Tensor) and _h.dim() == 2:
                 _s = _h.detach().float().sum(dim=1)
                 _m = _h.detach().float().abs().amax(dim=1)
-                for _ti in range(_h.shape[0]):
+                # only the non-padding tokens (the padding rows are zero),
+                # and only a few, or the profile run floods the log
+                _nz = (_m > 0).nonzero().flatten()
+                for _ti in _nz[:_DSV41_LOG_MAX_TOKENS].tolist():
                     logger.warning(
                         "DSV41 ATN tok=%d sum=%.10g absmax=%.10g",
                         _ti, float(_s[_ti]), float(_m[_ti]),
@@ -1278,9 +1284,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 _ck("res", residual)
                 _ck("post", post_mix)
                 _ck("resmix", res_mix)
-                if _DSV41_LOG_ROW_DIFF:
-                    # Debug: a per-TOKEN checksum of every layer's hidden
-                    # state, so the two requests of a batch can be compared
+                if _DSV41_LOG_ROW_DIFF and idx == _DSV41_LOG_LAYER:
+                    # Debug: a per-TOKEN checksum of ONE layer's hidden
+                    # state, so two requests of a batch can be compared
                     # OFFLINE (the token layout in the batch is not known
                     # here, and the batch also holds the decode tokens).
                     h = hidden_states
