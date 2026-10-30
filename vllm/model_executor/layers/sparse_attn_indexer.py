@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
 import torch
 import torch.distributed as dist
 
@@ -966,6 +967,25 @@ def sparse_attn_indexer(
             topk_tokens,
             attn_metadata_narrowed.max_seq_len,
         )
+        if os.environ.get("VLLM_DSV41_LOG_TOPK", "0") == "1":
+            # Debug: the indexer's SCORES and the SELECTION they produce.
+            # The selection is the discrete choice the attention consumes, so
+            # if it differs between two runs of the SAME request, the
+            # scores differ. The scores' checksum localises it further.
+            _lg = logits.detach().float()
+            logger.warning(
+                "DSV41 ILOGITS shape=%s sum=%.10g absmax=%.10g",
+                tuple(_lg.shape),
+                float(_lg.sum()),
+                float(_lg.abs().amax()),
+            )
+            _tk = topk_indices.detach().to(torch.int64)
+            for _r in range(min(_tk.shape[0], 4)):
+                _v = _tk[_r].tolist()
+                logger.warning(
+                    "DSV41 TOPK row=%d sum=%d first=%s",
+                    _r, sum(int(x) for x in _v if x >= 0), _v[:12],
+                )
 
         if decode_metadata.global_seq_lens is not None:
             _merge_dcp_topk_global(
