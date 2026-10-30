@@ -646,6 +646,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             x = sp_all_gather(x)[: positions.shape[0]]
 
         x = self.attn(positions, x, None)
+        if _DSV41_LOG_LAYER_SUMS and x is not None and x.numel():
+            logger.info(
+                "DSV41 PART attn sum=%.10g absmax=%.10g",
+                float(x.detach().float().sum()),
+                float(x.detach().float().abs().max()),
+            )
         # With GEMM-RS bound, the attention output is already this rank's
         # sequence-parallel shard (see DeepseekV4Attention._wo_b_proj).
         if self.use_sequence_parallel and self.attn.gemm_rs is None:
