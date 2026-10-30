@@ -1308,6 +1308,20 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             return 0
 
         if self._use_tilelang_sparse_mla:
+            if not getattr(self, "_tl_logged", False):
+                self._tl_logged = True
+                c = self.swa_cache_layer.kv_cache
+                logger.warning_once(
+                    "TILELANG DECODE BRANCH REACHED: q rows=%d "
+                    "output_mxfp8=%s output=%s cache_shape=%s "
+                    "cache_stride=%s q_head0_rope=%s",
+                    q.shape[0],
+                    output_mxfp8 is not None,
+                    output is not None,
+                    tuple(c.shape),
+                    tuple(c.stride()),
+                    q[0, 0, -ROPE_DIM:].float().tolist()[:4],
+                )
             # The reference's TileLang sparse attention over the packed fp8
             # caches. It wants a dense bf16 KV, so the module dequantises
             # the selected rows and concatenates the window and compressed
