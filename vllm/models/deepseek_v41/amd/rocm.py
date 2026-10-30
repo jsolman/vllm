@@ -1311,6 +1311,19 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             if not getattr(self, "_tl_logged", False):
                 self._tl_logged = True
                 c = self.swa_cache_layer.kv_cache
+                _ri = swa_metadata.decode_swa_ragged_indices
+                _rp = swa_metadata.decode_swa_ragged_indptr
+                _di = swa_metadata.decode_swa_indices
+                logger.warning_once(
+                    "TILELANG INPUTS: ragged_idx_numel=%s ragged_indptr=%s "
+                    "dense_idx_shape=%s dense_row0=%s "
+                    "ragged_first8=%s",
+                    None if _ri is None else _ri.numel(),
+                    None if _rp is None else _rp[:4].tolist(),
+                    None if _di is None else tuple(_di.shape),
+                    None if _di is None else _di[0][:8].tolist(),
+                    None if _ri is None else _ri[:8].tolist(),
+                )
                 logger.warning_once(
                     "TILELANG DECODE BRANCH REACHED: q rows=%d "
                     "output_mxfp8=%s output=%s cache_shape=%s "
