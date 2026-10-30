@@ -128,6 +128,9 @@ logger = init_logger(__name__)
 _DSV41_LOG_LAYER_SUMS = os.environ.get("VLLM_DSV41_LOG_LAYER_SUMS", "0") == "1"
 # Debug: log how the rows of one batch differ from each other.
 _DSV41_LOG_ROW_DIFF = os.environ.get("VLLM_DSV41_LOG_ROW_DIFF", "0") == "1"
+# How many requests the row-diff probe's batch has (so it can compare the
+# SAME token across requests).
+_DSV41_ROW_DIFF_REQS = int(os.environ.get("VLLM_DSV41_ROW_DIFF_REQS", "4") or 4)
 
 
 class DeepseekV4MoE(DeepseekV4MoEBase):
@@ -1265,21 +1268,34 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     # at an input that was computed differently.
                     h = hidden_states.detach().float()
                     if h.dim() == 2 and h.shape[0] > 1:
-                        # (T, dim): T is the flattened token axis, so a
-                        # batch of R requests of L tokens is R*L rows.
-                        # Compare each row with the FIRST row of its own
-                        # request is not possible here, so compare every
-                        # row with row 0 and report the count.
-                        r0 = h[0]
-                        for i in range(1, h.shape[0]):
-                            d = (h[i] - r0).abs()
-                            ndiff = int((d > 0).sum())
-                            logger.warning(
-                                "DSV41 ROWDIFF layer=%d row=%d ndiff=%d/%d "
-                                "max=%.6g",
-                                idx, i, ndiff, d.numel(),
-                                float(d.max()) if d.numel() else 0.0,
-                            )
+                        # (T, dim): T is the flattened token axis. A batch of
+                        # R requests of L tokens each is R*L rows, so row i
+                        # and row i+L are the SAME token of two different
+                        # requests. Compare across the REQUESTS, not down
+                        # the tokens: with a batch of R requests, compare
+                        # row i with row i+L for every i < L.
+                        t = h.shape[0]
+                        nreq = _DSV41_ROW_DIFF_REQS
+                        if nreq > 1 and t % nreq == 0:
+                            L = t // nreq
+                            for i in range(L):
+                                for r in range(1, nreq):
+                                    a = h[i]
+                                    b = h[i + r * L]
+                                    d = (a - b).abs()
+                                    ndiff = int((d > 0).sum())
+                                    if ndiff:
+                                        logger.warning(
+                                            "DSV41 ROWDIFF layer=%d "
+                                            "tok=%d req=%d vs req=%d "
+                                            "ndiff=%d/%d max=%.6g",
+                                            idx, i, 0, r, ndiff, d.numel(),
+                                            float(d.max()),
+                                        )
+                                        break
+                                else:
+                                    continue
+                                break
                     elif h.dim() == 3 and h.shape[0] > 1:
                         r0 = h[0]
                         for i in range(1, h.shape[0]):
