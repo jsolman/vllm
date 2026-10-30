@@ -1432,6 +1432,18 @@ class EngineCoreProc(EngineCore):
     @staticmethod
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         """Launch EngineCore busy loop in background process."""
+        if os.environ.get("VLLM_DSV41_DUMP_ENV"):
+            import sys as _sys
+            _keep = ("VLLM_DSV41", "VLLM_MHC", "VLLM_REASONING",
+                     "VLLM_SPARSE_DECODE", "VLLM_USE_BREAKABLE")
+            _d = {k: v for k, v in os.environ.items()
+                  if any(k.startswith(pfx) for pfx in _keep)}
+            print(f"DSV41 ENVDUMP-CHILD ppid={os.getpid()} "
+                  f"n_all={len(os.environ)} matching={sorted(_d.items())}",
+                  file=_sys.stderr, flush=True)
+            _raw = open("/proc/self/environ", "rb").read().split(b"\0")
+            print(f"DSV41 ENVDUMP-CHILD-PROC n_proc={len([d for d in _raw if d])}",
+                  file=_sys.stderr, flush=True)
         vllm_config: VllmConfig = kwargs["vllm_config"]
         if logging_config := getattr(vllm_config, "logging_config", None):
             configure_logging(logging_config)
