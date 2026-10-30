@@ -709,10 +709,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             x = sp_all_gather(x)[: positions.shape[0]]
 
         x = self.attn(positions, x, None)
-        if _DSV41_LOG_ROW_DIFF and idx == _DSV41_LOG_LAYER:
+        if _DSV41_LOG_ROW_DIFF:
             # Debug: a per-token checksum right after the attention, from
             # inside the decoder layer (so it fires whatever the runner
-            # does). ONE layer only, or the log fills up.
+            # does). The decoder layer does not know its own index, so the
+            # per-process line budget is what bounds this.
             _h = x
             if isinstance(_h, torch.Tensor) and _h.dim() == 2:
                 _s = _h.detach().float().sum(dim=1)
