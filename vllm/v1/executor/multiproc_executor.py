@@ -1100,6 +1100,14 @@ class WorkerProc:
             ep_rank = get_ep_group().rank_in_group
             process_name += f"_EP{ep_rank}"
         set_process_title(name=process_name)
+        if os.environ.get("VLLM_DSV41_DUMP_ENV"):
+            import sys as _sys
+            _keep = ("VLLM_DSV41", "VLLM_MHC", "VLLM_REASONING",
+                     "VLLM_SPARSE_DECODE", "VLLM_USE_BREAKABLE")
+            _d = {k: v for k, v in os.environ.items()
+                  if any(k.startswith(pfx) for pfx in _keep)}
+            print(f"DSV41 WORKER-ENVDUMP pid={os.getpid()} n_all={len(os.environ)} "
+                  f"matching={sorted(_d.items())}", file=_sys.stderr, flush=True)
         decorate_logs(process_name)
 
 
