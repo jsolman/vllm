@@ -16,8 +16,24 @@ _TOPK = 6
 
 logger = init_logger(__name__)
 
+def _dsv41_flag(name: str) -> bool:
+    """Read a debug flag from the env OR from /tmp/dsv41-flags (one name
+    per line). The engine process does not inherit every env var, so the
+    file is the reliable channel for a live experiment."""
+    if os.environ.get(name, "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            for line in f:
+                if line.strip() == name:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 # Debug: log the MoE's routing per token.
-_DSV41_LOG_ROUTING = os.environ.get("VLLM_DSV41_LOG_ROUTING", "0") == "1"
+_DSV41_LOG_ROUTING = _dsv41_flag("VLLM_DSV41_LOG_ROUTING")
 _DSV41_LOG_MAX_TOKENS = int(os.environ.get("VLLM_DSV41_LOG_MAX_TOKENS", "32") or 32)
 
 def can_use_dsv4_topk(
