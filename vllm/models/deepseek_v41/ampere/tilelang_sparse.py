@@ -282,11 +282,14 @@ def tilelang_sparse_attn_decode(
     if os.environ.get("VLLM_DSV41_TL_DEBUG", "0") == "1":
         logger.warning(
             "TL MODULE: q %s dense_rows %s topk_idxs %s "
-            "sink_sum %s q_rope %s",
+            "sink_sum %s q_rope %s "
+            "rows_absmax %s rows_nonzero %s",
             tuple(q_p.shape), tuple(dense_rows.shape),
             topk_idxs[0].tolist()[:8],
             float(sink.sum()) if sink is not None else None,
             q_p[0, 0, -64:].float().tolist()[:4],
+            dense_rows.abs().amax(dim=1).tolist()[:8],
+            int((dense_rows != 0).any(dim=1).sum()),
         )
     kernel(q_p.unsqueeze(0), dense_rows.unsqueeze(0), out,
            sink if sink is not None else torch.zeros(num_heads_padded,
