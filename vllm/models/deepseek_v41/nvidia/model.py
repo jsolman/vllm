@@ -670,6 +670,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             x = sp_all_gather(x)[: positions.shape[0]]
 
         x = self.attn(positions, x, None)
+        if _DSV41_LOG_ROW_DIFF:
+            # Debug: a per-token checksum right after the attention, from
+            # inside the decoder layer (so it fires whatever the runner does).
+            _h = x
+            if isinstance(_h, torch.Tensor) and _h.dim() == 2:
+                _s = _h.detach().float().sum(dim=1)
+                _m = _h.detach().float().abs().amax(dim=1)
+                for _ti in range(_h.shape[0]):
+                    logger.warning(
+                        "DSV41 ATN tok=%d sum=%.10g absmax=%.10g",
+                        _ti, float(_s[_ti]), float(_m[_ti]),
+                    )
         if _DSV41_LOG_LAYER_SUMS and x is not None and x.numel():
             logger.info(
                 "DSV41 PART attn sum=%.10g absmax=%.10g",
