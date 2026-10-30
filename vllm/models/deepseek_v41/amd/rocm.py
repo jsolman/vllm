@@ -1360,6 +1360,27 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 self.rotary_emb.cos_sin_cache,
                 self.rope_head_dim,
             )
+            if output_mxfp8 is not None:
+                # The MXFP8 path: the caller passes output=None and expects
+                # the attention output as MXFP8 (wo_a's input), not bf16.
+                # The format (see _mxfp8_quantize_rows / the Triton
+                # reduce epilogue):
+                #   data  [T, H * D] e4m3
+                #   scale [T, H * D // 32] E8M0 (biased exponents)
+                # with one scale per 32 lanes: bits = ceil(log2(amax/448))
+                # + 127, and the values scaled by exp2(127 - bits).
+                data, scale = output_mxfp8
+                rows, heads, dim = out.shape
+                flat = out.reshape(rows, heads * dim).float()
+                blocks = flat.reshape(rows, heads * dim // 32, 32)
+                amax = blocks.abs().amax(-1).clamp_min(1.1754943508222875e-38)
+                bits = (torch.ceil(torch.log2(amax / 448.0)) + 127.0).clamp(
+                    0.0, 254.0)
+                q = (blocks * torch.pow(2.0, 127.0 - bits.unsqueeze(-1))
+                     ).reshape(rows, heads * dim)
+                data[:rows] = q.to(torch.float8_e4m3fn).view(
+                    torch.float8_e4m3fn).reshape(rows, -1)
+                scale[:rows] = bits.to(torch.uint8)
             # The return value is how many decode rows are ALREADY rotated.
             # We rotated them above, so the caller must not rotate them
             # again: returning 0 would make it apply the standalone pass
