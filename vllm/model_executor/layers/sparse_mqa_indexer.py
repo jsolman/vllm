@@ -158,6 +158,18 @@ class SparseMQAIndexer(nn.Module):
         if metadata.num_prefills > 0:
             prefill = metadata.prefill
             sparse_chunks = metadata.sparse_prefill
+            if _DSV41_LOG_TOPK:
+                # Debug: the PUBLISHED top-k, in the PREFILL branch. The
+                # selection is the discrete choice the next layer consumes.
+                _pt = topk_indices_buffer[: prefill.chunks[0].token_end
+                                          if prefill.chunks else 0,
+                                          :topk_tokens]
+                for _r in range(min(_pt.shape[0], 6)):
+                    _v = _pt[_r].detach().to(torch.int64).tolist()
+                    logger.warning(
+                        "DSV41 TOPK-P row=%d sum=%d first=%s",
+                        _r, sum(int(x) for x in _v if x >= 0), _v[:12],
+                    )
             assert prefill is not None and sparse_chunks is not None
             k_quant_full, k_scale_full = _prefill_k_workspaces(
                 self.max_total_seq_len, self.head_dim
