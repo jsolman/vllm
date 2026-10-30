@@ -679,6 +679,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             x = self.ffn(x, input_ids, mega_gate_metadata)
         if mhc_stream is not None:
             torch.cuda.current_stream().wait_stream(mhc_stream)
+        if _DSV41_LOG_LAYER_SUMS and x is not None and x.numel():
+            logger.info(
+                "DSV41 PART ffn sum=%.10g absmax=%.10g",
+                float(x.detach().float().sum()),
+                float(x.detach().float().abs().max()),
+            )
         return x, residual, post_mix, res_mix, ffn_pre, previous_aux
 
     def write_kv(
