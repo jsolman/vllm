@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from vllm.logger import init_logger
+import os
 import torch
 
 from vllm.platforms import current_platform
@@ -11,6 +13,12 @@ _TOPK = 6
 # Adapted from:
 # https://github.com/sgl-project/sglang/blob/main/python/sglang/jit_kernel/moe_fused_gate.py
 
+
+logger = init_logger(__name__)
+
+# Debug: log the MoE's routing per token.
+_DSV41_LOG_ROUTING = os.environ.get("VLLM_DSV41_LOG_ROUTING", "0") == "1"
+_DSV41_LOG_MAX_TOKENS = int(os.environ.get("VLLM_DSV41_LOG_MAX_TOKENS", "32") or 32)
 
 def can_use_dsv4_topk(
     gating_output: torch.Tensor,
@@ -166,4 +174,17 @@ def dsv4_topk(
             num_warps=1,
             launch_pdl=current_platform.is_arch_support_pdl(),
         )
+    if _DSV41_LOG_ROUTING and num_tokens:
+        # Debug: the routing is the model's one DISCRETE choice (the
+        # bias-corrected top-k over the experts). Log the selected ids and
+        # weights per token so two runs of the same request can be
+        # compared: if the experts differ, the selection is flipping.
+        _ids = topk_ids.detach().to(torch.int32)
+        _w = topk_weights.detach().float()
+        for _t in range(min(num_tokens, _DSV41_LOG_MAX_TOKENS)):
+            _row = ",".join(str(int(v)) for v in _ids[_t].tolist())
+            _ws = ",".join("%.6g" % float(v) for v in _w[_t].tolist())
+            logger.warning(
+                "DSV41 ROUTE tok=%d ids=%s w=%s", _t, _row, _ws
+            )
     return topk_weights, topk_ids
