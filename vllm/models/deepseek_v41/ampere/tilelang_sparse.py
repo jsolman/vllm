@@ -139,8 +139,23 @@ def dequantise_swa_pages(
     #   token_scale_ptr = cache_block_ptr + main_block_size * 576 + pos * 8
     # so a page holds [block * 576 value bytes][block * 8 scale bytes] and
     # the page stride is the tensor's own stride(0).
+    #
+    # IMPORTANT: the cache is NOT contiguous (its page stride is padded for
+    # alignment), so reshape(-1) would COPY it in LOGICAL order and every
+    # flat index would point at the wrong byte. The kernel addresses the
+    # raw storage, so we must too: use the physical byte offsets.
     page_stride = swa_k_cache.stride(0)
-    flat = swa_k_cache.reshape(-1)
+    flat = swa_k_cache.view(-1) if swa_k_cache.is_contiguous() else None
+    if flat is None:
+        # Build a flat VIEW of the PHYSICAL storage: the kernel addresses the
+        # raw bytes (base + block*stride(0) + offset), so our indices must be
+        # physical byte offsets too. Take the underlying storage (which is
+        # contiguous) and view it flat, then offset by the tensor's own
+        # storage_offset.
+        base = swa_k_cache.storage()
+        flat = torch.as_strided(swa_k_cache, (base.nbytes(),), (1,),
+                                swa_k_cache.storage_offset())
+        flat = flat.view(torch.uint8)
 
     block_ids = torch.div(slots, block, rounding_mode="floor").long()
     offsets = (slots % block).long()
