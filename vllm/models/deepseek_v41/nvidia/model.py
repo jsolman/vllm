@@ -152,11 +152,11 @@ logger.warning("DSV41 PROBE row_diff=%s layer_sums=%s",
 _DSV41_ROW_DIFF_REQS = int(os.environ.get("VLLM_DSV41_ROW_DIFF_REQS", "4") or 4)
 # Which layer's tokens to log, and how many tokens per pass.
 _DSV41_LOG_LAYER = int(os.environ.get("VLLM_DSV41_LOG_LAYER", "0") or 0)
-_DSV41_LOG_MAX_TOKENS = int(os.environ.get("VLLM_DSV41_LOG_MAX_TOKENS", "64") or 64)
+_DSV41_LOG_MAX_TOKENS = int(os.environ.get("VLLM_DSV41_LOG_MAX_TOKENS", "32") or 32)
 # A hard cap on the probe's total output per process, so a debug run can
 # never fill the disk (the profile run alone would emit 4096 tokens x 40
 # layers x every request).
-_DSV41_LOG_BUDGET = int(os.environ.get("VLLM_DSV41_LOG_BUDGET", "20000") or 20000)
+_DSV41_LOG_BUDGET = int(os.environ.get("VLLM_DSV41_LOG_BUDGET", "4000") or 4000)
 _dsv41_log_used = 0
 
 
@@ -687,9 +687,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             x = sp_all_gather(x)[: positions.shape[0]]
 
         x = self.attn(positions, x, None)
-        if _DSV41_LOG_ROW_DIFF:
+        if _DSV41_LOG_ROW_DIFF and idx == _DSV41_LOG_LAYER:
             # Debug: a per-token checksum right after the attention, from
-            # inside the decoder layer (so it fires whatever the runner does).
+            # inside the decoder layer (so it fires whatever the runner
+            # does). ONE layer only, or the log fills up.
             _h = x
             if isinstance(_h, torch.Tensor) and _h.dim() == 2:
                 _s = _h.detach().float().sum(dim=1)
