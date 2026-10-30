@@ -279,6 +279,15 @@ def tilelang_sparse_attn_decode(
     # takes the output buffer as an explicit argument (its own wrapper
     # allocates it with torch.empty_like(q)).
     out = torch.empty_like(q_p).unsqueeze(0)
+    if os.environ.get("VLLM_DSV41_TL_DEBUG", "0") == "1":
+        logger.warning(
+            "TL MODULE: q %s dense_rows %s topk_idxs %s "
+            "sink_sum %s q_rope %s",
+            tuple(q_p.shape), tuple(dense_rows.shape),
+            topk_idxs[0].tolist()[:8],
+            float(sink.sum()) if sink is not None else None,
+            q_p[0, 0, -64:].float().tolist()[:4],
+        )
     kernel(q_p.unsqueeze(0), dense_rows.unsqueeze(0), out,
            sink if sink is not None else torch.zeros(num_heads_padded,
                                                      device=q.device,
