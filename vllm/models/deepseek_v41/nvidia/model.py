@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from functools import partial
@@ -122,6 +123,9 @@ if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 logger = init_logger(__name__)
+
+# Debug: log a per-layer checksum of the hidden states.
+_DSV41_LOG_LAYER_SUMS = os.environ.get("VLLM_DSV41_LOG_LAYER_SUMS", "0") == "1"
 
 
 class DeepseekV4MoE(DeepseekV4MoEBase):
@@ -1209,6 +1213,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 if self.use_sequence_parallel:
                     previous_aux = sp_all_gather(previous_aux)[:full_num_tokens]
                 aux_hidden_by_layer[idx] = previous_aux
+            if _DSV41_LOG_LAYER_SUMS and hidden_states is not None:
+                # Debug: a per-layer checksum of the hidden states, so a
+                # run-to-run divergence can be localised to the first layer
+                # that differs.
+                h = hidden_states
+                if not isinstance(h, torch.Tensor):
+                    h = h[0] if isinstance(h, (tuple, list)) else None
+                if isinstance(h, torch.Tensor) and h.numel():
+                    v = h.detach().float()
+                    logger.info(
+                        "DSV41 LAYER %d sum=%.10g absmax=%.10g shape=%s",
+                        idx,
+                        float(v.sum()),
+                        float(v.abs().max()),
+                        tuple(v.shape),
+                    )
         assert residual is not None and post_mix is not None
         assert res_mix is not None and pre_mix is not None
         return hidden_states, residual, post_mix, res_mix, pre_mix
