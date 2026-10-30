@@ -2000,6 +2000,18 @@ class Engram(nn.Module):
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
         if self._prefetch_done is not None:
             self._finish_prefetch(self._prefetch_done)
+        if _DSV41_LOG_ENGRAM_HASH and num_tokens:
+            # Debug: the STAGED rows are the engram's output. The hash ids
+            # are deterministic, so if these differ, the race is in the
+            # disk-table staging (the compact table) or in the lookup
+            # kernel.
+            _r = self.staged_rows[:num_tokens].detach().float()
+            logger.warning(
+                "DSV41 EROWS n=%d sum=%.10g absmax=%.10g",
+                num_tokens,
+                float(_r.sum().item()),
+                float(_r.abs().amax().item()),
+            )
         if self.embed_tokens.dp_size > 1:
             slot = engram_gathered_num_tokens()
             staged = self.staged_rows[: slot * self.embed_tokens.dp_size]
