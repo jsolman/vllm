@@ -225,6 +225,36 @@ def reserve_rocm_mxfp4_indexer_workspace(
 
 _DSV41_LOG_TOPK = os.environ.get("VLLM_DSV41_LOG_TOPK", "0") == "1"
 
+# Canonicalise the top-k's output order (see _topk). On by default:
+# the order is what makes the attention's reduction nondeterministic.
+_DSV41_CANONICAL_TOPK = os.environ.get("VLLM_DSV41_CANONICAL_TOPK", "1") == "1"
+
+
+def _sort_topk_rows(out: torch.Tensor, k: int) -> None:
+    """Sort each row's selected positions ascending, in place.
+
+    The rows are padded with -1; the -1s must stay at the END, so the
+    valid prefix is counted first and only that prefix is sorted.
+    """
+    rows = out.shape[0]
+    if rows == 0:
+        return
+    # the number of valid entries per row
+    valid = (out >= 0).sum(dim=1)                     # [rows]
+    if int(valid.min()) == k and int(valid.max()) == k:
+        # every row is full: sort the whole row
+        out.sort(dim=1)
+        return
+    # A ragged sort: the -1 padding must stay at the END. Replace the
+    # padding with a large sentinel, sort ascending (stable, so the
+    # valid entries keep their relative order among equal values), then
+    # put the padding back.
+    big = torch.iinfo(torch.int32).max
+    padded = torch.where(out >= 0, out, torch.full_like(out, big))
+    order = torch.argsort(padded.to(torch.int64), dim=1, stable=True)
+    out.copy_(torch.gather(padded, 1, order))
+    out.copy_(torch.where(out == big, torch.full_like(out, -1), out))
+
 
 def _topk(
     logits: torch.Tensor, lengths: torch.Tensor, out: torch.Tensor, k: int
@@ -283,6 +313,25 @@ def _topk(
         torch.ops._C.top_k_per_row_decode(
             logits, 1, lengths, out, rows, logits.stride(0), logits.stride(1), k
         )
+    # CANONICALISE THE SELECTION ORDER.
+    #
+    # The compiled top-k returns the selected positions in an
+    # ARBITRARY order: on the same logits, 20 runs produced 20
+    # different orders (998 of 1024 positions moved). The sparse
+    # attention reduces over the selected positions - the softmax
+    # denominator and the weighted sum - so the reduction ORDER changes
+    # the BF16 rounding of the result:
+    #     the same SET, a permuted order -> a 3.8e-7 relative difference
+    # which 40 layers of amplification turn into a ~0.5-nat difference in
+    # the logits. That was THE source of the serving path's
+    # nondeterminism.
+    #
+    # The attention is order-invariant in exact arithmetic, so sorting
+    # the selection ASCENDING costs nothing and makes the reduction
+    # deterministic. The -1 padding must stay at the end, so sort only
+    # the valid prefix.
+    if _DSV41_CANONICAL_TOPK and out.numel():
+        _sort_topk_rows(out, k)
 
 
 @triton.jit
