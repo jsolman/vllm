@@ -31,6 +31,7 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     mhc_post_tilelang,
     mhc_pre_delayed_tilelang,
 )
+from vllm.model_executor.kernels.mhc.torch_fused import mhc_post_torch
 from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -123,6 +124,11 @@ if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 logger = init_logger(__name__)
+
+# Debug/fix switch: the pure-torch MHC post, as an A/B against the
+# TileLang kernel. The TileLang mHC kernels had a real shared-memory
+# race (every tile program wrote the same cross-warp reduction slot).
+_DSV41_MHC_TORCH = os.environ.get("DSV4_MHC_TORCH", "0") == "1"
 
 def _dsv41_flag(name: str) -> bool:
     """Read a debug flag from the env OR from /tmp/dsv41-flags (one name
@@ -658,7 +664,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             assert isinstance(x, torch.Tensor)
             if self.fuse_mhc_all_reduce:
                 x = tensor_model_parallel_all_reduce(x)
-            previous_post = mhc_post_tilelang(x, residual, post_mix, res_mix)
+            # The A/B against the TileLang mHC post. The engram layers
+            # call mhc_post_tilelang DIRECTLY (they do not go through
+            # mhc_shifted_post_pre), so without this the DSV4_MHC_TORCH
+            # switch silently left the engram layers on TileLang - and
+            # the engram layers are where the divergence was localised.
+            if _DSV41_MHC_TORCH:
+                previous_post = mhc_post_torch(x, residual, post_mix, res_mix)
+            else:
+                previous_post = mhc_post_tilelang(
+                    x, residual, post_mix, res_mix
+                )
             if capture_previous_aux:
                 previous_aux = previous_post.mean(dim=1)
             residual = self.engram(

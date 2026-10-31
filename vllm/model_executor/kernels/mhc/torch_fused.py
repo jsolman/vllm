@@ -119,12 +119,48 @@ def mhc_post_torch(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    """Post mapping: new_residual = comb @ residual + post_mix * x."""
-    mixed = torch.einsum(
-        "...ij,...ih->...jh", comb_res_mix.float(), residual.float()
-    )
-    post_term = post_layer_mix.float() * x.unsqueeze(-2).float()
-    return (mixed + post_term).to(residual.dtype)
+    """Post mapping: the COLLAPSED layer input.
+
+    The TileLang kernel (mhc_post_tilelang) computes, per token:
+        out[0, h] = post_mix[h] * x[h] + sum_i comb[i, h] * residual[i, h]
+    i.e. it writes the collapsed [n, hidden] result (the kernel's x
+    tensor is (n, hc, h) but only the [:, 0, :] slice is written).
+
+    So the oracle must:
+      * take x as the collapsed [n, hidden] (or [n, hc, hidden] and take
+        row 0), and
+      * sum the comb @ residual product over the residual's FIRST axis
+        (the hc axis), keeping the hidden axis.
+    """
+    # The kernel's contract (mhc_post_tilelang):
+    #   a = comb_res_mix  [n, hc, hc]  float32
+    #   b = residual      [n, hc, h]    bf16
+    #   c = post_mix      [n, hc]       float32
+    #   d = x             [n, h]        bf16
+    # and it computes, per token and per hidden element:
+    #   x_local[hc_out, h] = c[hc_out] * d[h]
+    #                        + sum_i a[i, hc_out] * b[i, h]
+    # then writes x[n, 0, :] - the COLLAPSED output, [n, h].
+    # (The call site passes post_layer_mix.squeeze(-1) as c, so c is
+    # [n, hc]; the caller passes the collapsed x as d.)
+    n, hc, h = residual.shape
+    assert comb_res_mix.shape == (n, hc, hc), comb_res_mix.shape
+    c = post_layer_mix.float()
+    if c.dim() == 3:
+        c = c.squeeze(-1)
+    assert c.shape == (n, hc), c.shape
+    d = x
+    if d.dim() == 3:
+        d = d[:, 0]
+    assert d.shape == (n, h), d.shape
+
+    # out[n, j, h] = c[n, j] * d[n, h] + sum_i a[n, i, j] * b[n, i, h]
+    mixed = torch.einsum("nij,nih->njh", comb_res_mix.float(),
+                          residual.float())
+    post_term = c.float().unsqueeze(-1) * d.float().unsqueeze(1)
+    out = mixed + post_term
+    # the kernel writes the collapsed result into x[n, 0, :]
+    return out[:, 0].to(residual.dtype)
 
 
 def mhc_fused_post_pre_torch(
