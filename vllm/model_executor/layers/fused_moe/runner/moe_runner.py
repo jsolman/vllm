@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, cast
@@ -910,6 +911,17 @@ class MoERunner(MoERunnerInterface):
                     self, hidden_states, self._combined_gate_weight, None
                 )
             else:
+                if os.environ.get("VLLM_DSV41_LOG_GATE_INPUT", "0") == "1":
+                    # Debug: the GATE's actual input. The 'ffnin' probe
+                    # measures the layer's x, but the MoE gates on this
+                    # tensor - if it differs between runs, the divergence
+                    # is in whatever computes it.
+                    _gi = hidden_states.detach().float()
+                    logger.warning(
+                        "DSV41 GIN shape=%s sum=%.10g absmax=%.10g",
+                        tuple(_gi.shape), float(_gi.sum()),
+                        float(_gi.abs().amax()),
+                    )
                 router_logits, _ = self.gate(hidden_states)
 
         with self._sequence_parallel_context():
