@@ -78,6 +78,7 @@ if current_platform.is_cuda():
         HAS_PADDING: tl.constexpr,
         HAS_VL: tl.constexpr,
         launch_pdl: tl.constexpr,
+        LOG_ROUTING: tl.constexpr,
     ):
         row = tl.program_id(0)
         expert_offsets = tl.arange(0, BLOCK_N)
@@ -143,7 +144,7 @@ if current_platform.is_cuda():
 
         tl.store(topk_weights_ptr + output_offsets, selected_weights, mask=output_mask)
         tl.store(topk_ids_ptr + output_offsets, selected_ids, mask=output_mask)
-        if _DSV41_LOG_ROUTING:
+        if LOG_ROUTING:
             # Debug: the CORRECTED SCORES the top-k selects from, and the
             # gap between the 6th and 7th score (a small gap = a near-tie,
             # so a last-bit difference flips the selection). A Triton
@@ -157,19 +158,6 @@ if current_platform.is_cuda():
             tl.store(rscore_ptr + row * 4 + 2, _s7, mask=output_mask)
             tl.store(rscore_ptr + row * 4 + 3, tl.max(logits, axis=0),
                      mask=output_mask)
-        if _DSV41_LOG_ROUTING:
-            # Debug: the CORRECTED SCORES the top-k selects from, and the
-            # gap between the 6th and 7th score (a small gap = a near-tie,
-            # so a last-bit difference flips the selection).
-            _sc = tl.sort(current, axis=0)
-            _s6 = tl.sum(tl.where(tl.arange(0, 8) == 5, _sc, 0.0), axis=0)
-            _s7 = tl.sum(tl.where(tl.arange(0, 8) == 6, _sc, 0.0), axis=0)
-            _mx = tl.max(logits, axis=0)
-            _sum = tl.sum(logits, axis=0)
-            logger.warning(
-                "DSV41 RSCORE row=%d gsum=%.10g gmax=%.10g s6=%.10g s7=%.10g gap=%.10g",
-                row, _sum, _mx, _s6, _s7, _s6 - _s7,
-            )
 
 
 def dsv4_topk(
@@ -218,6 +206,7 @@ def dsv4_topk(
             input_ids,
             bias_vl,
             image_sentinel_lo,
+            LOG_ROUTING=_DSV41_LOG_ROUTING,
             NUM_EXPERTS=num_experts,
             BLOCK_N=triton.next_power_of_2(num_experts),
             HAS_PADDING=is_padding is not None,
