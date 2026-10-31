@@ -3,11 +3,13 @@
 """Fused MoE utilities for GPTQ."""
 
 import math
+import os
 from collections.abc import Callable
 
 import torch
 
 import vllm._custom_ops as ops
+from vllm.logger import init_logger
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import (
     ApplyMoEActivationConfig,
@@ -24,6 +26,10 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
     LoRAExpertsMixin,
 )
+
+logger = init_logger(__name__)
+_DSV41_LOG_ALIGN = os.environ.get("VLLM_DSV41_LOG_ALIGN", "0") == "1"
+
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     batched_moe_align_block_size,
     moe_align_block_size,
@@ -353,6 +359,23 @@ def fused_marlin_moe(
         expert_map,
         ignore_invalid_experts=True,
     )
+    if _DSV41_LOG_ALIGN:
+        # Debug: the align's slot assignment. The align hands out slots
+        # with atomicAdd, so the ORDER of the tokens within a block is
+        # NOT deterministic. The expert GEMM then reduces over that
+        # order, so the reduction's rounding differs between runs.
+        # This hashes the assignment so two runs can be compared.
+        _st = sorted_token_ids.detach().to(torch.int64)
+        _ex = expert_ids.detach().to(torch.int64)
+        logger.warning(
+            "DSV41 ALIGN n=%d bs=%d st_hash=%d ex_hash=%d "
+            "first=%s exfirst=%s",
+            int(_st.numel()), int(block_size_m),
+            hash(tuple(_st[:256].tolist())),
+            hash(tuple(_ex[:64].tolist())),
+            _st[:8].tolist(),
+            _ex[:8].tolist(),
+        )
 
     assert activation is not None
     moe_output = _fused_marlin_moe(
