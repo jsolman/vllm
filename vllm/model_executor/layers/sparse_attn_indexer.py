@@ -825,9 +825,13 @@ def sparse_attn_indexer(
                     _tk = topk_indices.detach().to(torch.int64)
                     for _r in range(min(_tk.shape[0], 4)):
                         _v = _tk[_r].tolist()
+                        # a hash of the WHOLE selection: if two runs of the
+                        # same request pick the same set, the hash matches.
+                        _hash = hash(tuple(int(x) for x in _v))
                         logger.warning(
-                            "DSV41 TOPK row=%d sum=%d first=%s",
-                            _r, sum(int(x) for x in _v if x >= 0), _v[:12],
+                            "DSV41 TOPK row=%d sum=%d hash=%d first=%s",
+                            _r, sum(int(x) for x in _v if x >= 0), _hash,
+                            _v[:8],
                         )
 
             if deinterleave_idx is None:
