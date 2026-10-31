@@ -822,11 +822,18 @@ def sparse_attn_indexer(
                     _row0 = _lg[0]
                     _fin0 = _row0[torch.isfinite(_row0)]
                     if _fin0.numel():
-                        _mx = _fin0.max()
-                        _ties = int((_fin0 == _mx).sum())
+                        # the top-k selects the top topk_tokens scores; the
+                        # tie that matters is at the CUTOFF (the 1024th
+                        # score), not at the maximum.
+                        _k = min(topk_tokens, _fin0.numel())
+                        _srt, _ = torch.sort(_fin0, descending=True)
+                        _cut = _srt[_k - 1]
+                        _ties = int((_fin0 == _cut).sum())
+                        _above = int((_fin0 > _cut).sum())
                         logger.warning(
-                            "DSV41 ITIE row0 n=%d max=%.10g ties_at_max=%d",
-                            _fin0.numel(), float(_mx), _ties,
+                            "DSV41 ITIE row0 n=%d k=%d cutoff=%.10g "
+                            "above=%d ties_at_cutoff=%d",
+                            _fin0.numel(), _k, float(_cut), _above, _ties,
                         )
                     # hash the FINITE entries only: the mask makes the rest
                     # -inf. If two runs of the same chunk produce the same
