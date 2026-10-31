@@ -159,8 +159,13 @@ def mhc_post_torch(
                           residual.float())
     post_term = c.float().unsqueeze(-1) * d.float().unsqueeze(1)
     out = mixed + post_term
-    # the kernel writes the collapsed result into x[n, 0, :]
-    return out[:, 0].to(residual.dtype)
+    # The kernel returns an (n, hc, h) buffer whose [:, 0, :] holds the
+    # collapsed result; the other rows are untouched. Keep that shape so
+    # the oracle is a drop-in for the kernel.
+    full = torch.zeros(n, hc, h, device=residual.device,
+                       dtype=residual.dtype)
+    full[:, 0, :] = out[:, 0].to(residual.dtype)
+    return full
 
 
 def mhc_fused_post_pre_torch(
