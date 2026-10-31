@@ -815,19 +815,25 @@ def sparse_attn_indexer(
                     # discrete choice the attention consumes, so if it
                     # differs between two runs of the SAME request, the
                     # scores differ.
-                    _lg = logits.detach().float()
-                    # Debug: the FIRST finite score per row and the count of
-                    # exactly-tied scores at the cutoff. A large tie count
-                    # means the atomic tie-break decides the selection.
-                    _row0 = _lg[0]
+                    # NOTE: the probe must NOT copy or sort the whole
+                    # logits: they are (4096, 32768) fp32 = 537 MB, and
+                    # torch.sort / the isfinite() mask each materialise
+                    # another gigabyte - per layer, per rank. That is what
+                    # OOM-killed the worker during the 89K prefill.
+                    # Only the FIRST ROW is examined, and it is examined
+                    # with a partial sort over a bounded slice.
+                    _row0 = logits[0].detach().float()
                     _fin0 = _row0[torch.isfinite(_row0)]
                     if _fin0.numel():
                         # the top-k selects the top topk_tokens scores; the
                         # tie that matters is at the CUTOFF (the 1024th
                         # score), not at the maximum.
                         _k = min(topk_tokens, _fin0.numel())
-                        _srt, _ = torch.sort(_fin0, descending=True)
-                        _cut = _srt[_k - 1]
+                        # torch.kthvalue is O(n) and does not materialise
+                        # a sorted copy of the whole row.
+                        _cut = torch.kthvalue(
+                            _fin0, _fin0.numel() - _k + 1
+                        ).values
                         _ties = int((_fin0 == _cut).sum())
                         _above = int((_fin0 > _cut).sum())
                         logger.warning(
@@ -839,12 +845,13 @@ def sparse_attn_indexer(
                     # -inf. If two runs of the same chunk produce the same
                     # hash but different selections, the selection is the
                     # race (the scores are identical).
-                    _fin = _lg[torch.isfinite(_lg)]
+                    # hash a BOUNDED slice of the first row (not the
+                    # whole tensor: the isfinite() mask would copy it all)
+                    _sl = logits[0].detach().float()[:1024]
                     logger.warning(
-                        "DSV41 ILOGITS shape=%s nfin=%d hash=%d",
-                        tuple(_lg.shape),
-                        _fin.numel(),
-                        hash(tuple(_fin.tolist()[:2048])),
+                        "DSV41 ILOGITS shape=%s hash=%d",
+                        tuple(logits.shape),
+                        hash(tuple(_sl.tolist())),
                     )
                     _tk = topk_indices.detach().to(torch.int64)
                     for _r in range(min(_tk.shape[0], 4)):
