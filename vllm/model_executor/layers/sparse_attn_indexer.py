@@ -816,6 +816,18 @@ def sparse_attn_indexer(
                     # differs between two runs of the SAME request, the
                     # scores differ.
                     _lg = logits.detach().float()
+                    # Debug: the FIRST finite score per row and the count of
+                    # exactly-tied scores at the cutoff. A large tie count
+                    # means the atomic tie-break decides the selection.
+                    _row0 = _lg[0]
+                    _fin0 = _row0[torch.isfinite(_row0)]
+                    if _fin0.numel():
+                        _mx = _fin0.max()
+                        _ties = int((_fin0 == _mx).sum())
+                        logger.warning(
+                            "DSV41 ITIE row0 n=%d max=%.10g ties_at_max=%d",
+                            _fin0.numel(), float(_mx), _ties,
+                        )
                     # hash the FINITE entries only: the mask makes the rest
                     # -inf. If two runs of the same chunk produce the same
                     # hash but different selections, the selection is the
