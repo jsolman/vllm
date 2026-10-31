@@ -912,15 +912,16 @@ class MoERunner(MoERunnerInterface):
                 )
             else:
                 if os.environ.get("VLLM_DSV41_LOG_GATE_INPUT", "0") == "1":
-                    # Debug: the GATE's actual input. The 'ffnin' probe
-                    # measures the layer's x, but the MoE gates on this
-                    # tensor - if it differs between runs, the divergence
-                    # is in whatever computes it.
+                    # Debug: the GATE's actual input. The checksum is too
+                    # weak (two tensors can share a sum and an absmax), so
+                    # hash the FIRST ROW's bytes as well.
                     _gi = hidden_states.detach().float()
+                    _r0 = hidden_states[0].detach().contiguous().view(torch.uint8)
                     logger.warning(
-                        "DSV41 GIN shape=%s sum=%.10g absmax=%.10g",
+                        "DSV41 GIN shape=%s sum=%.10g absmax=%.10g h0=%d",
                         tuple(_gi.shape), float(_gi.sum()),
                         float(_gi.abs().amax()),
+                        hash(tuple(_r0.tolist()[:256])),
                     )
                 router_logits, _ = self.gate(hidden_states)
 
