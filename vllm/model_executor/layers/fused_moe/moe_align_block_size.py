@@ -41,11 +41,17 @@ def _deterministic_align(
     flat_expert = topk_ids.reshape(-1).to(torch.int64)
     flat_index = torch.arange(numel, device=device, dtype=torch.int64)
 
-    # The CUDA op is called with expert_map=None (the caller maps the
-    # BLOCK ids afterwards), so the grouping is over the GLOBAL expert
-    # ids. The helper must do exactly the same.
     valid = flat_expert >= 0
-    local_expert = flat_expert
+    if expert_map is not None and not ignore_invalid_experts:
+        # an expert that is not on this rank is skipped
+        valid &= expert_map[flat_expert.clamp(min=0)] >= 0
+    local_expert = torch.where(
+        valid,
+        flat_expert
+        if expert_map is None or ignore_invalid_experts
+        else expert_map[flat_expert.clamp(min=0)].to(torch.int64),
+        torch.full_like(flat_expert, -1),
+    )
 
     # the count of tokens per expert, and the padded base of each expert
     counts = torch.bincount(local_expert[valid], minlength=num_experts)
@@ -89,8 +95,9 @@ def _deterministic_align(
         _nb = int((int(padded[e].item()) + block_size - 1) // block_size)
         if _nb > 0:
             expert_ids[_b0:min(_b0 + _nb, num_blocks)] = e
-    # The block ids hold the LOCAL expert ids; the CALLER maps them
-    # through expert_map, exactly as it does for the CUDA op.
+    if expert_map is not None and not ignore_invalid_experts:
+        expert_ids.copy_(expert_map[expert_ids.clamp(min=0)].to(torch.int32))
+
     num_tokens_post_pad[0] = min(total, sorted_ids.numel())
     if scatter_idx is not None:
         scatter_idx.copy_(
@@ -278,9 +285,6 @@ def moe_align_block_size(
         )
 
     if expert_map is not None and not ignore_invalid_experts:
-        # the block ids hold the LOCAL expert ids (the CUDA op's
-        # get_local_expert_id applies the map); the caller maps them
-        # back to global ids here - exactly as for the CUDA path.
         expert_ids = expert_map[expert_ids]
 
     if scatter_idx is not None:
