@@ -322,6 +322,32 @@ def mhc_shifted_post_pre(
         )
         return *outputs, x.new_empty(0, x.shape[1])
 
+    if _MHC_TORCH:
+        # Debug/fix switch: the whole fused MHC path in pure torch (the
+        # A/B against the TileLang kernels, whose cross-warp reduction
+        # had a shared-memory race).
+        _out = mhc_fused_post_pre_torch(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+        if capture_aux:
+            _aux = _out[0].mean(dim=1)
+        else:
+            _aux = _out[0].new_empty(0, _out[0].shape[-1])
+        return (*_out, _aux)
+
     return mhc_fused_post_pre_delayed_tilelang(
         x,
         residual,
