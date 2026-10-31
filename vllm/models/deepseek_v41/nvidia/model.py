@@ -728,11 +728,19 @@ class DeepseekV4DecoderLayer(nn.Module):
                         _ti, float(_s[_ti]), float(_m[_ti]),
                     )
         if _DSV41_LOG_LAYER_SUMS and x is not None and x.numel():
+            # hash EVERY token row of the attention output, so the first
+            # diverging token can be identified.
+            _xr = x.detach().contiguous().view(torch.uint8).view(x.shape[0], -1)
+            _xh = [
+                hash(tuple(_xr[t].tolist()[:128]))
+                for t in range(min(_xr.shape[0], 12))
+            ]
             logger.info(
-                "DSV41 PART L%d attn sum=%.10g absmax=%.10g",
+                "DSV41 PART L%d attn sum=%.10g absmax=%.10g h=%s",
                 getattr(self, "_dsv41_layer_id", -1),
                 float(x.detach().float().sum()),
                 float(x.detach().float().abs().max()),
+                _xh,
             )
         # With GEMM-RS bound, the attention output is already this rank's
         # sequence-parallel shard (see DeepseekV4Attention._wo_b_proj).
