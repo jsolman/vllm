@@ -68,6 +68,7 @@ if current_platform.is_cuda():
         is_padding_ptr,
         topk_weights_ptr,
         topk_ids_ptr,
+        rscore_ptr,
         routed_scaling_factor,
         input_ids_ptr,
         bias_vl_ptr,
@@ -145,6 +146,20 @@ if current_platform.is_cuda():
         if _DSV41_LOG_ROUTING:
             # Debug: the CORRECTED SCORES the top-k selects from, and the
             # gap between the 6th and 7th score (a small gap = a near-tie,
+            # so a last-bit difference flips the selection). A Triton
+            # kernel cannot call a logger, so the numbers go into a debug
+            # buffer that the caller reads and logs.
+            _sc = tl.sort(current, axis=0)
+            _s6 = tl.sum(tl.where(tl.arange(0, 8) == 5, _sc, 0.0), axis=0)
+            _s7 = tl.sum(tl.where(tl.arange(0, 8) == 6, _sc, 0.0), axis=0)
+            tl.store(rscore_ptr + row * 4, tl.sum(logits, axis=0), mask=output_mask)
+            tl.store(rscore_ptr + row * 4 + 1, _s6, mask=output_mask)
+            tl.store(rscore_ptr + row * 4 + 2, _s7, mask=output_mask)
+            tl.store(rscore_ptr + row * 4 + 3, tl.max(logits, axis=0),
+                     mask=output_mask)
+        if _DSV41_LOG_ROUTING:
+            # Debug: the CORRECTED SCORES the top-k selects from, and the
+            # gap between the 6th and 7th score (a small gap = a near-tie,
             # so a last-bit difference flips the selection).
             _sc = tl.sort(current, axis=0)
             _s6 = tl.sum(tl.where(tl.arange(0, 8) == 5, _sc, 0.0), axis=0)
@@ -185,6 +200,12 @@ def dsv4_topk(
     shape = (num_tokens, _TOPK)
     topk_weights = gating_output.new_empty(shape, dtype=torch.float32)
     topk_ids = gating_output.new_empty(shape, dtype=indices_dtype)
+    # Debug: the corrected scores per row (the gating sum, the 6th and the
+    # 7th score, and the max). The gap between the 6th and the 7th is the
+    # near-tie margin: a small margin means a last-bit difference flips the
+    # selected expert set.
+    rscore = (gating_output.new_empty((num_tokens, 4), dtype=torch.float32)
+              if _DSV41_LOG_ROUTING else gating_output.new_empty(1))
     if num_tokens > 0:
         _dsv4_topk_kernel[(num_tokens,)](
             gating_output,
@@ -192,6 +213,7 @@ def dsv4_topk(
             is_padding,
             topk_weights,
             topk_ids,
+            rscore,
             routed_scaling_factor,
             input_ids,
             bias_vl,
@@ -215,5 +237,13 @@ def dsv4_topk(
             _ws = ",".join("%.6g" % float(v) for v in _w[_t].tolist())
             logger.warning(
                 "DSV41 ROUTE tok=%d ids=%s w=%s", _t, _row, _ws
+            )
+    if _DSV41_LOG_ROUTING and num_tokens > 0:
+        _rs = rscore.detach()
+        for _r in range(min(_rs.shape[0], 6)):
+            logger.warning(
+                "DSV41 RSCORE row=%d gsum=%.10g s6=%.10g s7=%.10g gap=%.10g",
+                _r, float(_rs[_r, 0]), float(_rs[_r, 1]), float(_rs[_r, 2]),
+                float(_rs[_r, 1]) - float(_rs[_r, 2]),
             )
     return topk_weights, topk_ids
