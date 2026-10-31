@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from typing import Literal, overload
 
 import torch
@@ -10,86 +9,8 @@ from vllm import _custom_ops as ops
 from vllm.triton_utils import triton
 from vllm.utils.math_utils import round_up
 
-# Debug/fix switch: use the deterministic (stable-sorted) token-to-expert
-# block assignment instead of the CUDA op. The CUDA op hands out the
-# slots with an atomicAdd, so the order of the tokens inside an expert's
-# block is not deterministic; the expert GEMM then accumulates them in
-# that order, and fp32 addition is not associative, so the same request
-# gave different results run to run.
-_DETERMINISTIC_ALIGN = os.environ.get("VLLM_DSV41_DETERMINISTIC_ALIGN", "0") == "1"
-
-
-def _deterministic_align(
-    topk_ids: torch.Tensor,
-    block_size: int,
-    num_experts: int,
-    expert_map: torch.Tensor | None = None,
-    ignore_invalid_experts: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The stable (expert_id, token_index) block assignment.
-
-    Same layout as ``ops.moe_align_block_size``, but the tokens of each
-    expert are placed in increasing token-index order, so the result does
-    not depend on the order the atomic increments happened in.
-    """
-    numel = topk_ids.numel()
-    device = topk_ids.device
-    flat_expert = topk_ids.reshape(-1).to(torch.int64)
-    flat_index = torch.arange(numel, device=device, dtype=torch.int64)
-
-    valid = flat_expert >= 0
-    if expert_map is not None and not ignore_invalid_experts:
-        # an expert that is not on this rank is skipped
-        valid &= expert_map[flat_expert.clamp(min=0)] >= 0
-    local_expert = torch.where(
-        valid,
-        flat_expert
-        if expert_map is None or ignore_invalid_experts
-        else expert_map[flat_expert.clamp(min=0)].to(torch.int64),
-        torch.full_like(flat_expert, -1),
-    )
-
-    # the count of tokens per expert, and the padded base of each expert
-    counts = torch.bincount(local_expert[valid], minlength=num_experts)
-    padded = ((counts + block_size - 1) // block_size) * block_size
-    bases = torch.cumsum(padded, 0) - padded
-    total = int(padded.sum().item())
-
-    # a STABLE sort by (expert, index): the index is the tie-break, so the
-    # tokens of an expert keep their relative order.
-    order = torch.argsort(local_expert, stable=True)
-    sorted_expert = local_expert[order]
-    starts = torch.cumsum(counts, 0) - counts
-    rank_in_expert = torch.empty(numel, dtype=torch.int64, device=device)
-    rank_in_expert[order] = torch.arange(numel, device=device,
-                                        dtype=torch.int64) - starts[sorted_expert]
-
-    slot = torch.where(valid, bases[local_expert.clamp(min=0)] + rank_in_expert,
-                       torch.zeros_like(flat_index))
-    sorted_ids = torch.full((total,), numel, dtype=torch.int32, device=device)
-    sorted_ids[slot[valid]] = flat_index[valid].to(torch.int32)
-
-    # the expert id of every block
-    num_blocks = (total + block_size - 1) // block_size
-    block_expert = torch.full((num_blocks,), -1, dtype=torch.int32, device=device)
-    for e in range(num_experts):
-        b0 = int(bases[e].item())
-        b1 = b0 + int(padded[e].item())
-        if b1 > b0:
-            block_expert[b0 // block_size: (b1 + block_size - 1) // block_size] = e
-    if expert_map is not None and not ignore_invalid_experts:
-        block_expert = expert_map[block_expert.clamp(min=0)].to(torch.int32)
-
-    num_post = torch.tensor([total], dtype=torch.int32, device=device)
-    _scatter = torch.where(
-        valid, flat_index, torch.full_like(flat_index, -1)
-    ).to(torch.int32).unsqueeze(1)
-    return sorted_ids, block_expert, num_post, _scatter
-
-
 
 @overload
-
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -229,41 +150,16 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
-    if _DETERMINISTIC_ALIGN:
-        # The CUDA op hands each token its slot within its expert's block
-        # with an atomicAdd, so the ORDER of the tokens inside a block is
-        # whatever order the atomics happened in. The expert GEMM then
-        # accumulates the block's tokens in that order, and fp32 addition
-        # is not associative, so the SAME request produced different
-        # results run to run (and the difference grew with the layer
-        # depth, ending in a repetition loop at temperature 1.0).
-        #
-        # This computes the same layout with a STABLE sort by
-        # (expert_id, token_index), which is both deterministic and the
-        # ordering the reference implementation uses.
-        _sorted_ids, _expert_ids, _num_post, _scatter_idx = _deterministic_align(
-            topk_ids,
-            block_size,
-            num_experts,
-            expert_map,
-            ignore_invalid_experts,
-        )
-        sorted_ids[: _sorted_ids.numel()].copy_(_sorted_ids)
-        expert_ids[: _expert_ids.numel()].copy_(_expert_ids)
-        num_tokens_post_pad.copy_(_num_post)
-        if scatter_idx is not None:
-            scatter_idx.copy_(_scatter_idx)
-    else:
-        ops.moe_align_block_size(
-            topk_ids,
-            num_experts,
-            block_size,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
-            expert_map if ignore_invalid_experts else None,
-            scatter_idx,
-        )
+    ops.moe_align_block_size(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        expert_map if ignore_invalid_experts else None,
+        scatter_idx,
+    )
 
     if expert_map is not None and not ignore_invalid_experts:
         expert_ids = expert_map[expert_ids]
