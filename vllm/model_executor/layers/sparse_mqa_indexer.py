@@ -207,6 +207,23 @@ class SparseMQAIndexer(nn.Module):
                     col_indices=rows.col_indices,
                     kernel_metadata=rows.kernel_metadata,
                 )
+                if _DSV41_LOG_TOPK:
+                    # Debug: the PREFILL's published top-k selection.
+                    # This is the discrete set of context positions the
+                    # next layer's sparse attention reads. If it differs
+                    # between two runs of the SAME request, the indexer's
+                    # scores (or its top-k) are the race.
+                    _pt = topk_indices_buffer[start:end, :topk_tokens]
+                    for _r in range(min(_pt.shape[0], 4)):
+                        _v = _pt[_r].detach().to(torch.int64).tolist()
+                        logger.warning(
+                            "DSV41 PTOPK chunk=%d row=%d sum=%d hash=%d "
+                            "first=%s",
+                            start, _r,
+                            sum(int(x) for x in _v if x >= 0),
+                            hash(tuple(int(x) for x in _v)),
+                            _v[:12],
+                        )
 
         if metadata.num_decodes > 0:
             decode_rows = metadata.sparse_decode
