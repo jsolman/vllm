@@ -56,7 +56,10 @@ def _deterministic_align(
         local_expert = flat_expert
 
     # the count of tokens per expert, and the padded base of each expert
-    counts = torch.bincount(local_expert[valid], minlength=num_experts)
+    # bincount needs non-negative values, and the invalid entries are -1
+    _sel = local_expert[valid]
+    _sel = _sel[_sel >= 0]
+    counts = torch.bincount(_sel, minlength=num_experts)
     padded = ((counts + block_size - 1) // block_size) * block_size
     bases = torch.cumsum(padded, 0) - padded
     total = int(padded.sum().item())
@@ -67,10 +70,16 @@ def _deterministic_align(
     sorted_expert = local_expert[order]
     starts = torch.cumsum(counts, 0) - counts
     rank_in_expert = torch.empty(numel, dtype=torch.int64, device=device)
-    rank_in_expert[order] = torch.arange(numel, device=device,
-                                        dtype=torch.int64) - starts[sorted_expert]
+    _pos = torch.arange(numel, device=device, dtype=torch.int64)
+    # the invalid entries (-1) sort first; their rank is meaningless but
+    # they are never used (the slot is masked out below).
+    _base_of = torch.where(sorted_expert >= 0,
+                           starts[sorted_expert.clamp(min=0)],
+                           torch.zeros_like(sorted_expert))
+    rank_in_expert[order] = _pos - _base_of
 
-    slot = torch.where(valid, bases[local_expert.clamp(min=0)] + rank_in_expert,
+    slot = torch.where(valid,
+                       bases[local_expert.clamp(min=0)] + rank_in_expert,
                        torch.zeros_like(flat_index))
     # the caller's buffer; the tail is the padding
     n = min(total, sorted_ids.numel())
