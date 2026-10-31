@@ -816,11 +816,16 @@ def sparse_attn_indexer(
                     # differs between two runs of the SAME request, the
                     # scores differ.
                     _lg = logits.detach().float()
+                    # hash the FINITE entries only: the mask makes the rest
+                    # -inf. If two runs of the same chunk produce the same
+                    # hash but different selections, the selection is the
+                    # race (the scores are identical).
+                    _fin = _lg[torch.isfinite(_lg)]
                     logger.warning(
-                        "DSV41 ILOGITS shape=%s sum=%.10g absmax=%.10g",
+                        "DSV41 ILOGITS shape=%s nfin=%d hash=%d",
                         tuple(_lg.shape),
-                        float(_lg.sum()),
-                        float(_lg.abs().amax()),
+                        _fin.numel(),
+                        hash(tuple(_fin.tolist()[:2048])),
                     )
                     _tk = topk_indices.detach().to(torch.int64)
                     for _r in range(min(_tk.shape[0], 4)):
