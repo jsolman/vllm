@@ -76,7 +76,14 @@ _MHC_TILE_N_FIXED = int(os.environ.get("VLLM_MHC_TILE_N", "0") or 0) or None
 # Debug/fix switch: fix the mHC GEMM's split-K so it does not depend on
 # the batch's token count (see compute_num_split).
 _MHC_SPLIT_K_FIXED = int(os.environ.get("VLLM_MHC_SPLIT_K", "0") or 0) or None
-_FUSED_POST_PRE_MAX_TOKENS = 32
+# Debug/fix switch: the token count above which the fused post + pre-norm
+# path is NOT used. The fused path has one program per (token, tile,
+# split); the separate path uses a one-program-per-token post kernel plus
+# a split-k GEMM. Setting this to 0 forces the separate path, which is
+# an A/B against the fused kernel.
+_FUSED_POST_PRE_MAX_TOKENS = int(
+    os.environ.get("VLLM_MHC_FUSED_MAX_TOKENS", "32") or 32
+)
 
 
 def mhc_fused_post_pre_split_config(
