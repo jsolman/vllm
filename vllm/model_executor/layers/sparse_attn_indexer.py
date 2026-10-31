@@ -68,6 +68,26 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
+def _dsv41_flag(name: str) -> bool:
+    """Read a debug flag from the env OR from /tmp/dsv41-flags.
+
+    A flag must be exported in BOTH blocks of the launcher (the top-level
+    one, which the head's API server inherits, and the remote ssh one,
+    which the ranks 1-3 inherit). The flags file is the belt-and-braces
+    channel: it works even when a flag is missing from one of them.
+    """
+    if os.environ.get(name, "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            for line in f:
+                if line.strip() == name:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
 
@@ -785,7 +805,7 @@ def sparse_attn_indexer(
                     logits.stride(1),
                     topk_tokens,
                 )
-                if os.environ.get("VLLM_DSV41_LOG_TOPK", "0") == "1":
+                if _dsv41_flag("VLLM_DSV41_LOG_TOPK"):
                     # Debug: the indexer's SCORES and the SELECTION they
                     # produce (the prefill path). The selection is the
                     # discrete choice the attention consumes, so if it
@@ -987,7 +1007,7 @@ def sparse_attn_indexer(
             topk_tokens,
             attn_metadata_narrowed.max_seq_len,
         )
-        if os.environ.get("VLLM_DSV41_LOG_TOPK", "0") == "1":
+        if _dsv41_flag("VLLM_DSV41_LOG_TOPK"):
             # Debug: the indexer's SCORES and the SELECTION they produce.
             # The selection is the discrete choice the attention consumes, so
             # if it differs between two runs of the SAME request, the

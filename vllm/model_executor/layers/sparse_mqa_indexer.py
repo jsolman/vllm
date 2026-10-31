@@ -75,8 +75,28 @@ def _gather_prefill_chunk_k(
 
 logger = init_logger(__name__)
 
+def _dsv41_flag(name: str) -> bool:
+    """Read a debug flag from the env OR from /tmp/dsv41-flags.
+
+    A flag must be exported in BOTH blocks of the launcher (the top-level
+    one, which the head's API server inherits, and the remote ssh one,
+    which the ranks 1-3 inherit). The flags file is the belt-and-braces
+    channel: it works even when a flag is missing from one of them.
+    """
+    if os.environ.get(name, "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            for line in f:
+                if line.strip() == name:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 # Debug: log the published top-k block indices.
-_DSV41_LOG_TOPK = os.environ.get("VLLM_DSV41_LOG_TOPK", "0") == "1"
+_DSV41_LOG_TOPK = _dsv41_flag("VLLM_DSV41_LOG_TOPK")
 
 
 class SparseMQAIndexer(nn.Module):
