@@ -748,6 +748,18 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if mhc_stream is not None:
             torch.cuda.current_stream().wait_stream(mhc_stream)
+        if _DSV41_LOG_LAYER_SUMS and residual is not None and residual.numel():
+            # Debug: the MHC's INPUT (the residual the layer receives).
+            # Together with the gate input (GIN) and the layer output (x),
+            # this brackets the layer: if the MHC input and the gate input
+            # differ but the attention output does not, the difference is
+            # in the MHC; if the attention output differs, it is upstream.
+            logger.info(
+                "DSV41 PART L%d mhcin sum=%.10g absmax=%.10g",
+                getattr(self, "_dsv41_layer_id", -1),
+                float(residual.detach().float().sum()),
+                float(residual.detach().float().abs().max()),
+            )
         residual, post_mix, res_mix, x, ffn_pre, _ = mhc_shifted_post_pre(
             x,
             residual,
