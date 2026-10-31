@@ -154,18 +154,15 @@ def mhc_post_torch(
         d = d[:, 0]
     assert d.shape == (n, h), d.shape
 
-    # out[n, j, h] = c[n, j] * d[n, h] + sum_i a[n, i, j] * b[n, i, h]
+    # The REFERENCE's hc_post (inference/model.py):
+    #   y = post.unsqueeze(-1) * x.unsqueeze(-2)
+    #       + sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+    # -> y[n, j, h] = c[n, j] * d[n, h] + sum_i a[n, i, j] * b[n, i, h]
+    # EVERY hc row j is written.
     mixed = torch.einsum("nij,nih->njh", comb_res_mix.float(),
                           residual.float())
     post_term = c.float().unsqueeze(-1) * d.float().unsqueeze(1)
-    out = mixed + post_term
-    # The kernel returns an (n, hc, h) buffer whose [:, 0, :] holds the
-    # collapsed result; the other rows are untouched. Keep that shape so
-    # the oracle is a drop-in for the kernel.
-    full = torch.zeros(n, hc, h, device=residual.device,
-                       dtype=residual.dtype)
-    full[:, 0, :] = out[:, 0].to(residual.dtype)
-    return full
+    return (mixed + post_term).to(residual.dtype)
 
 
 def mhc_fused_post_pre_torch(

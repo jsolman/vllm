@@ -870,7 +870,17 @@ def mhc_post_tilelang(
                 for i_hci in T.vectorized(hc):
                     x_local[i_hco, i1_h] += a_local[i_hci, i_hco] * b_local[i_hci, i1_h]
 
-            T.copy(x_local, x[i_n, 0, i0_h * h_blk])
+            # Write EVERY hc row, not just row 0. The reference's
+            # hc_post produces the full [b, s, hc, d] stream:
+            #   y = post.unsqueeze(-1) * x.unsqueeze(-2)
+            #       + sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+            # The Engram layers then read ALL hc rows of this post
+            # (the engram kernel indexes hidden_states[token, hc, :]),
+            # so leaving rows 1..hc-1 unwritten fed UNINITIALIZED memory
+            # into the gate - which is what made the whole forward pass
+            # nondeterministic at the engram layers.
+            for i_hco, i1_h in T.Parallel(hc, h_blk):
+                x[i_n, i_hco, i0_h * h_blk + i1_h] = x_local[i_hco, i1_h]
         if ENABLE_PDL:
             T.pdl_trigger()
 
