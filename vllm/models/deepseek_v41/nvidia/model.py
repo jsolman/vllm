@@ -767,6 +767,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             stream=mhc_stream,
             reduce_results=self.fuse_mhc_all_reduce,
         )
+        if _DSV41_LOG_LAYER_SUMS and x is not None and x.numel():
+            # Debug: the FFN's INPUT (the MHC's output, after the ffn norm).
+            # The MHC streams (residual/post_mix/res_mix) are identical
+            # across runs at the failing layer, so if this differs, the MHC
+            # pre is where it enters.
+            logger.info(
+                "DSV41 PART L%d ffnin sum=%.10g absmax=%.10g",
+                getattr(self, "_dsv41_layer_id", -1),
+                float(x.detach().float().sum()),
+                float(x.detach().float().abs().max()),
+            )
         if self.fuse_mhc_all_reduce and self.ffn.defers_finalize(x.shape[0]):
             # The next layer's first boundary finalizes it with the all-reduce.
             x = self.ffn.forward_unfinalized(x, input_ids)
