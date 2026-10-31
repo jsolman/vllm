@@ -152,16 +152,11 @@ if current_platform.is_cuda():
             # a debug buffer that the caller reads and logs.
             # selected_weights holds the 6 selected scores (the weights are
             # the corrected scores, before the softmax).
-            _sel = tl.sum(
-                tl.where(tl.arange(0, 8) < 6, selected_weights, 0.0), axis=0
-            )
-            tl.store(rscore_ptr + row * 4, tl.sum(logits, axis=0),
-                     mask=output_mask)
-            tl.store(rscore_ptr + row * 4 + 1, selected_weights[5],
-                     mask=output_mask)
-            tl.store(rscore_ptr + row * 4 + 2, _sel, mask=output_mask)
-            tl.store(rscore_ptr + row * 4 + 3, tl.max(logits, axis=0),
-                     mask=output_mask)
+            # the sum of the 6 selected corrected scores, and the max of
+            # the gating output: both are scalars, so they are stored
+            # without a mask (one program per row).
+            tl.store(rscore_ptr + row * 2, tl.sum(logits, axis=0))
+            tl.store(rscore_ptr + row * 2 + 1, tl.sum(selected_weights, axis=0))
 
 
 def dsv4_topk(
@@ -196,7 +191,7 @@ def dsv4_topk(
     # 7th score, and the max). The gap between the 6th and the 7th is the
     # near-tie margin: a small margin means a last-bit difference flips the
     # selected expert set.
-    rscore = (gating_output.new_empty((num_tokens, 4), dtype=torch.float32)
+    rscore = (gating_output.new_empty((num_tokens, 2), dtype=torch.float32)
               if _DSV41_LOG_ROUTING else gating_output.new_empty(1))
     if num_tokens > 0:
         _dsv4_topk_kernel[(num_tokens,)](
@@ -235,8 +230,7 @@ def dsv4_topk(
         _rs = rscore.detach()
         for _r in range(min(_rs.shape[0], 6)):
             logger.warning(
-                "DSV41 RSCORE row=%d gsum=%.10g s6=%.10g wsum=%.10g gmax=%.10g",
-                _r, float(_rs[_r, 0]), float(_rs[_r, 1]), float(_rs[_r, 2]),
-                float(_rs[_r, 3]),
+                "DSV41 RSCORE row=%d gsum=%.10g selwsum=%.10g",
+                _r, float(_rs[_r, 0]), float(_rs[_r, 1]),
             )
     return topk_weights, topk_ids
