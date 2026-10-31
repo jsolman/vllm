@@ -23,13 +23,9 @@ def _deterministic_align(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,
-    sorted_ids: torch.Tensor,
-    expert_ids: torch.Tensor,
-    num_tokens_post_pad: torch.Tensor,
-    scatter_idx: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
     ignore_invalid_experts: bool = False,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The stable (expert_id, token_index) block assignment.
 
     Same layout as ``ops.moe_align_block_size``, but the tokens of each
@@ -70,41 +66,25 @@ def _deterministic_align(
 
     slot = torch.where(valid, bases[local_expert.clamp(min=0)] + rank_in_expert,
                        torch.zeros_like(flat_index))
-    # the caller's buffer; the tail is the padding
-    n = min(total, sorted_ids.numel())
-    # the WHOLE buffer is the padding, so fill all of it (the CUDA op
-    # fills it with numel, the "this row does not exist" sentinel)
-    sorted_ids.fill_(numel)
-    # the slots and the token indices must be masked TOGETHER: taking
-    # the first n of each separately would pair a slot with the wrong
-    # token.
-    _slots = slot[valid]
-    _tokens = flat_index[valid]
-    _m = _slots < n
-    sorted_ids[:n].scatter_(0, _slots[_m].to(torch.int64),
-                            _tokens[_m].to(torch.int32))
+    sorted_ids = torch.full((total,), numel, dtype=torch.int32, device=device)
+    sorted_ids[slot[valid]] = flat_index[valid].to(torch.int32)
 
     # the expert id of every block
-    num_blocks = expert_ids.numel()
-    expert_ids.fill_(-1)
-    _b = torch.arange(num_blocks, device=device, dtype=torch.int64)
-    # the block of each expert, and the expert of each block
-    _blk_of_expert = bases // block_size
+    num_blocks = (total + block_size - 1) // block_size
+    block_expert = torch.full((num_blocks,), -1, dtype=torch.int32, device=device)
     for e in range(num_experts):
-        _b0 = int(_blk_of_expert[e].item())
-        _nb = int((int(padded[e].item()) + block_size - 1) // block_size)
-        if _nb > 0:
-            expert_ids[_b0:min(_b0 + _nb, num_blocks)] = e
+        b0 = int(bases[e].item())
+        b1 = b0 + int(padded[e].item())
+        if b1 > b0:
+            block_expert[b0 // block_size: (b1 + block_size - 1) // block_size] = e
     if expert_map is not None and not ignore_invalid_experts:
-        expert_ids.copy_(expert_map[expert_ids.clamp(min=0)].to(torch.int32))
+        block_expert = expert_map[block_expert.clamp(min=0)].to(torch.int32)
 
-    num_tokens_post_pad[0] = min(total, sorted_ids.numel())
-    if scatter_idx is not None:
-        scatter_idx.copy_(
-            torch.where(valid, flat_index, torch.full_like(flat_index, -1))
-            .to(torch.int32)
-            .unsqueeze(1)
-        )
+    num_post = torch.tensor([total], dtype=torch.int32, device=device)
+    _scatter = torch.where(
+        valid, flat_index, torch.full_like(flat_index, -1)
+    ).to(torch.int32).unsqueeze(1)
+    return sorted_ids, block_expert, num_post, _scatter
 
 
 
@@ -261,17 +241,18 @@ def moe_align_block_size(
         # This computes the same layout with a STABLE sort by
         # (expert_id, token_index), which is both deterministic and the
         # ordering the reference implementation uses.
-        _deterministic_align(
+        _sorted_ids, _expert_ids, _num_post, _scatter_idx = _deterministic_align(
             topk_ids,
             block_size,
             num_experts,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
-            scatter_idx,
             expert_map,
             ignore_invalid_experts,
         )
+        sorted_ids[: _sorted_ids.numel()].copy_(_sorted_ids)
+        expert_ids[: _expert_ids.numel()].copy_(_expert_ids)
+        num_tokens_post_pad.copy_(_num_post)
+        if scatter_idx is not None:
+            scatter_idx.copy_(_scatter_idx)
     else:
         ops.moe_align_block_size(
             topk_ids,
