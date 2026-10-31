@@ -145,17 +145,21 @@ if current_platform.is_cuda():
         tl.store(topk_weights_ptr + output_offsets, selected_weights, mask=output_mask)
         tl.store(topk_ids_ptr + output_offsets, selected_ids, mask=output_mask)
         if LOG_ROUTING:
-            # Debug: the CORRECTED SCORES the top-k selects from, and the
-            # gap between the 6th and 7th score (a small gap = a near-tie,
-            # so a last-bit difference flips the selection). A Triton
-            # kernel cannot call a logger, so the numbers go into a debug
-            # buffer that the caller reads and logs.
-            _sc = tl.sort(current, axis=0)
-            _s6 = tl.sum(tl.where(tl.arange(0, 8) == 5, _sc, 0.0), axis=0)
-            _s7 = tl.sum(tl.where(tl.arange(0, 8) == 6, _sc, 0.0), axis=0)
-            tl.store(rscore_ptr + row * 4, tl.sum(logits, axis=0), mask=output_mask)
-            tl.store(rscore_ptr + row * 4 + 1, _s6, mask=output_mask)
-            tl.store(rscore_ptr + row * 4 + 2, _s7, mask=output_mask)
+            # Debug: the CORRECTED SCORES the top-k selected from, and the
+            # MARGIN between the 6th and the 7th (a small margin = a
+            # near-tie, so a last-bit difference flips the selected set).
+            # A Triton kernel cannot call a logger, so the numbers go into
+            # a debug buffer that the caller reads and logs.
+            # selected_weights holds the 6 selected scores (the weights are
+            # the corrected scores, before the softmax).
+            _sel = tl.sum(
+                tl.where(tl.arange(0, 8) < 6, selected_weights, 0.0), axis=0
+            )
+            tl.store(rscore_ptr + row * 4, tl.sum(logits, axis=0),
+                     mask=output_mask)
+            tl.store(rscore_ptr + row * 4 + 1, selected_weights[5],
+                     mask=output_mask)
+            tl.store(rscore_ptr + row * 4 + 2, _sel, mask=output_mask)
             tl.store(rscore_ptr + row * 4 + 3, tl.max(logits, axis=0),
                      mask=output_mask)
 
@@ -231,8 +235,8 @@ def dsv4_topk(
         _rs = rscore.detach()
         for _r in range(min(_rs.shape[0], 6)):
             logger.warning(
-                "DSV41 RSCORE row=%d gsum=%.10g s6=%.10g s7=%.10g gap=%.10g",
+                "DSV41 RSCORE row=%d gsum=%.10g s6=%.10g wsum=%.10g gmax=%.10g",
                 _r, float(_rs[_r, 0]), float(_rs[_r, 1]), float(_rs[_r, 2]),
-                float(_rs[_r, 1]) - float(_rs[_r, 2]),
+                float(_rs[_r, 3]),
             )
     return topk_weights, topk_ids
