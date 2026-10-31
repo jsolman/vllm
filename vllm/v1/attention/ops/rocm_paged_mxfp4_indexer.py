@@ -13,6 +13,7 @@ them.
 """
 
 import functools
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
@@ -23,6 +24,9 @@ import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     apply_candidate_mask,
 )
@@ -219,6 +223,9 @@ def reserve_rocm_mxfp4_indexer_workspace(
     torch.empty(budget, dtype=torch.uint8, device=hidden_states.device)
 
 
+_DSV41_LOG_TOPK = os.environ.get("VLLM_DSV41_LOG_TOPK", "0") == "1"
+
+
 def _topk(
     logits: torch.Tensor, lengths: torch.Tensor, out: torch.Tensor, k: int
 ) -> None:
@@ -231,6 +238,36 @@ def _topk(
     rows, width = logits.shape
     if rows == 0:
         return
+    if _DSV41_LOG_TOPK:
+        # Debug: the logits the top-k sees, and the selection it
+        # produces, for the FIRST row. This is the live prefill path
+        # (the one the ROCm indexer actually uses).
+        #
+        # The tie check is the point: the compiled top-k
+        # (top_k_per_row_decode) admits tied candidates in an
+        # ARBITRARY order, so two runs that produce the SAME scores can
+        # select DIFFERENT positions - and the attention then reads
+        # different context.
+        _r0 = logits[0].detach().float()
+        _fin = _r0[torch.isfinite(_r0)]
+        if _fin.numel():
+            _kk = min(k, _fin.numel())
+            _cut = torch.kthvalue(
+                _fin, _fin.numel() - _kk + 1
+            ).values
+            _ties = int((_fin == _cut).sum())
+            _above = int((_fin > _cut).sum())
+            logger.warning(
+                "DSV41 LTIE rows=%d width=%d n=%d k=%d cutoff=%.10g "
+                "above=%d ties_at_cutoff=%d",
+                rows, width, _fin.numel(), _kk, float(_cut),
+                _above, _ties,
+            )
+        _sl = _r0[:2048]
+        logger.warning(
+            "DSV41 LLOGITS rows=%d width=%d hash=%d",
+            rows, width, hash(tuple(_sl.tolist())),
+        )
     if width >= k and (k >= 2048 or rows >= 128):
         _aiter_topk()(
             logits,
