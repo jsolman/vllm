@@ -916,12 +916,18 @@ class MoERunner(MoERunnerInterface):
                     # weak (two tensors can share a sum and an absmax), so
                     # hash the FIRST ROW's bytes as well.
                     _gi = hidden_states.detach().float()
-                    _r0 = hidden_states[0].detach().contiguous().view(torch.uint8)
+                    # hash EVERY token's row, so the first DIVERGING token
+                    # can be identified.
+                    _rows = hidden_states.detach().contiguous().view(
+                        torch.uint8).view(hidden_states.shape[0], -1)
+                    _h = [
+                        hash(tuple(_rows[t].tolist()[:128]))
+                        for t in range(min(_rows.shape[0], 12))
+                    ]
                     logger.warning(
-                        "DSV41 GIN shape=%s sum=%.10g absmax=%.10g h0=%d",
+                        "DSV41 GIN shape=%s sum=%.10g absmax=%.10g h=%s",
                         tuple(_gi.shape), float(_gi.sum()),
-                        float(_gi.abs().amax()),
-                        hash(tuple(_r0.tolist()[:256])),
+                        float(_gi.abs().amax()), _h,
                     )
                 router_logits, _ = self.gate(hidden_states)
 
