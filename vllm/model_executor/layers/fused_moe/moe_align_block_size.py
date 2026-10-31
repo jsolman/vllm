@@ -41,19 +41,11 @@ def _deterministic_align(
     flat_expert = topk_ids.reshape(-1).to(torch.int64)
     flat_index = torch.arange(numel, device=device, dtype=torch.int64)
 
-    # The CUDA op's get_local_expert_id applies the expert_map when the
-    # caller passes it (which the expert-parallel callers do, with
-    # ignore_invalid_experts=True), and the grouping is then over the
-    # LOCAL expert ids. When the caller does NOT pass it, the grouping
-    # is over the GLOBAL ids and the caller maps the block ids itself.
-    # The helper must follow the same rule.
-    if expert_map is not None:
-        valid = flat_expert >= 0
-        _mapped = expert_map[flat_expert.clamp(min=0)].to(torch.int64)
-        local_expert = torch.where(valid, _mapped, torch.full_like(flat_expert, -1))
-    else:
-        valid = flat_expert >= 0
-        local_expert = flat_expert
+    # The CUDA op is called with expert_map=None (the caller maps the
+    # BLOCK ids afterwards), so the grouping is over the GLOBAL expert
+    # ids. The helper must do exactly the same.
+    valid = flat_expert >= 0
+    local_expert = flat_expert
 
     # the count of tokens per expert, and the padded base of each expert
     counts = torch.bincount(local_expert[valid], minlength=num_experts)
@@ -270,10 +262,7 @@ def moe_align_block_size(
             expert_ids,
             num_tokens_post_pad,
             scatter_idx,
-            # the op is given the map only when the caller wants the
-            # LOCAL ids (ignore_invalid_experts); otherwise the caller
-            # maps the block ids itself.
-            expert_map if ignore_invalid_experts else None,
+            expert_map,
             ignore_invalid_experts,
         )
     else:
