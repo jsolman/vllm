@@ -795,6 +795,10 @@ def sparse_attn_indexer(
                             chunk_candidates,
                             candidate_block_size,
                         )
+                logger.warning(
+                    "DSV41 PREFILL-TOPK-SITE reached logits=%s",
+                    tuple(logits.shape),
+                )
                 ops.top_k_per_row_prefill(
                     logits,
                     torch.zeros_like(row_ends) if row_starts is None else row_starts,
