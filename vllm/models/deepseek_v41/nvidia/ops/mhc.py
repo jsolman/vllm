@@ -346,6 +346,9 @@ def mhc_shifted_post_pre(
         # layer_input, next_pre_mix, aux); the torch one has no
         # next_pre_mix, so it reuses post_mix.
         _res, _post, _comb, _layer_input = _out
+        # the torch path returns post_mix with a trailing dim; the model
+        # expects (T, hc_mult).
+        _post = _post.reshape(_post.shape[0], _post.shape[1])
         if capture_aux:
             _aux = _res.mean(dim=1)
         else:
