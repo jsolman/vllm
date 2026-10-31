@@ -424,6 +424,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.engram: Engram | None = None
         if engram_layout is not None:
             layer_id = extract_layer_index(prefix)
+            self._dsv41_layer_id = layer_id
             if layer_id in engram_layout.layer_ids:
                 self.engram = Engram(
                     config,
@@ -729,7 +730,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _DSV41_LOG_LAYER_SUMS and x is not None and x.numel():
             logger.info(
                 "DSV41 PART L%d attn sum=%.10g absmax=%.10g",
-                idx,
+                getattr(self, "_dsv41_layer_id", -1),
                 float(x.detach().float().sum()),
                 float(x.detach().float().abs().max()),
             )
@@ -738,7 +739,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _DSV41_LOG_LAYER_SUMS and x is not None and x.numel():
             logger.info(
                 "DSV41 PART L%d attnout sum=%.10g absmax=%.10g",
-                idx,
+                getattr(self, "_dsv41_layer_id", -1),
                 float(x.detach().float().sum()),
                 float(x.detach().float().abs().max()),
             )
