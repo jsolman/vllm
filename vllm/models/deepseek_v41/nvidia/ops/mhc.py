@@ -342,11 +342,15 @@ def mhc_shifted_post_pre(
             norm_weight=norm_weight,
             norm_eps=norm_eps,
         )
+        # the tilelang path returns (residual_cur, post_mix, comb_mix,
+        # layer_input, next_pre_mix, aux); the torch one has no
+        # next_pre_mix, so it reuses post_mix.
+        _res, _post, _comb, _layer_input = _out
         if capture_aux:
-            _aux = _out[0].mean(dim=1)
+            _aux = _res.mean(dim=1)
         else:
-            _aux = _out[0].new_empty(0, _out[0].shape[-1])
-        return (*_out, _aux)
+            _aux = _res.new_empty(0, _res.shape[-1])
+        return (_res, _post, _comb, _layer_input, _post, _aux)
 
     return mhc_fused_post_pre_delayed_tilelang(
         x,
