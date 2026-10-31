@@ -239,12 +239,10 @@ def _sort_topk_rows(out: torch.Tensor, k: int) -> None:
     rows = out.shape[0]
     if rows == 0:
         return
-    # the number of valid entries per row
-    valid = (out >= 0).sum(dim=1)                     # [rows]
-    if int(valid.min()) == k and int(valid.max()) == k:
-        # every row is full: sort the whole row
-        out.sort(dim=1)
-        return
+    # NOTE: torch.sort() is BROKEN in this build (it does not sort, on
+    # CUDA or CPU, for any dtype - a simple [[5,3,9,1]] comes back
+    # unchanged). torch.argsort() works, so use that.
+    #
     # A ragged sort: the -1 padding must stay at the END. Replace the
     # padding with a large sentinel, sort ascending (stable, so the
     # valid entries keep their relative order among equal values), then
@@ -252,8 +250,9 @@ def _sort_topk_rows(out: torch.Tensor, k: int) -> None:
     big = torch.iinfo(torch.int32).max
     padded = torch.where(out >= 0, out, torch.full_like(out, big))
     order = torch.argsort(padded.to(torch.int64), dim=1, stable=True)
-    out.copy_(torch.gather(padded, 1, order))
-    out.copy_(torch.where(out == big, torch.full_like(out, -1), out))
+    sorted_rows = torch.gather(padded, 1, order)
+    out.copy_(torch.where(sorted_rows == big, torch.full_like(out, -1),
+                          sorted_rows))
 
 
 def _topk(
