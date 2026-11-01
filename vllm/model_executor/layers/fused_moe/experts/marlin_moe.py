@@ -360,6 +360,21 @@ def fused_marlin_moe(
         ignore_invalid_experts=True,
     )
     if _DSV41_LOG_ALIGN:
+        # The ROUTING WEIGHTS, as the GEMM applies them: topk_weights is
+        # indexed by the SLOT (token * top_k + slot), and the align
+        # decides which expert is in which slot. So this hashes BOTH the
+        # weights and the token->slot->expert mapping.
+        _tw = topk_weights.detach().float()
+        _st0 = sorted_token_ids.detach().to(torch.int64)
+        logger.warning(
+            "DSV41 RW n=%d w_hash=%d st_map_hash=%d first_w=%s "
+            "first_st=%s",
+            int(_tw.numel()),
+            hash(tuple(_tw[:64].tolist())),
+            hash(tuple((_st0[:64] // 6).tolist())),
+            [round(float(x), 6) for x in _tw[:6].tolist()],
+            _st0[:6].tolist(),
+        )
         # Debug: the align's slot assignment. The align hands out slots
         # with atomicAdd, so the ORDER of the tokens within a block is
         # NOT deterministic. The expert GEMM then reduces over that
