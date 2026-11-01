@@ -1555,6 +1555,22 @@ class DeepseekV4Indexer(nn.Module):
             self.compress_ratio,
             self.use_fp4_kv,
         )
+        if _dsv41_flag("VLLM_DSV41_LOG_CACHE"):
+            # Debug: the INDEXER's K cache after the write. The decode's
+            # indexer scores against THIS cache (not the compressed
+            # cache), and it is a separate buffer, so the compressed-
+            # and SWA-cache probes do not cover it. The rows at the
+            # non-boundary tokens hold garbage (the store kernel skips
+            # them), so the hash covers only the first rows.
+            _ik = self.k_cache.kv_cache.detach()
+            _iflat = _ik.reshape(_ik.shape[0], -1)
+            _in = min(64, _iflat.shape[0])
+            logger.warning(
+                "DSV41 IKACHE shape=%s sum=%.10g hash=%d",
+                tuple(_ik.shape),
+                float(_iflat[:_in].float().sum()),
+                hash(tuple(_iflat[:_in, :16].float().reshape(-1).tolist())),
+            )
 
     def forward_q(
         self,
