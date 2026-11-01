@@ -442,6 +442,17 @@ def fused_marlin_moe(
     if output is None:
         output = torch.empty_like(hidden_states)
 
+    if _DSV41_LOG_ALIGN:
+        # The SECOND GEMM's output (the moe_output, before moe_sum):
+        # one row per (token, slot). If this is identical and the
+        # final output differs, the divergence is in moe_sum.
+        _mo = output.detach().float()
+        logger.warning(
+            "DSV41 MOUT n=%d sum=%.10g absmax=%.10g hash=%d",
+            int(_mo.numel()), float(_mo.sum()), float(_mo.abs().amax()),
+            hash(tuple(_mo.reshape(-1)[:64].tolist())),
+        )
+
     if moe_sum is None:
         if expert_map is not None:
             ops.moe_sum(moe_output, output, topk_ids, expert_map)
