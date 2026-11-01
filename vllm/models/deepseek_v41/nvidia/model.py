@@ -1876,6 +1876,18 @@ class DeepseekV41LLMForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
+        if _DSV41_LOG_LAYER_SUMS and logits is not None and logits.numel():
+            # Debug: the LOGITS' checksum. The per-layer probe covers the
+            # layers, but NOT the final norm or the LM head - so a
+            # divergence there would be invisible to it and visible in
+            # the sampled token.
+            v = logits.detach().float()
+            logger.warning(
+                "DSV41 LOGITS sum=%.10g absmax=%.10g hash=%d",
+                float(v.sum()),
+                float(v.abs().max()),
+                hash(tuple(v.reshape(-1)[:64].tolist())),
+            )
         return logits
 
     def compute_logits_local(
