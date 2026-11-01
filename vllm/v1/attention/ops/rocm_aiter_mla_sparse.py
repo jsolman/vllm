@@ -34,6 +34,29 @@ else:
 
 logger = init_logger(__name__)
 
+
+def _dsv41_flag(name: str) -> bool:
+    """Read a debug flag from the env OR from /tmp/dsv41-flags.
+
+    The flags file is the belt-and-braces channel: it works even when a
+    flag is missing from one of the launcher's env blocks, and it is
+    read at CALL time, so a flag can be turned on without a restart
+    (a restart with a heavy probe can stall the startup's shared-memory
+    broadcast).
+    """
+    if os.environ.get(name, "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            for line in f:
+                if line.strip() == name:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+
 FP8_DTYPE = current_platform.fp8_dtype()
 
 
@@ -1466,7 +1489,8 @@ def rocm_aiter_sparse_attn_indexer(
             )
             if _DSV41_CANONICAL_TOPK:
                 _sort_topk_rows(topk_indices)
-            if _DSV41_LOG_DECODE_SELECTION and _decsel_count < 24:
+            if _dsv41_flag("VLLM_DSV41_LOG_DECODE_SELECTION") and \
+                    _decsel_count < 24:
                 # Debug: the decode selection's SET (not its order). The
                 # compiled top-k breaks the exactly-tied candidates by
                 # the thread arrival order, so the SET can differ between
