@@ -4321,6 +4321,21 @@ def _rocm_sparse_attn_decode_ragged_triton(
             if _forced >= 1:
                 num_splits = _forced
 
+    if os.environ.get("VLLM_DSV41_LOG_DECODE_SPLITS", "0") == "1":
+        # Debug: the decode's split count and the selection's size.
+        # The split count depends on main_indices.numel() (the number of
+        # selected positions), and a different split count is a
+        # different accumulation order in the decode's split-K
+        # reduction - so a selection whose SIZE varies would change the
+        # result.
+        import logging as _logging
+        _logging.getLogger("vllm").warning(
+            "DSV41 DSPLITS q=%d main=%d extra=%d splits=%d",
+            int(num_queries), int(main_indices.numel()),
+            int(extra_indices.numel()) if has_extra else 0,
+            int(num_splits),
+        )
+
     base_workgroups = num_queries * heads_blocks
     adaptive_splits = (
         _ON_GFX950 and adaptive_splits and base_workgroups >= 16 and num_splits > 4
