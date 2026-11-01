@@ -1297,8 +1297,27 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # mixes — the mix the reference applies via
         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
         assert pre_mix is not None
+        if _DSV41_LOG_LAYER_SUMS and hidden_states is not None:
+            # Debug: the COLLAPSED and NORMALISED hidden states - the
+            # last steps before the LM head, which the per-layer probe
+            # does NOT cover (it stops at the layer boundary).
+            _hc = hidden_states.detach().float()
+            logger.warning(
+                "DSV41 COLLAPSE sum=%.10g absmax=%.10g hash=%d",
+                float(_hc.sum()),
+                float(_hc.abs().max()),
+                hash(tuple(_hc.reshape(-1)[:64].tolist())),
+            )
         hidden_states = hc_collapse_triton(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
+        if _DSV41_LOG_LAYER_SUMS and hidden_states is not None:
+            _hn = hidden_states.detach().float()
+            logger.warning(
+                "DSV41 FINALNORM sum=%.10g absmax=%.10g hash=%d",
+                float(_hn.sum()),
+                float(_hn.abs().max()),
+                hash(tuple(_hn.reshape(-1)[:64].tolist())),
+            )
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
