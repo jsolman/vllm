@@ -182,6 +182,22 @@ def _resolve_dsv4_kv_cache_dtype(
     return kv_cache_dtype, torch.bfloat16
 
 
+def _dsv41_swa_replay_supported() -> bool:
+    """Whether this platform's sparse prefill kernel clamps the SWA window.
+
+    The decoder SWA bounded replay relies on a window clamp inside the
+    prefill kernel: the replayed layers read the SWA cache beyond the
+    window, and the clamp is what keeps them inside it. The clamp lives
+    in the FlashInfer and FlashMLA prefill kernels. On the platforms whose
+    sparse attention is served by the Triton sparse path (SM110 / Thor),
+    the clamp is absent, so the replay reads uninitialised slots: the
+    residual then grows without bound over the replayed layers and the
+    run-to-run blow-up is random in magnitude.
+    """
+    # The Triton sparse path serves the attention on SM110 (Thor).
+    return current_platform.get_device_capability()[0] < 11
+
+
 class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     """DeepseekV4 MLA attention layer.
 
@@ -560,6 +576,25 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 "it relies on lives in the FlashInfer and FlashMLA prefill "
                 "kernels, so the padded slots fault); the sliding-window cache "
                 "takes part in prefix caching instead."
+            )
+            swa_bounded_replay = False
+        # The decoder SWA bounded replay needs the window clamp that lives in
+        # the FlashInfer / FlashMLA prefill kernels. On the platforms whose
+        # sparse attention is served by a different kernel (the Triton sparse
+        # path on SM110), that clamp is absent, so the replayed layers read
+        # the padded slots of the SWA cache. The result is a residual that
+        # grows without bound over the replayed layers (measured: the
+        # residual's absmax reached 3.2e5, a 200,000x growth, on a long
+        # prompt) and a run-to-run blow-up whose magnitude is random.
+        # The replay stays off on those platforms; the sliding-window cache
+        # takes part in prefix caching instead.
+        if swa_bounded_replay and not _dsv41_swa_replay_supported():
+            logger.warning_once(
+                "Decoder SWA bounded replay is off on this platform (the "
+                "window clamp it relies on lives in the FlashInfer and "
+                "FlashMLA prefill kernels, which this platform's sparse "
+                "attention does not use); the sliding-window cache takes "
+                "part in prefix caching instead."
             )
             swa_bounded_replay = False
         self.swa_cache_layer = DeepseekV4SWACache(
