@@ -1429,6 +1429,23 @@ def rocm_aiter_sparse_attn_indexer(
             if visible.numel() != num_rows:
                 visible = visible.repeat_interleave(next_n)
             visible = visible[:num_rows].to(torch.int64)
+            # The candidate selection scores the COMPRESSED positions (the
+            # logits are over the compressed KV), so the row ends must be
+            # in COMPRESSED units. The prefill passes the chunk's
+            # cu_seqlen_ks/ke, which are the compressed lengths
+            # (compressed_seq_lens_cpu); the decode was passing the
+            # TOKEN length, which is compress_ratio times too large.
+            #
+            # The effect: the scoring ran past the valid compressed
+            # region, into the unwritten tail of the compressed cache.
+            # Those slots hold uninitialized memory, so the block scores
+            # come out NaN (the score kernel propagates NaN), and a
+            # torch.topk over NaN-containing scores has an
+            # implementation-defined order - so the candidate selection
+            # differed between two runs of the same request. The decode
+            # then read a different set of candidate blocks.
+            visible = torch.div(visible, compress_ratio,
+                                rounding_mode="floor")
             row_starts = torch.zeros_like(visible)
             decode_candidates = candidate_blocks[:num_rows]
             if candidate_write:
