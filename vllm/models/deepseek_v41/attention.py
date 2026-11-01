@@ -1188,6 +1188,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 not self.accepts_unnormed_unroped_query,  # apply_q_rope
                 self.accepts_unnormed_unroped_query,  # is_q_interleaved
             )
+            if _dsv41_flag("VLLM_DSV41_LOG_CACHE"):
+                # Debug: the SWA CACHE's contents after the write (the
+                # decode reads it). The per-layer probe covers the
+                # hidden states, not the cache.
+                _k = swa_kv_cache.detach()
+                _flat = _k.reshape(_k.shape[0], -1)
+                _n = min(64, _flat.shape[0])
+                logger.warning(
+                    "DSV41 SWACACHE shape=%s sum=%.10g hash=%d",
+                    tuple(_k.shape),
+                    float(_flat[:_n].float().sum()),
+                    hash(tuple(_flat[:_n, :16].float().reshape(-1).tolist())),
+                )
             return q if pad_to == 0 else q_padded
 
         assert not self.accepts_unnormed_unroped_query, (
