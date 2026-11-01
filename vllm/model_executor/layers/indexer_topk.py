@@ -10,6 +10,7 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.config import get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -153,6 +154,11 @@ def get_indexer_topk(backend: str) -> "SparseIndexerTopk":
 #
 # The -1 padding must stay at the END, so only the valid prefix is
 # sorted.
+logger = init_logger(__name__)
+
+_DSV41_LOG_DECODE_SELECTION = os.environ.get(
+    "VLLM_DSV41_LOG_DECODE_SELECTION", "0"
+) == "1"
 _DSV41_CANONICAL_TOPK = os.environ.get("VLLM_DSV41_CANONICAL_TOPK", "1") == "1"
 
 
@@ -458,3 +464,17 @@ class SparseIndexerTopk(torch.nn.Module):
         # costs nothing and makes the reduction deterministic.
         if _DSV41_CANONICAL_TOPK:
             _sort_topk_rows(topk_indices)
+        if _DSV41_LOG_DECODE_SELECTION:
+            # Debug: the decode selection's SET (not its order). The
+            # compiled top-k breaks the exactly-tied candidates by the
+            # thread arrival order, so the SET can differ between two
+            # runs - and the attention would then read a different
+            # context. The set hash is order-independent.
+            _sel = topk_indices.detach().to(torch.int64)
+            _valid = _sel[_sel >= 0]
+            logger.warning(
+                "DSV41 DECSEL n=%d sum=%d hash=%d",
+                int(_valid.numel()),
+                int(_valid.sum()),
+                hash(tuple(sorted(_valid.tolist()))),
+            )
