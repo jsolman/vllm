@@ -1894,7 +1894,16 @@ class DeepseekV41LLMForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+        logits = self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+        if _DSV41_LOG_LAYER_SUMS and logits is not None and logits.numel():
+            v = logits.detach().float()
+            logger.warning(
+                "DSV41 LOGITSL sum=%.10g absmax=%.10g hash=%d",
+                float(v.sum()),
+                float(v.abs().max()),
+                hash(tuple(v.reshape(-1)[:64].tolist())),
+            )
+        return logits
 
     @staticmethod
     def get_model_state_cls():
