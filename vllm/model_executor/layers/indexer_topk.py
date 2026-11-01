@@ -156,6 +156,9 @@ def get_indexer_topk(backend: str) -> "SparseIndexerTopk":
 # sorted.
 logger = init_logger(__name__)
 
+# The decode selection probe's budget (the probe floods the log pipe).
+_decsel_count = 0
+
 _DSV41_LOG_DECODE_SELECTION = os.environ.get(
     "VLLM_DSV41_LOG_DECODE_SELECTION", "0"
 ) == "1"
@@ -438,6 +441,26 @@ class SparseIndexerTopk(torch.nn.Module):
             assert backend == "per_row", f"unknown topk backend: {backend}"
             self._per_row(logits, seq_lens, next_n, topk_indices, topk_tokens)
 
+        if _DSV41_LOG_DECODE_SELECTION and _decsel_count < 24:
+            # Debug: the decode selection's SET (not its order). The
+            # compiled top-k breaks the exactly-tied candidates by the
+            # thread arrival order, so the SET can differ between two
+            # runs - and the attention would then read a different
+            # context. The set hash is order-independent.
+            #
+            # The probe is bounded: one line per decode step floods the
+            # worker's log pipe, and the startup's shared-memory
+            # broadcast then times out (the engine never comes up).
+            _decsel_count += 1
+            _sel = topk_indices.detach().to(torch.int64)
+            _valid = _sel[_sel >= 0]
+            logger.warning(
+                "DSV41 DECSEL n=%d sum=%d hash=%d",
+                int(_valid.numel()),
+                int(_valid.sum()),
+                hash(tuple(sorted(_valid.tolist()))),
+            )
+
     @staticmethod
     def _per_row(
         logits: torch.Tensor,
@@ -464,17 +487,4 @@ class SparseIndexerTopk(torch.nn.Module):
         # costs nothing and makes the reduction deterministic.
         if _DSV41_CANONICAL_TOPK:
             _sort_topk_rows(topk_indices)
-        if _DSV41_LOG_DECODE_SELECTION:
-            # Debug: the decode selection's SET (not its order). The
-            # compiled top-k breaks the exactly-tied candidates by the
-            # thread arrival order, so the SET can differ between two
-            # runs - and the attention would then read a different
-            # context. The set hash is order-independent.
-            _sel = topk_indices.detach().to(torch.int64)
-            _valid = _sel[_sel >= 0]
-            logger.warning(
-                "DSV41 DECSEL n=%d sum=%d hash=%d",
-                int(_valid.numel()),
-                int(_valid.sum()),
-                hash(tuple(sorted(_valid.tolist()))),
-            )
+

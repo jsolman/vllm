@@ -50,6 +50,11 @@ FP8_DTYPE = current_platform.fp8_dtype()
 #
 # The -1 padding must stay at the END, so only the valid prefix is
 # sorted.
+_DSV41_LOG_DECODE_SELECTION = os.environ.get(
+    "VLLM_DSV41_LOG_DECODE_SELECTION", "0"
+) == "1"
+# The decode selection probe's budget (the probe floods the log pipe).
+_decsel_count = 0
 _DSV41_CANONICAL_TOPK = os.environ.get("VLLM_DSV41_CANONICAL_TOPK", "1") == "1"
 
 
@@ -1461,6 +1466,25 @@ def rocm_aiter_sparse_attn_indexer(
             )
             if _DSV41_CANONICAL_TOPK:
                 _sort_topk_rows(topk_indices)
+            if _DSV41_LOG_DECODE_SELECTION and _decsel_count < 24:
+                # Debug: the decode selection's SET (not its order). The
+                # compiled top-k breaks the exactly-tied candidates by
+                # the thread arrival order, so the SET can differ between
+                # two runs - and the attention would then read a
+                # different context.
+                #
+                # The probe is bounded: one line per decode step floods
+                # the worker's log pipe, and the startup's shared-memory
+                # broadcast then times out (the engine never comes up).
+                _decsel_count += 1
+                _sel = topk_indices.detach().to(torch.int64)
+                _valid = _sel[_sel >= 0]
+                logger.warning(
+                    "DSV41 DECSEL n=%d sum=%d hash=%d",
+                    int(_valid.numel()),
+                    int(_valid.sum()),
+                    hash(tuple(sorted(_valid.tolist()))),
+                )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
