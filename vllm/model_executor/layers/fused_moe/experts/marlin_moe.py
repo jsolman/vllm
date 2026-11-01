@@ -198,6 +198,18 @@ def _fused_marlin_moe(
             intermediate_cache2, input_dtype
         )
 
+    if _DSV41_LOG_ALIGN:
+        # The intermediate cache (the first GEMM's output, before the
+        # second GEMM reduces over the intermediate dim). If THIS is
+        # identical and the final output differs, the divergence is in
+        # the SECOND GEMM's reduction; if it differs, it is in the
+        # first.
+        _ic = intermediate_cache2.detach().float()
+        logger.warning(
+            "DSV41 ICACHE n=%d sum=%.10g absmax=%.10g hash=%d",
+            int(_ic.numel()), float(_ic.sum()), float(_ic.abs().amax()),
+            hash(tuple(_ic.reshape(-1)[:64].tolist())),
+        )
     output = ops.moe_wna16_marlin_gemm(
         intermediate_cache2,
         output,
