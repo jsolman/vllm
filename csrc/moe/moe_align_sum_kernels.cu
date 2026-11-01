@@ -344,9 +344,124 @@ __device__ void _count_and_sort_expert_tokens(
     int32_t* __restrict__ expert_map, size_t numel, int32_t num_experts,
     int32_t max_num_tokens_padded, int32_t* __restrict__ token_mask,
     int32_t model_offset, int32_t topk_num, bool has_expert_map,
-    int32_t* scatter_idx = nullptr) {
+    int32_t* scatter_idx = nullptr, int32_t* block_counts = nullptr) {
   const size_t tid = blockIdx.y * blockDim.x + threadIdx.x;
   const size_t stride = blockDim.x * gridDim.y;
+
+  // DETERMINISTIC SCATTER.
+  //
+  // The position of an entry within its expert's bucket used to come
+  // from an atomicAdd, so it depended on the thread ARRIVAL order: two
+  // runs on the same routing produced the same SET of entries but in a
+  // different ORDER within each bucket.
+  //
+  // The order is not semantically meaningful, but the Marlin kernel
+  // assigns a block's ROWS to the threads BY POSITION
+  // (sh_rd_block_sorted_ids[threadIdx.x] = idx / top_k), so a
+  // different order means a different token->thread map and therefore a
+  // different order for the cross-thread reduction - the same
+  // summation in a different order, which in BF16 is a different
+  // result.
+  //
+  // The position is now a function of the entry's INDEX alone:
+  //
+  //     pos = <the number of the expert's entries in the blocks before
+  //            this one>
+  //         + <the entry's rank by index among this block's entries for
+  //            that expert>
+  //
+  // For that, the blocks must own CONTIGUOUS ranges of the flattened
+  // (token, slot) array (so that the blocks partition it in index
+  // order), and each block must publish its per-expert counts so that
+  // the later blocks can compute their exclusive base.
+  //
+  // The per-block counts are published in block_counts
+  // ([gridDim.y][num_experts]); the exclusive base of a block is the
+  // sum of the counts of the blocks before it.
+  //
+  // The rank WITHIN the block is computed by an ordered walk over the
+  // block's range: the range is walked in ascending index order, so a
+  // running per-expert counter IS the rank. The walk is done in CHUNKS
+  // (the block's range can be large, so a per-entry rank table would
+  // not fit in shared memory); each chunk's ranks are relative to the
+  // chunk, and the chunk's per-expert bases are accumulated across the
+  // chunks in order.
+  if (block_counts != nullptr) {
+    // The block's contiguous range.
+    const size_t blk_begin = (numel * blockIdx.y) / gridDim.y;
+    const size_t blk_end = (numel * (blockIdx.y + 1)) / gridDim.y;
+
+    // The chunked ordered pass. The per-expert base, the running
+    // per-expert count and the per-entry rank of the current chunk live
+    // in shared memory. The chunk is small enough for that.
+    constexpr int32_t kChunk = 256;
+    constexpr int32_t kMaxExperts = 1024;
+    __shared__ int32_t sh_base[kMaxExperts];
+    __shared__ int32_t sh_counts[kMaxExperts];
+    __shared__ int32_t sh_rank[kChunk];
+
+    // The block's exclusive base per expert.
+    //
+    // cumsum_buffer holds the PADDED start offset of each expert's
+    // bucket (the counting kernel's exclusive prefix scan), and the
+    // position within the bucket is the count of the expert's entries
+    // in the blocks BEFORE this one. So the base is the padded start
+    // plus the preceding blocks' counts.
+    for (int32_t e = threadIdx.x; e < num_experts; e += blockDim.x) {
+      int32_t base = cumsum_buffer[(model_offset * (num_experts + 1)) + e];
+      for (uint32_t b = 0; b < blockIdx.y; b++) {
+        base += block_counts[(size_t)b * num_experts + e];
+      }
+      sh_base[e] = base;
+      sh_counts[e] = 0;
+    }
+    __syncthreads();
+
+    for (size_t chunk = blk_begin; chunk < blk_end; chunk += kChunk) {
+      const size_t chunk_end = min(chunk + (size_t)kChunk, blk_end);
+      // The ordered walk: the rank of each entry of the chunk, in index
+      // order.
+      //
+      // This MUST be a strictly serial walk over the chunk: the rank of
+      // an entry is the number of the expert's entries with a SMALLER
+      // index, so the walk has to visit the entries in index order and
+      // the per-expert counter must be advanced one at a time. A warp
+      // with a stride of 32 would advance the counter concurrently, so
+      // the ranks would be arrival-ordered again (and the counts would
+      // be wrong).
+      //
+      // The chunk is 256 entries, so the serial walk is short. It runs
+      // on one thread while the others wait at the barrier.
+      if (threadIdx.x == 0) {
+        for (size_t i = chunk; i < chunk_end; i++) {
+          int expert_id = get_local_expert_id(i, topk_ids, expert_map,
+                                              num_experts, has_expert_map);
+          bool valid = expert_id != -1 &&
+                       (token_mask == nullptr || token_mask[i / topk_num]);
+          if (valid) {
+            sh_rank[i - chunk] = sh_counts[expert_id]++;
+          }
+        }
+      }
+      __syncthreads();
+      // The scatter of the chunk.
+      for (size_t i = chunk + threadIdx.x; i < chunk_end; i += blockDim.x) {
+        int expert_id = get_local_expert_id(i, topk_ids, expert_map,
+                                            num_experts, has_expert_map);
+        bool valid =
+            expert_id != -1 && (token_mask == nullptr || token_mask[i / topk_num]);
+        if (scatter_idx != nullptr) {
+          scatter_idx[i] = valid ? static_cast<int32_t>(i) : -1;
+        }
+        if (valid) {
+          const int32_t pos = sh_base[expert_id] + sh_rank[i - chunk];
+          sorted_token_ids[max_num_tokens_padded * model_offset + pos] = i;
+        }
+      }
+      __syncthreads();
+    }
+    return;
+  }
 
   for (size_t i = tid; i < numel; i += stride) {
     int expert_id = get_local_expert_id(i, topk_ids, expert_map, num_experts,
@@ -383,16 +498,42 @@ __global__ void moe_align_block_size_kernel(
       0, -1, topk_num, nullptr, has_expert_map);
 }
 
+// The per-block per-expert counts, for the deterministic scatter.
+//
+// Each block owns a CONTIGUOUS range of the flattened (token, slot)
+// array (the same range the scatter uses), and counts the entries of
+// each expert in it. The scatter then adds up the counts of the blocks
+// before it to get its exclusive base.
+template <typename scalar_t>
+__global__ void count_expert_tokens_per_block_kernel(
+    const scalar_t* __restrict__ topk_ids, int32_t* __restrict__ block_counts,
+    int32_t* __restrict__ expert_map, size_t numel, int32_t num_experts,
+    int32_t topk_num, bool has_expert_map) {
+  const size_t blk_begin = (numel * blockIdx.y) / gridDim.y;
+  const size_t blk_end = (numel * (blockIdx.y + 1)) / gridDim.y;
+  for (int32_t e = threadIdx.x; e < num_experts; e += blockDim.x)
+    block_counts[(size_t)blockIdx.y * num_experts + e] = 0;
+  __syncthreads();
+  for (size_t i = blk_begin + threadIdx.x; i < blk_end; i += blockDim.x) {
+    int expert_id = get_local_expert_id(i, topk_ids, expert_map, num_experts,
+                                        has_expert_map);
+    if (expert_id != -1) {
+      atomicAdd(&block_counts[(size_t)blockIdx.y * num_experts + expert_id], 1);
+    }
+  }
+}
+
 template <typename scalar_t>
 __global__ void count_and_sort_expert_tokens_kernel(
     const scalar_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ cumsum_buffer,
     int32_t* __restrict__ expert_map, size_t numel, int32_t num_experts,
     int32_t max_num_tokens_padded, int32_t topk_num, bool has_expert_map,
-    int32_t* scatter_idx) {
+    int32_t* scatter_idx, int32_t* block_counts) {
   _count_and_sort_expert_tokens(
       topk_ids, sorted_token_ids, cumsum_buffer, expert_map, numel, num_experts,
-      max_num_tokens_padded, nullptr, 0, topk_num, has_expert_map, scatter_idx);
+      max_num_tokens_padded, nullptr, 0, topk_num, has_expert_map, scatter_idx,
+      block_counts);
 }
 
 // Reduce the topk expert outputs per token (summed in fp32). The output is
@@ -773,15 +914,37 @@ void moe_align_block_size(torch::stable::Tensor topk_ids, int64_t num_experts,
           const int actual_blocks = std::min(num_blocks, max_blocks);
           dim3 gridDims(1, actual_blocks);
 
+          // The deterministic scatter needs the per-block per-expert
+          // counts: the exclusive base of a block is the sum of the
+          // counts of the blocks before it.
+          torch::stable::Tensor block_counts = torch::stable::new_empty(
+              topk_ids, {(long long)actual_blocks * num_experts},
+              torch::headeronly::ScalarType::Int);
+
+          auto count_kernel =
+              vllm::moe::count_expert_tokens_per_block_kernel<scalar_t>;
+          count_kernel<<<gridDims, block_threads, 0, stream>>>(
+              reinterpret_cast<const scalar_t*>(topk_ids.const_data_ptr()),
+              reinterpret_cast<int32_t*>(block_counts.mutable_data_ptr()),
+              reinterpret_cast<int32_t*>(expert_map.mutable_data_ptr()),
+              topk_ids.numel(), num_experts, topk_ids.size(1),
+              has_expert_map);
+
+          // The scatter's shared memory is STATIC (the per-expert base
+          // and the running count [1024 each] + the chunk's per-entry
+          // rank [256]), so the dynamic size is 0.
+          const size_t sort_smem_size = 0;
+
           auto sort_kernel =
               vllm::moe::count_and_sort_expert_tokens_kernel<scalar_t>;
-          sort_kernel<<<gridDims, block_threads, 0, stream>>>(
+          sort_kernel<<<gridDims, block_threads, sort_smem_size, stream>>>(
               reinterpret_cast<const scalar_t*>(topk_ids.const_data_ptr()),
               reinterpret_cast<int32_t*>(sorted_token_ids.mutable_data_ptr()),
               reinterpret_cast<int32_t*>(cumsum_buffer.mutable_data_ptr()),
               reinterpret_cast<int32_t*>(expert_map.mutable_data_ptr()),
               topk_ids.numel(), num_experts, sorted_token_ids.size(0),
-              topk_ids.size(1), has_expert_map, scatter_ptr);
+              topk_ids.size(1), has_expert_map, scatter_ptr,
+              reinterpret_cast<int32_t*>(block_counts.mutable_data_ptr()));
         }
       });
 }
