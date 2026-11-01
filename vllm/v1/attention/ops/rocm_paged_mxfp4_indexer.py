@@ -301,6 +301,9 @@ def _topk(
     rows, width = logits.shape
     if rows == 0:
         return
+    if os.environ.get("VLLM_DSV41_TRACE_TOPK", "0") == "1":
+        logger.warning(
+            "DSV41 TOPKCALL rows=%d width=%d k=%d", rows, width, k)
     if _DSV41_LOG_TOPK:
         # Debug: the logits the top-k sees, and the selection it
         # produces, for the FIRST row. This is the live prefill path
