@@ -30,6 +30,12 @@ from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
 logger = init_logger(__name__)
 _DSV41_LOG_ALIGN = os.environ.get("VLLM_DSV41_LOG_ALIGN", "0") == "1"
 
+# Canonicalise the expert slot order (see the align call). On by
+# default: the align's nondeterministic slot order makes moe_sum's
+# reduction order vary between runs.
+_DSV41_CANONICAL_EXPERTS = (
+    os.environ.get("VLLM_DSV41_CANONICAL_EXPERTS", "1") == "1")
+
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     batched_moe_align_block_size,
     moe_align_block_size,
@@ -363,6 +369,25 @@ def fused_marlin_moe(
 
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
+
+    if _DSV41_CANONICAL_EXPERTS and topk_ids.numel():
+        # CANONICALISE THE EXPERT SLOT ORDER.
+        #
+        # moe_sum reduces a token's top-k experts in SLOT ORDER:
+        #     for k in 0..topk-1: acc += in_tok[k]
+        # and the align assigns the slots with atomicAdd, so the ORDER
+        # of a token's experts within its slots differs between runs.
+        # FP addition is not associative, so a different summation order
+        # gives a different result - a ~1e-7 relative perturbation that
+        # 40 layers amplify into a ~0.5-nat difference in the logits.
+        #
+        # Sorting each token's experts by expert id makes the slot
+        # order canonical. The routing WEIGHTS are indexed by the slot,
+        # so they must be permuted to match.
+        _order = torch.argsort(topk_ids.to(torch.int64), dim=1, stable=True)
+        topk_ids = torch.gather(topk_ids, 1, _order)
+        if topk_weights.shape == topk_ids.shape:
+            topk_weights = torch.gather(topk_weights, 1, _order)
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids,
