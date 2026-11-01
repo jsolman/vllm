@@ -70,6 +70,27 @@ from vllm.v1.worker.workspace import current_workspace_manager
 logger = init_logger(__name__)
 
 
+def _dsv41_flag(name: str) -> bool:
+    """Read a debug flag from the env OR from /tmp/dsv41-flags.
+
+    The flags file is read at CALL time, so a flag can be turned on
+    without a restart (a restart with a heavy probe can stall the
+    startup's shared-memory broadcast).
+    """
+    if os.environ.get(name, "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            for line in f:
+                if line.strip() == name:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+
+
 def _trust_dsv4_extra_cache_nan_free(
     kv_cache_dtype: str,
     has_kv_transfer: bool,
@@ -1360,6 +1381,19 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                     topk_ragged_indptr,
                     q.shape[0],
                 )
+            if _dsv41_flag("VLLM_DSV41_LOG_DECODE_Q"):
+                # Debug: the decode's QUERY and its ATTENTION OUTPUT. These are
+                # the steps between the cache read and the layer output that no
+                # other probe covers: the q norm, the RoPE and the FP8
+                # quantization of q, and the output projection.
+                _q = q.detach()
+                _qf = _q.reshape(_q.shape[0], -1)
+                _n = min(32, _qf.shape[0])
+                logger.warning(
+                    "DSV41 DQ qsum=%.10g qhash=%d",
+                    float(_qf[:_n].float().sum()),
+                    hash(tuple(_qf[:_n, :16].float().reshape(-1).tolist())),
+                )
             out = tilelang_sparse_attn_decode(
                 q=q,
                 swa_k_cache=self.swa_cache_layer.kv_cache,
@@ -1447,6 +1481,20 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             # produces garbage output).
             return q.shape[0]
 
+        if _dsv41_flag("VLLM_DSV41_LOG_DECODE_Q"):
+            # Debug: the decode's QUERY. This is the step between the
+            # cache read and the attention output that no other probe
+            # covers: the q norm, the RoPE and the FP8 quantization of
+            # q (which the fused Q+KV op does together with the KV
+            # write).
+            _q = q.detach()
+            _qf = _q.reshape(_q.shape[0], -1)
+            _qn = min(32, _qf.shape[0])
+            logger.warning(
+                "DSV41 DQ qsum=%.10g qhash=%d",
+                float(_qf[:_qn].float().sum()),
+                hash(tuple(_qf[:_qn, :16].float().reshape(-1).tolist())),
+            )
         return rocm_sparse_attn_decode(
             q=q,
             kv_cache=kv_cache,
