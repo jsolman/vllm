@@ -90,8 +90,14 @@ def _sort_topk_rows(out: torch.Tensor) -> None:
         return
     valid = (out >= 0).sum(dim=1)
     if int(valid.min()) == out.shape[1] and int(valid.max()) == out.shape[1]:
-        # every row is full: sort the whole row
-        out.sort(dim=1)
+        # Every row is full: sort the whole row.
+        #
+        # NOTE: the IN-PLACE sort (out.sort(dim=1)) is BROKEN in this
+        # build - it silently leaves the tensor unchanged for an int32
+        # CUDA tensor of this shape. The out-of-place form
+        # (torch.sort(out, dim=1).values) is correct, so use it and copy
+        # the result back.
+        out.copy_(torch.sort(out, dim=1).values)
         return
     # A ragged sort: the -1 padding must stay at the END. Replace the
     # padding with a large sentinel, sort ascending (stable, so the
