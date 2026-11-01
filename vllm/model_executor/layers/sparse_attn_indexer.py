@@ -68,6 +68,43 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
+# CANONICALISE THE TOP-K's OUTPUT ORDER.
+#
+# The compiled top-k returns the selected positions in an ARBITRARY
+# order: on the same logits, 10 runs produced 10 different orders (955
+# of 1024 positions moved). The sparse attention reduces over the
+# selected positions - the softmax denominator and the weighted sum -
+# so the reduction ORDER changes the BF16 rounding of the result. The
+# attention is order-invariant in exact arithmetic, so sorting the
+# selection ASCENDING costs nothing and makes the reduction
+# deterministic.
+#
+# The -1 padding must stay at the END, so only the valid prefix is
+# sorted.
+_DSV41_CANONICAL_TOPK = os.environ.get("VLLM_DSV41_CANONICAL_TOPK", "1") == "1"
+
+
+def _sort_topk_rows(out: torch.Tensor) -> None:
+    """Sort each row's selected positions ascending, in place."""
+    if out.numel() == 0:
+        return
+    valid = (out >= 0).sum(dim=1)
+    if int(valid.min()) == out.shape[1] and int(valid.max()) == out.shape[1]:
+        # every row is full: sort the whole row
+        out.sort(dim=1)
+        return
+    # A ragged sort: the -1 padding must stay at the END. Replace the
+    # padding with a large sentinel, sort ascending (stable, so the
+    # valid entries keep their relative order among equal values), then
+    # put the padding back.
+    big = torch.iinfo(torch.int32).max
+    padded = torch.where(out >= 0, out, torch.full_like(out, big))
+    order = torch.argsort(padded.to(torch.int64), dim=1, stable=True)
+    out.copy_(torch.gather(padded, 1, order))
+    out.copy_(torch.where(out == big, torch.full_like(out, -1), out))
+
+
+
 def _dsv41_flag(name: str) -> bool:
     """Read a debug flag from the env OR from /tmp/dsv41-flags.
 
@@ -809,6 +846,8 @@ def sparse_attn_indexer(
                     logits.stride(1),
                     topk_tokens,
                 )
+                if _DSV41_CANONICAL_TOPK:
+                    _sort_topk_rows(topk_indices)
                 if _dsv41_flag("VLLM_DSV41_LOG_TOPK"):
                     # Debug: the indexer's SCORES and the SELECTION they
                     # produce (the prefill path). The selection is the
