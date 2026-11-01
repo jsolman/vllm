@@ -370,10 +370,10 @@ def fused_marlin_moe(
             "DSV41 RW n=%d w_hash=%d st_map_hash=%d first_w=%s "
             "first_st=%s",
             int(_tw.numel()),
-            hash(tuple(_tw[:64].tolist())),
-            hash(tuple((_st0[:64] // 6).tolist())),
-            tuple(round(float(x), 6) for x in _tw[:6].tolist()),
-            tuple(_st0[:6].tolist()),
+            hash(tuple(_tw.reshape(-1)[:64].tolist())),
+            hash(tuple((_st0.reshape(-1)[:64] // 6).tolist())),
+            tuple(round(float(x), 6) for x in _tw.reshape(-1)[:6].tolist()),
+            tuple(_st0.reshape(-1)[:6].tolist()),
         )
         # Debug: the align's slot assignment. The align hands out slots
         # with atomicAdd, so the ORDER of the tokens within a block is
