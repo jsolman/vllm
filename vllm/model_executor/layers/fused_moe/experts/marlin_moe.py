@@ -388,8 +388,8 @@ def fused_marlin_moe(
             int(_st.numel()), int(block_size_m),
             hash(tuple(_st[:256].tolist())),
             hash(tuple(_ex[:64].tolist())),
-            _st[:8].tolist(),
-            _ex[:8].tolist(),
+            tuple(_st[:8].tolist()),
+            tuple(_ex[:8].tolist()),
         )
 
     assert activation is not None
