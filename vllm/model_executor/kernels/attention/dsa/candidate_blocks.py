@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 
 from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits import has_deep_select
@@ -214,6 +216,18 @@ def select_candidate_blocks(
         return
     # Keep the existing top-k tie behavior.
     top = scores.topk(min(topk_blocks, nblocks), dim=-1)
+    if os.environ.get("VLLM_DSV41_LOG_CANDIDATES", "0") == "1":
+        # Debug: the candidate selection's checksum. The candidate
+        # blocks are a LENGTH-DEPENDENT, DISCRETE selection that the
+        # decode's attention reads, and they are NOT covered by the
+        # per-layer probe (they live in their own buffer).
+        import logging as _logging
+        _logging.getLogger("vllm").warning(
+            "DSV41 CAND n=%d topk=%d sum=%.10g hash=%d",
+            int(scores.shape[0]), int(topk_blocks),
+            float(scores.float().sum()),
+            hash(tuple(top.indices[0].tolist())),
+        )
     _store_candidates_kernel[(rows, triton.cdiv(topk_blocks, 256))](
         top.values,
         top.indices,
