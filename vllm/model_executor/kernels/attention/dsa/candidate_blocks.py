@@ -214,6 +214,29 @@ def select_candidate_blocks(
     if use_deep_select:
         deep_select_topk(scores, topk_blocks, end=valid_blocks, output_idx=out)
         return
+    # MASK THE INVALID BLOCKS BEFORE THE TOP-K.
+    #
+    # The scores buffer is allocated with new_empty (UNINITIALIZED) and
+    # the score kernel writes only each row's VALID blocks (the store is
+    # masked with `blocks < num_blocks`). The top-k over
+    # min(topk_blocks, nblocks) therefore also ranks the INVALID blocks,
+    # whose values are whatever the allocator left there - so the
+    # selection depends on uninitialized memory.
+    #
+    # That is harmless in the prefill (nblocks is the row's own block
+    # count, so every block is valid) but NOT in the decode: the
+    # candidates are scored over the whole compressed region while only
+    # the first (seq_len // compress_ratio) positions are written, so
+    # most of the blocks are uninitialized. The top-k then picks an
+    # arbitrary subset of them, and the decode reads a different set of
+    # candidate blocks on every run.
+    #
+    # Masking the invalid blocks to -inf makes the selection depend only
+    # on the valid ones.
+    if not use_deep_select:
+        _arange = torch.arange(nblocks, device=scores.device)
+        _valid = _arange.unsqueeze(0) < valid_blocks.unsqueeze(1)
+        scores = scores.masked_fill(~_valid, float("-inf"))
     # Keep the existing top-k tie behavior.
     top = scores.topk(min(topk_blocks, nblocks), dim=-1)
     if os.environ.get("VLLM_DSV41_LOG_CANDIDATES", "0") == "1":
