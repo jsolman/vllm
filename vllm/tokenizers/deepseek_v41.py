@@ -88,32 +88,44 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 system["tools"] = tools
 
             thinking = bool(kwargs.get("thinking") or kwargs.get("enable_thinking"))
+            # An EXPLICIT reasoning effort implies the thinking mode: the
+            # effort prefix is only rendered in the thinking mode, so
+            # asking for an effort and getting the chat mode would
+            # silently drop it. This also matches the parser, which
+            # treats an effort other than "none" as the thinking mode
+            # (vllm/parser/deepseek_v4.py) - the tokenizer and the
+            # parser must agree, or the reasoning and the content get
+            # swapped.
             if "thinking" not in kwargs and "enable_thinking" not in kwargs:
-                # The DEFAULT thinking mode.
-                #
-                # The model's OWN reference inference defaults to the CHAT
-                # mode: inference/generate.py has
-                #   --thinking-mode type=str default="chat"
-                # and the reference's encoder renders the chat mode
-                # WITHOUT the "Reasoning Effort: N" prefix and with
-                # </think> closing the assistant turn instead of
-                # <think> opening it.
-                #
-                # The THINKING mode puts the model into a long reasoning
-                # monologue. On a tool-using prompt (an attachment block
-                # that says "use read_file on PARSED_SANDBOX_PATH") the
-                # reference deployment answers DIRECTLY and emits the
-                # tool call, while the thinking mode narrates the task
-                # and then degenerates trying to reproduce the file text
-                # it never fetched (measured: the max6gram 540 vs 7).
-                #
-                # So the default follows the reference inference. Set
-                # VLLM_DSV41_THINKING_MODE=thinking to restore the old
-                # behaviour (the thinking mode with the effort prefix).
-                _default_thinking = os.environ.get(
-                    "VLLM_DSV41_THINKING_MODE", "chat"
-                ).strip().lower() not in ("chat", "0", "false", "off")
-                thinking = _default_thinking
+                if kwargs.get("reasoning_effort") is not None:
+                    thinking = kwargs.get("reasoning_effort") != "none"
+                else:
+                    # The DEFAULT thinking mode.
+                    #
+                    # The model's OWN reference inference defaults to the
+                    # CHAT mode: inference/generate.py has
+                    #   --thinking-mode type=str default="chat"
+                    # and the reference's encoder renders the chat mode
+                    # WITHOUT the "Reasoning Effort: N" prefix and with
+                    # </think> closing the assistant turn instead of
+                    # <think> opening it.
+                    #
+                    # The THINKING mode puts the model into a long
+                    # reasoning monologue. On a tool-using prompt (an
+                    # attachment block that says "use read_file on
+                    # PARSED_SANDBOX_PATH") the reference deployment
+                    # answers DIRECTLY and emits the tool call, while
+                    # the thinking mode narrates the task and then
+                    # degenerates trying to reproduce the file text it
+                    # never fetched (measured: the max6gram 540 vs 7).
+                    #
+                    # So the default follows the reference inference. Set
+                    # VLLM_DSV41_THINKING_MODE=thinking to restore the
+                    # old behaviour (the thinking mode with the effort
+                    # prefix).
+                    thinking = os.environ.get(
+                        "VLLM_DSV41_THINKING_MODE", "chat"
+                    ).strip().lower() not in ("chat", "0", "false", "off")
             effort = kwargs.get("reasoning_effort")
             if effort == "none":
                 thinking = False
