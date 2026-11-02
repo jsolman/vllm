@@ -69,6 +69,43 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
 
 
+def _dsv41_quant_act_fp8(x: torch.Tensor) -> torch.Tensor:
+    """Quantise the activations to FP8 (per 32, UE8M0) and back to the
+    input dtype.
+
+    The reference implementation quantises the activations to FP8 for
+    every FP4-weight GEMM (the FP4 tensor cores require it), with a
+    per-32 activation scale rounded UP to a power of two (UE8M0). Marlin
+    has no W4A8-FP8 path on SM110, so our live path is W4A16 and the
+    activations would otherwise stay in BF16 - a different function from
+    the reference's.
+
+    Quantising and dequantising here reproduces the reference's INPUT to
+    the GEMM while keeping the arithmetic in BF16, so it runs on SM110.
+
+    Controlled by VLLM_DSV41_FP4_ACT_QUANT=1.
+    """
+    import os
+
+    if os.environ.get("VLLM_DSV41_FP4_ACT_QUANT", "0") != "1":
+        return x
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8,
+    )
+
+    # the per-32 group size and the UE8M0 (a power of two, rounded up)
+    # scale, matching the reference's fp8_block_size=32 and
+    # scale_fmt="ue8m0".
+    q, s = per_token_group_quant_fp8(
+        x,
+        group_size=32,
+        use_ue8m0=True,
+    )
+    # dequantise back to the input dtype
+    out = q.to(torch.float32) * s.repeat_interleave(32, dim=1)
+    return out.to(x.dtype)
+
+
 def _fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -133,6 +170,10 @@ def _fused_marlin_moe(
 
     a_scales1 = None
     gate_up_input = hidden_states
+    # The reference quantises the activations to FP8 for every FP4-weight
+    # GEMM; Marlin has no W4A8-FP8 path on SM110, so this reproduces the
+    # reference's input by quantising and dequantising.
+    gate_up_input = _dsv41_quant_act_fp8(gate_up_input)
     if input_dtype == torch.int8:
         gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
         if input_global_scale1 is not None:
