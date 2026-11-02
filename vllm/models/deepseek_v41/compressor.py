@@ -480,18 +480,26 @@ class DeepseekCompressor(nn.Module):
             fp8_scale=fp8_scale,
         )
 
-        if _DSV41_LOG_CACHE:
+        if _dsv41_flag("VLLM_DSV41_LOG_CACHE"):
             # Debug: the COMPRESSED CACHE's contents after the write.
             # The per-layer probe covers the hidden states, but NOT what
             # the prefill wrote into the cache - and the decode reads
             # the cache, so a difference there is invisible to the layer
             # probe and visible in the decode.
+            #
+            # The ABSMAX matters as much as the hash: the latent is
+            # allocated with torch.empty and the pooling writes only the
+            # group-boundary rows, so if the insert read a row that was
+            # never written, the cache would hold allocator garbage
+            # (magnitude ~1e36) - and that garbage varies run to run
+            # because the allocator hands back different memory.
             _k = kv_cache.detach()
             _flat = _k.reshape(_k.shape[0], -1)
             _n = min(64, _flat.shape[0])
             logger.warning(
-                "DSV41 CCACHE shape=%s sum=%.10g hash=%d",
+                "DSV41 CCACHE shape=%s sum=%.10g amax=%.10g hash=%d",
                 tuple(_k.shape),
                 float(_flat[:_n].float().sum()),
+                float(_flat[:_n].float().abs().max()) if _n else 0.0,
                 hash(tuple(_flat[:_n, :16].float().reshape(-1).tolist())),
             )
