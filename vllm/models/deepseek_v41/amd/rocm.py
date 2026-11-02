@@ -858,6 +858,36 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             positions,
             attn_out,
         )
+        if _dsv41_flag("VLLM_DSV41_LOG_DECODE_Q"):
+            # Debug: the attention's OUTPUT, taken here (after the
+            # attention has written into attn_out) and BEFORE the
+            # projection. With the q checksum (logged in the decode
+            # path) this brackets the attention: q in, attn_out out. If
+            # the q matches across runs and this differs, the
+            # difference is inside the attention kernel itself; if this
+            # matches, the difference is in the projection.
+            _o = attn_out
+            if isinstance(_o, torch.Tensor):
+                # The attention may have run on an AUX STREAM, so the
+                # write is not yet visible on this stream. Join
+                # before reading, or the probe sees the buffer's
+                # previous contents (zeros) instead of the result.
+                torch.cuda.current_stream().synchronize()
+                _of = _o.detach().reshape(_o.shape[0], -1)
+                # Report the first row separately: in a decode-only step
+                # the attention writes only output[:num_decode_tokens],
+                # so the tail rows are stale and would swamp the sum.
+                _r0 = _of[:1].float()
+                logger.warning(
+                    "DSV41 AOUT shape=%s sum=%.10g amax=%.10g "
+                    "row0_sum=%.10g row0_amax=%.10g hash=%d",
+                    tuple(_o.shape),
+                    float(_of.float().sum()),
+                    float(_of.float().abs().max()) if _of.numel() else 0.0,
+                    float(_r0.sum()) if _r0.numel() else 0.0,
+                    float(_r0.abs().max()) if _r0.numel() else 0.0,
+                    hash(tuple(_r0.reshape(-1)[:16].tolist())),
+                )
         return self._o_proj(attn_out, positions)
 
     def _forward_csa2_full(
@@ -1067,6 +1097,27 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
     def _o_proj(
         self, attn_out: torch.Tensor | QuantizedActivation, positions: torch.Tensor
     ) -> torch.Tensor:
+        if _dsv41_flag("VLLM_DSV41_LOG_DECODE_Q"):
+            # Debug: which projection path is live, and the checksum of
+            # the attention's OUTPUT (the input to the projection). With
+            # the q checksum this brackets the attention: if the q and
+            # the attention output both match but the projection output
+            # differs, the projection is the culprit.
+            if isinstance(attn_out, QuantizedActivation):
+                _d = attn_out.data.detach()
+                _ds = attn_out.scale.detach()
+                logger.warning(
+                    "DSV41 OPROJ path=mxfp8 attn_sum=%.10g attn_amax=%.10g",
+                    float(_d.float().sum()),
+                    float(_d.float().abs().max()) if _d.numel() else 0.0,
+                )
+            else:
+                _o = attn_out.detach()
+                logger.warning(
+                    "DSV41 OPROJ path=bf16 attn_sum=%.10g attn_amax=%.10g",
+                    float(_o.float().sum()),
+                    float(_o.float().abs().max()) if _o.numel() else 0.0,
+                )
         if isinstance(attn_out, QuantizedActivation):
             z = rocm_mxfp8_wo_a_bmm(
                 attn_out.data,

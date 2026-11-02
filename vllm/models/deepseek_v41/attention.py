@@ -734,6 +734,35 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             positions,
             attn_out,
         )
+        if _dsv41_flag("VLLM_DSV41_LOG_DECODE_Q"):
+            # Debug: the attention's OUTPUT (the buffer the MLA
+            # attention wrote), taken BEFORE the projection. With the
+            # q checksum (logged in the decode path) this brackets the
+            # attention: q in, attn_out out. If the q matches across
+            # runs and this differs, the difference is inside the
+            # attention kernel itself; if this matches too, the
+            # difference is in the projection.
+            #
+            # The attention may have run on an AUX STREAM, so join
+            # before reading or the probe sees the buffer's previous
+            # contents instead of the result.
+            if isinstance(attn_out, torch.Tensor):
+                torch.cuda.current_stream().synchronize()
+                _of = attn_out.detach().reshape(attn_out.shape[0], -1)
+                # In a decode-only step the attention writes only
+                # output[:num_decode_tokens], so report row 0 on its
+                # own: the tail rows are stale and would swamp a sum.
+                _r0 = _of[:1].float()
+                logger.warning(
+                    "DSV41 AOUT shape=%s sum=%.10g amax=%.10g "
+                    "row0_sum=%.10g row0_amax=%.10g hash=%d",
+                    tuple(attn_out.shape),
+                    float(_of.float().sum()),
+                    float(_of.float().abs().max()) if _of.numel() else 0.0,
+                    float(_r0.sum()) if _r0.numel() else 0.0,
+                    float(_r0.abs().max()) if _r0.numel() else 0.0,
+                    hash(tuple(_r0.reshape(-1)[:16].tolist())),
+                )
         return self._o_proj(attn_out, positions)
 
     def forward_kv(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> None:
@@ -1092,6 +1121,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
         self.forward_mqa(q, kv, positions, out)
+
 
     def _fused_qnorm_rope_kv_insert(
         self,
