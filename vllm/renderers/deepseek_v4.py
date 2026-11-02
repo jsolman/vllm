@@ -146,9 +146,10 @@ class DeepseekV41Renderer(DeepseekV4Renderer):
                 # between the server and an offline reference.
                 _sha = hashlib.sha256(_p.encode()).hexdigest()
                 print(f"DSV41 PROMPT len={len(_p)} sha256={_sha}", flush=True)
-                # dump the full prompt so it can be diffed byte for byte
-                # against the model's own reference rendering
-                _path = "/tmp/dsv41-server-prompt.txt"
+                # dump the full prompt, ONE FILE PER DIGEST, so a later
+                # request does not overwrite an earlier one (the dump
+                # file is compared byte for byte against the reference)
+                _path = f"/tmp/dsv41-server-prompt-{_sha[:16]}.txt"
                 try:
                     with open(_path, "w") as _f:
                         _f.write(_p)
