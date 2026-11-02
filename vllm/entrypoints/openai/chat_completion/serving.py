@@ -150,10 +150,17 @@ def _dsv41_dump_request(request) -> None:
     try:
         msgs = []
         for m in (request.messages or []):
-            role = getattr(m, "role", None)
-            content = getattr(m, "content", None)
-            tool_calls = getattr(m, "tool_calls", None)
-            tool_call_id = getattr(m, "tool_call_id", None)
+            # the messages may be dicts (the parsed JSON) or objects
+            if isinstance(m, dict):
+                role = m.get("role")
+                content = m.get("content")
+                tool_calls = m.get("tool_calls")
+                tool_call_id = m.get("tool_call_id")
+            else:
+                role = getattr(m, "role", None)
+                content = getattr(m, "content", None)
+                tool_calls = getattr(m, "tool_calls", None)
+                tool_call_id = getattr(m, "tool_call_id", None)
             entry = {"role": role}
             if isinstance(content, str):
                 entry["content"] = content
@@ -165,13 +172,21 @@ def _dsv41_dump_request(request) -> None:
                     parts.append(d() if d else str(p))
                 entry["content_parts"] = parts
             if tool_calls:
-                entry["tool_calls"] = [
-                    {"id": getattr(t, "id", None),
-                     "type": getattr(t, "type", None),
-                     "function": {"name": getattr(t.function, "name", None),
-                                  "arguments": getattr(t.function, "arguments", None)}}
-                    if getattr(t, "function", None) is not None else str(t)
-                    for t in tool_calls]
+                tcs = []
+                for t in tool_calls:
+                    if isinstance(t, dict):
+                        fn = t.get("function") or {}
+                        tcs.append({"id": t.get("id"), "type": t.get("type"),
+                                    "function": {"name": fn.get("name"),
+                                                 "arguments": fn.get("arguments")}})
+                    else:
+                        fn = getattr(t, "function", None)
+                        tcs.append({"id": getattr(t, "id", None),
+                                    "type": getattr(t, "type", None),
+                                    "function": {"name": getattr(fn, "name", None),
+                                                 "arguments": getattr(fn, "arguments", None)}}
+                                    if fn is not None else str(t))
+                entry["tool_calls"] = tcs
             if tool_call_id:
                 entry["tool_call_id"] = tool_call_id
             msgs.append(entry)
