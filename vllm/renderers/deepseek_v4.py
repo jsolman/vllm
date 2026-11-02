@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from vllm.config import VllmConfig
 from vllm.renderers.chat_utils import (
     ChatCompletionMessageParam,
@@ -21,6 +22,20 @@ _FIM_HOLE = "<｜fim▁hole｜>"
 _FIM_END = "<｜fim▁end｜>"
 
 
+def _dsv41_flag(name: str) -> bool:
+    """Read a debug flag from the env OR from /tmp/dsv41-flags."""
+    if os.environ.get(name, "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            for line in f:
+                if line.strip() == name:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 class DeepseekV4Renderer(BaseRenderer[DeepseekV4Tokenizer]):
     def __init__(
         self,
@@ -34,7 +49,21 @@ class DeepseekV4Renderer(BaseRenderer[DeepseekV4Tokenizer]):
         )
 
     def _apply_chat_template(self, *args, **kwargs):
-        return self.get_tokenizer().apply_chat_template(*args, **kwargs), None
+        rendered = self.get_tokenizer().apply_chat_template(*args, **kwargs)
+        if _dsv41_flag("VLLM_DSV41_LOG_PROMPT"):
+            # Debug: the server's ACTUAL rendered prompt. The encoder was
+            # verified to match the model's own reference byte for byte,
+            # but that was the ENCODER in isolation - this is what the
+            # server really sends, including the thinking mode and the
+            # reasoning effort it chose.
+            try:
+                prompt_raw = rendered[0] if isinstance(rendered, tuple) else rendered
+                print(f"DSV41 PROMPT len={len(prompt_raw)} "
+                      f"hash={hash(tuple(prompt_raw[:400]))} "
+                      f"head={prompt_raw[:160]!r}", flush=True)
+            except Exception as e:
+                print(f"DSV41 PROMPT err {e}", flush=True)
+        return rendered, None
 
     def _build_prompt(self, rendered, mm_data, mm_uuids) -> DictPrompt:
         prompt_raw, image_order = rendered
@@ -103,4 +132,28 @@ class DeepseekV41Renderer(DeepseekV4Renderer):
         image_order: list[int] = []
         kwargs["image_order"] = image_order
         prompt_raw = self.get_tokenizer().apply_chat_template(*args, **kwargs)
+        if _dsv41_flag("VLLM_DSV41_LOG_PROMPT"):
+            # Debug: the server's ACTUAL rendered prompt. The encoder was
+            # verified to match the model's own reference byte for byte,
+            # but that was the ENCODER in isolation - this is what the
+            # server really sends, including the thinking mode and the
+            # reasoning effort it chose.
+            try:
+                import hashlib
+                _p = prompt_raw[0] if isinstance(prompt_raw, tuple) else prompt_raw
+                # a STABLE digest: Python's hash() on strings is
+                # randomised per process, so it is not comparable
+                # between the server and an offline reference.
+                _sha = hashlib.sha256(_p.encode()).hexdigest()
+                print(f"DSV41 PROMPT len={len(_p)} sha256={_sha}", flush=True)
+                # dump the full prompt so it can be diffed byte for byte
+                # against the model's own reference rendering
+                _path = "/tmp/dsv41-server-prompt.txt"
+                try:
+                    with open(_path, "w") as _f:
+                        _f.write(_p)
+                except OSError:
+                    pass
+            except Exception as e:
+                print(f"DSV41 PROMPT err {e}", flush=True)
         return prompt_raw, image_order
