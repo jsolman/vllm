@@ -100,31 +100,32 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 if kwargs.get("reasoning_effort") is not None:
                     thinking = kwargs.get("reasoning_effort") != "none"
                 else:
-                    # The DEFAULT thinking mode.
+                    # The DEFAULT thinking mode: the THINKING mode.
                     #
-                    # The model's OWN reference inference defaults to the
-                    # CHAT mode: inference/generate.py has
-                    #   --thinking-mode type=str default="chat"
-                    # and the reference's encoder renders the chat mode
-                    # WITHOUT the "Reasoning Effort: N" prefix and with
-                    # </think> closing the assistant turn instead of
-                    # <think> opening it.
+                    # The reference's STANDALONE inference script
+                    # defaults to the chat mode (inference/generate.py:
+                    # --thinking-mode default="chat"), but the SERVED
+                    # deployment uses the THINKING mode, and the token
+                    # counts prove it:
                     #
-                    # The THINKING mode puts the model into a long
-                    # reasoning monologue. On a tool-using prompt (an
-                    # attachment block that says "use read_file on
-                    # PARSED_SANDBOX_PATH") the reference deployment
-                    # answers DIRECTLY and emits the tool call, while
-                    # the thinking mode narrates the task and then
-                    # degenerates trying to reproduce the file text it
-                    # never fetched (measured: the max6gram 540 vs 7).
+                    #   the single-turn sermon request:
+                    #     the cloud 6996, the thinking mode 6996, the chat mode 6971
+                    #   the multi-turn (2 tool results):
+                    #     the cloud 7849, the thinking mode 7849, the chat mode 7822
+                    #   the multi-turn (6 tool results):
+                    #     the cloud 8018, the thinking mode 8018, the chat mode 7986
                     #
-                    # So the default follows the reference inference. Set
-                    # VLLM_DSV41_THINKING_MODE=thinking to restore the
-                    # old behaviour (the thinking mode with the effort
-                    # prefix).
+                    # The cloud's counts match the THINKING mode EXACTLY,
+                    # so the thinking mode is what the reference
+                    # deployment serves - and matching it is what makes
+                    # the local's first-token distribution match the
+                    # cloud's.
+                    #
+                    # Set VLLM_DSV41_THINKING_MODE=chat for the
+                    # standalone script's behaviour (no effort prefix,
+                    # no <think>).
                     thinking = os.environ.get(
-                        "VLLM_DSV41_THINKING_MODE", "chat"
+                        "VLLM_DSV41_THINKING_MODE", "thinking"
                     ).strip().lower() not in ("chat", "0", "false", "off")
             effort = kwargs.get("reasoning_effort")
             if effort == "none":
