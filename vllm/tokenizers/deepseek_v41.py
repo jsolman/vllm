@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+import os
 from typing import Any
 
 from transformers import TokenizersBackend
@@ -88,7 +89,31 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
 
             thinking = bool(kwargs.get("thinking") or kwargs.get("enable_thinking"))
             if "thinking" not in kwargs and "enable_thinking" not in kwargs:
-                thinking = True
+                # The DEFAULT thinking mode.
+                #
+                # The model's OWN reference inference defaults to the CHAT
+                # mode: inference/generate.py has
+                #   --thinking-mode type=str default="chat"
+                # and the reference's encoder renders the chat mode
+                # WITHOUT the "Reasoning Effort: N" prefix and with
+                # </think> closing the assistant turn instead of
+                # <think> opening it.
+                #
+                # The THINKING mode puts the model into a long reasoning
+                # monologue. On a tool-using prompt (an attachment block
+                # that says "use read_file on PARSED_SANDBOX_PATH") the
+                # reference deployment answers DIRECTLY and emits the
+                # tool call, while the thinking mode narrates the task
+                # and then degenerates trying to reproduce the file text
+                # it never fetched (measured: the max6gram 540 vs 7).
+                #
+                # So the default follows the reference inference. Set
+                # VLLM_DSV41_THINKING_MODE=thinking to restore the old
+                # behaviour (the thinking mode with the effort prefix).
+                _default_thinking = os.environ.get(
+                    "VLLM_DSV41_THINKING_MODE", "chat"
+                ).strip().lower() not in ("chat", "0", "false", "off")
+                thinking = _default_thinking
             effort = kwargs.get("reasoning_effort")
             if effort == "none":
                 thinking = False
