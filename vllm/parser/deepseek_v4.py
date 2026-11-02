@@ -254,6 +254,22 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
     )
 
 
+def _default_thinking_mode() -> bool:
+    """The default thinking mode, shared with the DSv4.1 tokenizer.
+
+    The tokenizer wrapper (vllm/tokenizers/deepseek_v41.py) renders the
+    prompt with this mode, and the parser must use the SAME one or the
+    reasoning and the content get swapped. The DSv4.1 default follows
+    the model's own reference inference (the chat mode:
+    inference/generate.py's --thinking-mode default="chat").
+    """
+    import os
+
+    return os.environ.get(
+        "VLLM_DSV41_THINKING_MODE", "chat"
+    ).strip().lower() not in ("chat", "0", "false", "off")
+
+
 class DeepSeekV4Parser(ParserEngine):
     parser_config = staticmethod(deepseek_v4_config)
 
@@ -268,7 +284,19 @@ class DeepSeekV4Parser(ParserEngine):
             chat_kwargs.get("thinking") or chat_kwargs.get("enable_thinking")
         )
         if "thinking" not in chat_kwargs and "enable_thinking" not in chat_kwargs:
-            thinking = True
+            # The parser's thinking mode MUST match the mode the
+            # tokenizer rendered the prompt with, or the reasoning and
+            # the content get swapped: the parser's initial state is
+            # REASONING in the thinking mode and CONTENT otherwise.
+            #
+            # The DSv4.1 tokenizer's default thinking mode follows the
+            # model's own reference inference (the CHAT mode - see
+            # inference/generate.py's --thinking-mode default="chat"),
+            # and it is controlled by VLLM_DSV41_THINKING_MODE. The
+            # parser has to read the SAME switch, or a request with no
+            # kwargs would be parsed in the thinking mode while the
+            # prompt was rendered in the chat mode.
+            thinking = _default_thinking_mode()
         thinking = thinking and chat_kwargs.get("reasoning_effort") != "none"
         super().__init__(
             tokenizer,
