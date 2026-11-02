@@ -1050,6 +1050,31 @@ def sparse_attn_indexer(
             # DCP need fp32. SM100 decode is varlen: one context length per row.
             if topk_backend != "deep_select" or dcp_world_size != 1:
                 logits = as_fp32_logits(logits, seq_lens.view(-1))
+                if _dsv41_flag("VLLM_DSV41_LOG_TOPK"):
+                    # Debug: the RAW indexer logits, BEFORE the candidate
+                    # mask and the top-k. The ILOGITS probe below hashes
+                    # the logits AFTER the mask, so it cannot tell a
+                    # difference in the paged-MQA kernel from a
+                    # difference in the mask. This one isolates the
+                    # kernel.
+                    _rl = logits.detach().float()
+                    # The row is mostly -inf (the invalid columns are
+                    # masked), so a hash of the first 16 elements
+                    # says nothing. Report the FINITE values instead:
+                    # their count, their sum and their positions.
+                    _fin = torch.isfinite(_rl[0])
+                    _nfin = int(_fin.sum())
+                    _fv = _rl[0][_fin]
+                    logger.warning(
+                        "DSV41 RAWLOGITS shape=%s nfinite=%d fsum=%.10g "
+                        "fmax=%.10g fmin=%.10g first=%s",
+                        tuple(_rl.shape),
+                        _nfin,
+                        float(_fv.sum()) if _nfin else 0.0,
+                        float(_fv.max()) if _nfin else 0.0,
+                        float(_fv.min()) if _nfin else 0.0,
+                        _rl[0][_fin][:8].tolist(),
+                    )
         num_rows = logits.shape[0]
         if candidate_blocks is not None:
             # Two-level selection (v4.1) on the decode logits; columns are

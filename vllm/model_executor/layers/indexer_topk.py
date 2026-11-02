@@ -156,6 +156,22 @@ def get_indexer_topk(backend: str) -> "SparseIndexerTopk":
 # sorted.
 logger = init_logger(__name__)
 
+
+def _dsv41_flag(name: str) -> bool:
+    """Read a debug flag from the env OR from /tmp/dsv41-flags."""
+    if os.environ.get(name, "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            for line in f:
+                if line.strip() == name:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+
 # The decode selection probe's budget (the probe floods the log pipe).
 _decsel_count = 0
 
@@ -368,9 +384,48 @@ class SparseIndexerTopk(torch.nn.Module):
         topk_indices (int32, -1 fill for rows shorter than topk_tokens).
         """
         backend = self.resolve_backend(logits, topk_tokens, logits.shape[0])
+        if _dsv41_flag("VLLM_DSV41_LOG_TOPK"):
+            # Debug: which decode top-k backend was resolved. Only the
+            # "per_row" backend canonicalises the selection's ORDER
+            # (the compiled top-k returns the selected positions in an
+            # arbitrary thread-arrival order, and the sparse attention
+            # reduces over them, so the order changes the BF16
+            # rounding). The cooperative and persistent backends do NOT
+            # sort, so their output order is arbitrary.
+            logger.warning(
+                "DSV41 TOPKBACKEND backend=%s topk_tokens=%d rows=%d "
+                "width=%d",
+                backend,
+                int(topk_tokens),
+                int(logits.shape[0]),
+                int(logits.shape[1]),
+            )
+        # CANONICALISE THE SELECTION ORDER, FOR EVERY BACKEND.
+        #
+        # The compiled top-k kernels (cooperative_topk, persistent_topk)
+        # return the selected positions in an arbitrary order - the
+        # thread arrival order - and the sparse attention REDUCES over
+        # the selected positions (the softmax denominator and the
+        # weighted sum). The reduction order therefore changes the BF16
+        # rounding of the result, so the SAME request produces a
+        # DIFFERENT attention output on every run.
+        #
+        # This was found the hard way: the live decode resolves the
+        # "persistent" backend (topk_tokens=512), and only the
+        # "per_row" backend canonicalised the order. With the order
+        # left arbitrary, the indexer on layer 2 (the first
+        # index_source layer) selected the SAME positions in a
+        # different ORDER on every run - its selection's sum was
+        # identical (364108) while its order differed - and the layer
+        # output diverged from there.
+        #
+        # The attention is order-invariant in exact arithmetic, so
+        # sorting the selection ASCENDING costs nothing.
         if backend == "deep_select":
             row_ends = self._row_ends(seq_lens, next_n, logits.shape[0])
             deep_select_topk(logits, topk_tokens, end=row_ends, output_idx=topk_indices)
+            if _DSV41_CANONICAL_TOPK:
+                _sort_topk_rows(topk_indices)
         elif backend == "cooperative":
             (topk_workspace,) = current_workspace_manager().get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
@@ -383,6 +438,8 @@ class SparseIndexerTopk(torch.nn.Module):
                 topk_tokens,
                 max_seq_len,
             )
+            if _DSV41_CANONICAL_TOPK:
+                _sort_topk_rows(topk_indices)
         elif backend == "persistent":
             (topk_workspace,) = current_workspace_manager().get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
@@ -400,6 +457,8 @@ class SparseIndexerTopk(torch.nn.Module):
                 topk_tokens,
                 max_seq_len,
             )
+            if _DSV41_CANONICAL_TOPK:
+                _sort_topk_rows(topk_indices)
         elif backend == "flashinfer":
             # Deferred: importing flashinfer initializes CUDA at import time.
             from flashinfer.topk import top_k_ragged_transform
@@ -412,6 +471,8 @@ class SparseIndexerTopk(torch.nn.Module):
             # row and -1-fills past the row length.
             indices = top_k_ragged_transform(logits, offsets, row_ends, topk_tokens)
             topk_indices.copy_(indices)
+            if _DSV41_CANONICAL_TOPK:
+                _sort_topk_rows(topk_indices)
         elif backend == "torch":
             # Debug reference: mask everything past each row's end, then topk.
             row_ends = self._row_ends(seq_lens, next_n, logits.shape[0])
@@ -425,6 +486,8 @@ class SparseIndexerTopk(torch.nn.Module):
             ) < row_ends.unsqueeze(1)
             indices = torch.where(in_range, indices, -1)
             topk_indices.copy_(indices)
+            if _DSV41_CANONICAL_TOPK:
+                _sort_topk_rows(topk_indices)
         elif backend == "aiter":
             from vllm._aiter_ops import rocm_aiter_ops
 
