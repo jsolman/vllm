@@ -259,14 +259,23 @@ def _default_thinking_mode() -> bool:
 
     The tokenizer wrapper (vllm/tokenizers/deepseek_v41.py) renders the
     prompt with this mode, and the parser must use the SAME one or the
-    reasoning and the content get swapped. The DSv4.1 default follows
-    the model's own reference inference (the chat mode:
-    inference/generate.py's --thinking-mode default="chat").
+    reasoning and the content get swapped: the parser's initial state is
+    REASONING in the thinking mode and CONTENT otherwise.
+
+    The default is the THINKING mode. The SERVED reference deployment
+    uses it - the cloud's prompt_tokens match the thinking mode exactly
+    (6996 / 7849 / 8018 for the three test prompts) and not the chat
+    mode (6971 / 7822 / 7986). The model's standalone inference script
+    defaults to "chat" (inference/generate.py), but that is the script,
+    not the deployment.
+
+    Set VLLM_DSV41_THINKING_MODE=chat for the chat mode (no effort
+    prefix, no <think>).
     """
     import os
 
     return os.environ.get(
-        "VLLM_DSV41_THINKING_MODE", "chat"
+        "VLLM_DSV41_THINKING_MODE", "thinking"
     ).strip().lower() not in ("chat", "0", "false", "off")
 
 
