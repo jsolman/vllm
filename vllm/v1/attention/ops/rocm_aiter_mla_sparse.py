@@ -2301,18 +2301,6 @@ def _sparse_attn_prefill_ragged_kernel(
             other=0.0,
         )
 
-        # RELOAD the slots for the NEXT block. Without this the loop
-        # reuses the FIRST block's slots for every iteration, so a
-        # query with more than BLOCK_K selected positions attends to
-        # the same BLOCK_K positions repeatedly (the paged kernel has
-        # this reload; the ragged one did not).
-        next_k_pos = k_start + BLOCK_K + k_offsets
-        slot = tl.load(
-            kv_indices_ptr + kv_start + next_k_pos,
-            mask=next_k_pos < kv_len,
-            other=-1,
-        )
-
         next_k_pos = k_start + BLOCK_K + k_offsets
         slot = tl.load(
             kv_indices_ptr + kv_start + next_k_pos, mask=next_k_pos < kv_len, other=-1
