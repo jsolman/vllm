@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -250,6 +251,55 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 def count_nans_per_row(logits: torch.Tensor) -> torch.Tensor:
     """Per-row NaN counts, left on device."""
     return logits.isnan().sum(dim=-1, dtype=torch.int32)
+
+
+# Debug probe: log the sampled token id and the top-2 logits of every
+# decode step, so a run-to-run divergence can be localised to the exact
+# step whose LOGITS differ (and not just to the step whose hidden state
+# differs). Off unless VLLM_DSV41_LOG_SAMPLED_TOKENS=1 (or the name is
+# in /tmp/dsv41-flags). It needs eager mode: it syncs the GPU.
+_DSV41_LOG_SAMPLED_TOKENS = os.environ.get(
+    "VLLM_DSV41_LOG_SAMPLED_TOKENS", "0") == "1"
+if not _DSV41_LOG_SAMPLED_TOKENS:
+    try:
+        with open("/tmp/dsv41-flags") as _f:
+            _DSV41_LOG_SAMPLED_TOKENS = any(
+                line.strip() == "VLLM_DSV41_LOG_SAMPLED_TOKENS"
+                for line in _f)
+    except OSError:
+        pass
+_DSV41_SAMPLED_COUNT = 0
+_DSV41_SAMPLED_BUDGET = 20000
+
+
+def _dsv41_log_sampled_tokens(
+    logits: torch.Tensor | None,
+    out: "SamplerOutput",
+) -> None:
+    """Log the sampled token and the top-2 logits per row."""
+    global _DSV41_SAMPLED_COUNT
+    if not _DSV41_LOG_SAMPLED_TOKENS or logits is None:
+        return
+    if _DSV41_SAMPLED_COUNT >= _DSV41_SAMPLED_BUDGET:
+        return
+    try:
+        ids = out.sampled_token_ids
+        if ids is None:
+            return
+        top = torch.topk(logits.float(), k=2, dim=-1)
+        ids_l = ids.tolist()
+        t_ids = top.indices.tolist()
+        t_vals = top.values.tolist()
+        for i, tid in enumerate(ids_l):
+            if _DSV41_SAMPLED_COUNT >= _DSV41_SAMPLED_BUDGET:
+                return
+            _DSV41_SAMPLED_COUNT += 1
+            logger.warning(
+                "DSV41 SAMP row=%d tok=%d top0=%d l0=%.10g top1=%d l1=%.10g",
+                i, tid, t_ids[i][0], t_vals[i][0], t_ids[i][1], t_vals[i][1],
+            )
+    except Exception as e:  # a debug probe must never break the server
+        logger.warning("DSV41 SAMP probe failed: %s", e)
 
 
 def nans_to_dict(counts: list[int], req_id_to_index: dict[str, int]) -> dict[str, int]:
@@ -3440,10 +3490,12 @@ class GPUModelRunner(
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
         if spec_decode_metadata is None:
-            return self.sampler(
+            out = self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
+            _dsv41_log_sampled_tokens(logits, out)
+            return out
 
         # Update spec_token_ids with real draft tokens from pre step only when
         # output_token_ids is needed (penalties or bad_words are in use).
