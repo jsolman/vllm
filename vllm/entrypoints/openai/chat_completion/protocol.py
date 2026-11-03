@@ -78,12 +78,24 @@ class ChatMessage(OpenAIBaseModel):
 
     # vLLM-specific fields that are not in OpenAI spec
     reasoning: str | None = None
+    # The OpenAI-compatible name for the thinking. Together.ai (and most
+    # OpenAI-compatible servers) return the thinking in "reasoning_content";
+    # a client that reads that name sees NOTHING when only "reasoning" is
+    # emitted. Both are emitted so either client works.
+    reasoning_content: str | None = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if len(data.get("tool_calls", [])) == 0:
             data.pop("tool_calls", None)
+        # keep the two names in sync: whichever was set, emit both
+        rc = data.get("reasoning_content")
+        rs = data.get("reasoning")
+        if rc is None and rs is not None:
+            data["reasoning_content"] = rs
+        elif rs is None and rc is not None:
+            data["reasoning"] = rc
         return data
 
 
