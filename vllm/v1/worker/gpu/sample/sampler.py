@@ -3,6 +3,8 @@
 
 from collections.abc import Sequence
 
+import os
+
 import numpy as np
 import torch
 
@@ -37,6 +39,56 @@ from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
 from vllm.v1.worker.gpu.states import RequestState
+from vllm.logger import init_logger
+
+
+logger = init_logger(__name__)
+
+
+# Debug probe: log the sampled token id and the top-2 logits of every
+# decode step, so a run-to-run divergence can be localised to the exact
+# step whose LOGITS differ (and not just to the step whose hidden state
+# differs). Off unless VLLM_DSV41_LOG_SAMPLED_TOKENS=1 (or the name is
+# in /tmp/dsv41-flags). It needs eager mode: it syncs the GPU.
+_DSV41_LOG_SAMPLED_TOKENS = os.environ.get(
+    "VLLM_DSV41_LOG_SAMPLED_TOKENS", "0") == "1"
+if not _DSV41_LOG_SAMPLED_TOKENS:
+    try:
+        with open("/tmp/dsv41-flags") as _f:
+            _DSV41_LOG_SAMPLED_TOKENS = any(
+                line.strip() == "VLLM_DSV41_LOG_SAMPLED_TOKENS"
+                for line in _f)
+    except OSError:
+        pass
+_DSV41_SAMPLED_COUNT = 0
+_DSV41_SAMPLED_BUDGET = 20000
+
+
+def _dsv41_log_sampled_tokens(
+    logits: torch.Tensor,
+    sampled: torch.Tensor,
+) -> None:
+    """Log the sampled token and the top-2 logits per row."""
+    global _DSV41_SAMPLED_COUNT
+    if not _DSV41_LOG_SAMPLED_TOKENS:
+        return
+    if _DSV41_SAMPLED_COUNT >= _DSV41_SAMPLED_BUDGET:
+        return
+    try:
+        top = torch.topk(logits.float(), k=2, dim=-1)
+        ids_l = sampled.view(-1).tolist()
+        t_ids = top.indices.tolist()
+        t_vals = top.values.tolist()
+        for i, tid in enumerate(ids_l):
+            if _DSV41_SAMPLED_COUNT >= _DSV41_SAMPLED_BUDGET:
+                return
+            _DSV41_SAMPLED_COUNT += 1
+            logger.warning(
+                "DSV41 SAMP row=%d tok=%d top0=%d l0=%.10g top1=%d l1=%.10g",
+                i, tid, t_ids[i][0], t_vals[i][0], t_ids[i][1], t_vals[i][1],
+            )
+    except Exception as e:  # a debug probe must never break the server
+        logger.warning("DSV41 SAMP probe failed: %s", e)
 
 
 class Sampler:
@@ -162,6 +214,7 @@ class Sampler:
             seq_lens_upper_bound_np,
             return_logprobs=logprobs_dims is not None,
         )
+        _dsv41_log_sampled_tokens(logits, sampled)
 
         if self.trace_replay_state is not None:
             # Overwrite sampled tokens with the replay trace up-front so that
