@@ -790,9 +790,20 @@ def sparse_attn_indexer(
                     row_ends = cu_seqlen_ke
                 else:
                     q_scale_slice, chunk_weights = mqa_logits_mx_inputs(
-                        q_slice_cast, q_scale_slice, weights[row_start:row_end]
+                        q_slice_cast, q_scale_cast, weights[row_start:row_end]
                     )
-                    row_ends = cu_seqlen_ke - cu_seqlen_ks
+                    # The candidate-block kernel's columns are ABSOLUTE
+                    # (the logits are [rows, the whole compressed cache]),
+                    # so its row bounds must be absolute too. Passing the
+                    # RELATIVE end (cu_seqlen_ke - cu_seqlen_ks) with no
+                    # start made the kernel score the columns [0, ke-ks)
+                    # - which for every chunk after the first are the
+                    # UNREACHABLE (-inf) positions - so it selected one
+                    # block instead of 256, and the wrong ones.
+                    # (Measured: the block set became IDENTICAL to the
+                    #  reference's select_candidate_blocks at every chunk.)
+                    row_starts = cu_seqlen_ks
+                    row_ends = cu_seqlen_ke
                     if use_deep_gemm():
                         logits = as_fp32_logits(
                             fp8_fp4_mqa_logits(
