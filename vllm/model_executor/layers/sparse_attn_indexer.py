@@ -790,7 +790,7 @@ def sparse_attn_indexer(
                     row_ends = cu_seqlen_ke
                 else:
                     q_scale_slice, chunk_weights = mqa_logits_mx_inputs(
-                        q_slice_cast, q_scale_cast, weights[row_start:row_end]
+                        q_slice_cast, q_scale_slice, weights[row_start:row_end]
                     )
                     # The candidate-block kernel's columns are ABSOLUTE
                     # (the logits are [rows, the whole compressed cache]),
