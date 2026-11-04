@@ -67,6 +67,8 @@ _DSV41_SAMPLED_BUDGET = 20000
 def _dsv41_log_sampled_tokens(
     logits: torch.Tensor,
     sampled: torch.Tensor,
+    req_ids: list[str] | None = None,
+    pos_list: list[int] | None = None,
 ) -> None:
     """Log the sampled token and the top-2 logits per row."""
     global _DSV41_SAMPLED_COUNT
@@ -83,10 +85,20 @@ def _dsv41_log_sampled_tokens(
             if _DSV41_SAMPLED_COUNT >= _DSV41_SAMPLED_BUDGET:
                 return
             _DSV41_SAMPLED_COUNT += 1
+            rid = req_ids[i] if req_ids is not None and i < len(req_ids) else "-"
             logger.warning(
-                "DSV41 SAMP row=%d tok=%d top0=%d l0=%.10g top1=%d l1=%.10g",
-                i, tid, t_ids[i][0], t_vals[i][0], t_ids[i][1], t_vals[i][1],
+                "DSV41 SAMP req=%s row=%d tok=%d top0=%d l0=%.10g "
+                "top1=%d l1=%.10g",
+                rid, i, tid, t_ids[i][0], t_vals[i][0], t_ids[i][1], t_vals[i][1],
             )
+            if _DSV41_SAMPLED_COUNT <= 3:
+                # The first samples of a step: also log the request's
+                # position, which identifies the request uniquely (each
+                # request has its own decode step counter).
+                logger.warning(
+                    "DSV41 SAMPX req=%s row=%d pos=%s",
+                    rid, i, pos_list[i] if pos_list is not None else "-",
+                )
     except Exception as e:  # a debug probe must never break the server
         logger.warning("DSV41 SAMP probe failed: %s", e)
 
@@ -214,7 +226,12 @@ class Sampler:
             seq_lens_upper_bound_np,
             return_logprobs=logprobs_dims is not None,
         )
-        _dsv41_log_sampled_tokens(logits, sampled)
+        _dsv41_log_sampled_tokens(
+            logits,
+            sampled,
+            input_batch.req_ids,
+            input_batch.positions[input_batch.logits_indices].tolist(),
+        )
 
         if self.trace_replay_state is not None:
             # Overwrite sampled tokens with the replay trace up-front so that
