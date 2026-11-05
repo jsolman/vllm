@@ -471,6 +471,30 @@ class SparseIndexerTopk(torch.nn.Module):
             )
             if _DSV41_CANONICAL_TOPK:
                 _sort_topk_rows(topk_indices)
+            if _dsv41_topkset_flag() and \
+                    _TOPKSET_STATE["n"] < _TOPKSET_BUDGET:
+                _TOPKSET_STATE["n"] += 1
+                try:
+                    import json as _json
+                    _rows = min(int(logits.shape[0]), 8)
+                    _data = []
+                    _top = logits.detach().float()
+                    for _i in range(_rows):
+                        _row = topk_indices[_i].detach().to(torch.int64).tolist()
+                        _v = [int(x) for x in _row if x >= 0]
+                        _data.append(dict(
+                            sel=_v,
+                            scores=[round(x, 3)
+                                    for x in _top[_i, _v].tolist()[:64]]))
+                    _sl = seq_lens.reshape(-1).tolist()[:_rows] \
+                        if hasattr(seq_lens, "tolist") else []
+                    with open(_TOPKSET_PATH, "a") as _f:
+                        _f.write(_json.dumps(dict(
+                            rows=_data, seq_lens=_sl,
+                            topk=int(topk_tokens),
+                            backend=backend)) + "\n")
+                except Exception as _e:
+                    logger.warning("DSV41 TOPKSET probe failed: %s", _e)
         elif backend == "persistent":
             (topk_workspace,) = current_workspace_manager().get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
