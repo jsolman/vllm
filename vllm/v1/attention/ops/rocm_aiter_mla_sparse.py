@@ -78,6 +78,24 @@ _DSV41_LOG_DECODE_SELECTION = os.environ.get(
 ) == "1"
 # The decode selection probe's budget (the probe floods the log pipe).
 _decsel_count = 0
+# THE TOPK-SETS probe (the attractor instrument): env VLLM_DSV41_
+# LOG_TOPK_SETS=1 or a line VLLM_DSV41_LOG_TOPK_SETS in /tmp/dsv41-
+# flags; writes _TOPKSET_PATH, one JSON per decode step (8 rows),
+# capped at _TOPKSET_BUDGET lines.
+_DSV41_LOG_TOPK_SETS = os.environ.get("VLLM_DSV41_LOG_TOPK_SETS", "0") == "1"
+if not _DSV41_LOG_TOPK_SETS:
+    try:
+        with open("/tmp/dsv41-flags") as _ftk:
+            _DSV41_LOG_TOPK_SETS = any(
+                line.strip() == "VLLM_DSV41_LOG_TOPK_SETS"
+                for line in _ftk)
+    except OSError:
+        pass
+_TOPKSET_PATH = os.environ.get(
+    "VLLM_DSV41_TOPKSET_PATH", "/tmp/dsv41-topksets.jsonl")
+_TOPKSET_BUDGET = int(os.environ.get(
+    "VLLM_DSV41_TOPKSET_BUDGET", "700"))
+_topkset_count = 0
 _DSV41_CANONICAL_TOPK = os.environ.get("VLLM_DSV41_CANONICAL_TOPK", "1") == "1"
 
 
@@ -1506,6 +1524,41 @@ def rocm_aiter_sparse_attn_indexer(
             )
             if _DSV41_CANONICAL_TOPK:
                 _sort_topk_rows(topk_indices)
+            if _dsv41_flag("VLLM_DSV41_LOG_TOPK_SETS") and \
+                    _topkset_count < _TOPKSET_BUDGET:
+                # THE ATTRACTOR INSTRUMENT (Step 1d): per decode row
+                # dump the 512 selected compressed positions + the
+                # selection scores at those positions - the full
+                # STATE of the indexer's decision. The attractor
+                # analysis compares the SELECTION's mass over the
+                # prompt's recitation region vs the model's own
+                # generated region at the ignition rows.
+                _topkset_count += 1
+                try:
+                    import json as _json
+                    _mat = topk_indices[:num_rows, :topk_tokens].detach() \
+                        .to(torch.int64)
+                    # The row's context length in the compressed
+                    # units: the selection is over [0, visible_i).
+                    _data = []
+                    _top = logits.detach().float()
+                    for _i in range(min(int(num_rows), 8)):
+                        _row = _mat[_i].tolist()
+                        _v = [int(x) for x in _row if x >= 0]
+                        _scores = _top[_i, _row].tolist() if _row else []
+                        _data.append(dict(sel=_v,
+                                          scores=[round(x, 3) for x in _scores]))
+                    _meta = decode_metadata
+                    _sl = _meta.seq_lens.reshape(-1).tolist()[:min(int(num_rows), 8)] \
+                        if hasattr(_meta, "seq_lens") else []
+                    with open(_TOPKSET_PATH, "a") as _f:
+                        _f.write(_json.dumps(dict(
+                            rows=_data,
+                            seq_lens=_sl,
+                            max_seq=getattr(_meta, "max_seq_len", None),
+                            topk=int(topk_tokens))) + "\n")
+                except Exception as _e:
+                    logger.warning("DSV41 TOPKSET probe failed: %s", _e)
             if _dsv41_flag("VLLM_DSV41_LOG_DECODE_SELECTION") and \
                     _decsel_count < 24:
                 # Debug: the decode selection's SET (not its order). The
