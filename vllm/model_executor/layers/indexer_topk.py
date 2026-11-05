@@ -186,7 +186,7 @@ _DSV41_LOG_DECODE_SELECTION = os.environ.get(
 _TOPKSET_PATH = os.environ.get(
     "VLLM_DSV41_TOPKSET_PATH", "/tmp/dsv41-topksets.jsonl")
 _TOPKSET_BUDGET = int(os.environ.get(
-    "VLLM_DSV41_TOPKSET_BUDGET", "700"))
+    "VLLM_DSV41_TOPKSET_BUDGET", "400000"))
 _TOPKSET_STATE = {"n": 0}
 
 
@@ -492,7 +492,8 @@ class SparseIndexerTopk(torch.nn.Module):
                         _f.write(_json.dumps(dict(
                             rows=_data, seq_lens=_sl,
                             topk=int(topk_tokens),
-                            backend=backend)) + "\n")
+                            backend=backend,
+                            layer=getattr(self, "layer_name", "?"))) + "\n")
                 except Exception as _e:
                     logger.warning("DSV41 TOPKSET probe failed: %s", _e)
         elif backend == "persistent":
