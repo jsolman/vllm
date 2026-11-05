@@ -1556,7 +1556,8 @@ def rocm_aiter_sparse_attn_indexer(
                             rows=_data,
                             seq_lens=_sl,
                             max_seq=getattr(_meta, "max_seq_len", None),
-                            topk=int(topk_tokens))) + "\n")
+                            topk=int(topk_tokens),
+                            layer=str(k_cache_prefix))) + "\n")
                 except Exception as _e:
                     logger.warning("DSV41 TOPKSET probe failed: %s", _e)
             if _dsv41_flag("VLLM_DSV41_LOG_DECODE_SELECTION") and \
