@@ -187,7 +187,7 @@ _TOPKSET_PATH = os.environ.get(
     "VLLM_DSV41_TOPKSET_PATH", "/tmp/dsv41-topksets.jsonl")
 _TOPKSET_BUDGET = int(os.environ.get(
     "VLLM_DSV41_TOPKSET_BUDGET", "700"))
-_topkset_count = 0
+_TOPKSET_STATE = {"n": 0}
 
 
 def _dsv41_topkset_flag() -> bool:
@@ -490,10 +490,9 @@ class SparseIndexerTopk(torch.nn.Module):
             )
             if _DSV41_CANONICAL_TOPK:
                 _sort_topk_rows(topk_indices)
-            if _dsv41_flag("VLLM_DSV41_LOG_TOPK_SETS") and \
-                    _topkset_count < _TOPKSET_BUDGET:
-                global _topkset_count
-                _topkset_count += 1
+            if _dsv41_topkset_flag() and \
+                    _TOPKSET_STATE["n"] < _TOPKSET_BUDGET:
+                _TOPKSET_STATE["n"] += 1
                 try:
                     import json as _json
                     _rows = min(int(logits.shape[0]), 8)
