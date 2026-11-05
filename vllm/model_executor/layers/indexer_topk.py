@@ -492,6 +492,7 @@ class SparseIndexerTopk(torch.nn.Module):
                 _sort_topk_rows(topk_indices)
             if _dsv41_flag("VLLM_DSV41_LOG_TOPK_SETS") and \
                     _topkset_count < _TOPKSET_BUDGET:
+                global _topkset_count
                 _topkset_count += 1
                 try:
                     import json as _json
