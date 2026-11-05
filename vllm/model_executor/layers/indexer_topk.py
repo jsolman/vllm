@@ -178,6 +178,37 @@ _decsel_count = 0
 _DSV41_LOG_DECODE_SELECTION = os.environ.get(
     "VLLM_DSV41_LOG_DECODE_SELECTION", "0"
 ) == "1"
+
+# THE TOPK-SETS probe (the attractor instrument, Step 1d): the decode
+# resolves the PERSISTENT backend (see the CANONICALISE block), so
+# the probe lives there. One JSON per decode step (up to 8 rows),
+# capped. Read from the env OR the flags file at CALL time.
+_TOPKSET_PATH = os.environ.get(
+    "VLLM_DSV41_TOPKSET_PATH", "/tmp/dsv41-topksets.jsonl")
+_TOPKSET_BUDGET = int(os.environ.get(
+    "VLLM_DSV41_TOPKSET_BUDGET", "700"))
+_topkset_count = 0
+
+
+def _dsv41_topkset_flag() -> bool:
+    if os.environ.get("VLLM_DSV41_LOG_TOPK_SETS", "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            return any(line.strip() == "VLLM_DSV41_LOG_TOPK_SETS"
+                       for line in f)
+    except OSError:
+        return False
+
+
+def _dsv41_flag(name: str) -> bool:
+    if os.environ.get(name, "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            return any(line.strip() == name for line in f)
+    except OSError:
+        return False
 _DSV41_CANONICAL_TOPK = os.environ.get("VLLM_DSV41_CANONICAL_TOPK", "1") == "1"
 
 
@@ -459,6 +490,30 @@ class SparseIndexerTopk(torch.nn.Module):
             )
             if _DSV41_CANONICAL_TOPK:
                 _sort_topk_rows(topk_indices)
+            if _dsv41_flag("VLLM_DSV41_LOG_TOPK_SETS") and \
+                    _topkset_count < _TOPKSET_BUDGET:
+                _topkset_count += 1
+                try:
+                    import json as _json
+                    _rows = min(int(logits.shape[0]), 8)
+                    _data = []
+                    _top = logits.detach().float()
+                    for _i in range(_rows):
+                        _row = topk_indices[_i].detach().to(torch.int64).tolist()
+                        _v = [int(x) for x in _row if x >= 0]
+                        _data.append(dict(
+                            sel=_v,
+                            scores=[round(x, 3)
+                                    for x in _top[_i, _v].tolist()[:64]]))
+                    _sl = seq_lens.reshape(-1).tolist()[:_rows] \
+                        if hasattr(seq_lens, "tolist") else []
+                    with open(_TOPKSET_PATH, "a") as _f:
+                        _f.write(_json.dumps(dict(
+                            rows=_data, seq_lens=_sl,
+                            topk=int(topk_tokens),
+                            backend=backend)) + "\n")
+                except Exception as _e:
+                    logger.warning("DSV41 TOPKSET probe failed: %s", _e)
         elif backend == "flashinfer":
             # Deferred: importing flashinfer initializes CUDA at import time.
             from flashinfer.topk import top_k_ragged_transform
