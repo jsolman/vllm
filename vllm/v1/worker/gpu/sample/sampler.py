@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Sequence
-
+import json
 import os
+from collections.abc import Sequence
 
 import numpy as np
 import torch
@@ -62,6 +62,64 @@ if not _DSV41_LOG_SAMPLED_TOKENS:
         pass
 _DSV41_SAMPLED_COUNT = 0
 _DSV41_SAMPLED_BUDGET = 20000
+
+# Debug probe 2 (the fp32-replay harness): dump the top-64 token ids
+# and logits of EVERY decode row to a JSONL, one line per row, with the
+# request id and the sequence position. The replay (a separate script)
+# re-derives the same rows in fp32 from the captured KV and compares
+# SHAPES (the top-20 sets and their gaps), not just the argmax - the
+# temp-0 ignition is a confident attractor, so a near-tie comparison
+# cannot see it. Off unless VLLM_DSV41_LOG_TOP64=1 (env or the flags
+# file). No budget by row - the harness writes what it asks for;
+# instead it stops after _DSV41_TOP64_MAX_ROWS lines total.
+_DSV41_LOG_TOP64 = os.environ.get("VLLM_DSV41_LOG_TOP64", "0") == "1"
+if not _DSV41_LOG_TOP64:
+    try:
+        with open("/tmp/dsv41-flags") as _f64:
+            _DSV41_LOG_TOP64 = any(
+                line.strip() == "VLLM_DSV41_LOG_TOP64"
+                for line in _f64)
+    except OSError:
+        pass
+_DSV41_TOP64_PATH = os.environ.get(
+    "VLLM_DSV41_TOP64_PATH", "/tmp/dsv41-top64.jsonl")
+_DSV41_TOP64_MAX_ROWS = int(os.environ.get("VLLM_DSV41_TOP64_MAX_ROWS", "4000"))
+_DSV41_TOP64_OUT = None
+_DSV41_TOP64_ROWS = 0
+
+
+def _dsv41_log_top64(
+    logits: torch.Tensor,
+    sampled: torch.Tensor,
+    req_ids: list[str] | None,
+    pos_list: list[int] | None,
+) -> None:
+    """Dump the top-64 logits rows of a decode batch to a JSONL."""
+    global _DSV41_TOP64_OUT, _DSV41_TOP64_ROWS
+    if not _DSV41_LOG_TOP64:
+        return
+    if _DSV41_TOP64_ROWS >= _DSV41_TOP64_MAX_ROWS:
+        return
+    try:
+        if _DSV41_TOP64_OUT is None:
+            _DSV41_TOP64_OUT = open(_DSV41_TOP64_PATH, "a")
+        k = min(64, logits.shape[-1])
+        top = torch.topk(logits.float(), k=k, dim=-1)
+        vals = top.values.tolist()
+        ids = top.indices.tolist()
+        sids = sampled.view(-1).tolist()
+        for i in range(len(sids)):
+            if _DSV41_TOP64_ROWS >= _DSV41_TOP64_MAX_ROWS:
+                break
+            rid = req_ids[i] if req_ids is not None and i < len(req_ids) else "-"
+            pos = pos_list[i] if pos_list is not None else -1
+            _DSV41_TOP64_OUT.write(json.dumps(dict(
+                req=rid, pos=pos, sampled=sids[i],
+                top=ids[i], lp=vals[i])) + "\n")
+            _DSV41_TOP64_ROWS += 1
+        _DSV41_TOP64_OUT.flush()
+    except Exception as e:  # a debug probe must never break the server
+        logger.warning("DSV41 TOP64 probe failed: %s", e)
 
 
 def _dsv41_log_sampled_tokens(
@@ -231,6 +289,12 @@ class Sampler:
             sampled,
             input_batch.req_ids,
             input_batch.positions[input_batch.logits_indices].tolist(),
+        )
+        _dsv41_log_top64(
+            logits,
+            sampled,
+            input_batch.req_ids,
+            pos.tolist(),
         )
 
         if self.trace_replay_state is not None:
