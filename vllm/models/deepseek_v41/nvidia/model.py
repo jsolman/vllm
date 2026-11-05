@@ -641,6 +641,20 @@ class DeepseekV4DecoderLayer(nn.Module):
                 )
             else:
                 residual = x
+                # Upstream 8a1c02efca9 (#62208): the engram must be
+                # injected at the pipeline stage entry too - the
+                # non-first-layer `residual is None` case. Ours was
+                # injecting only in the elif branch (which fires when
+                # the previous post exists); the entry case skipped the
+                # n-gram recall - the first decode step of a fresh
+                # stage read a stream without the engram injected, and
+                # the mhc_pre's mix then saw the wrong stream.
+                if self.engram is not None and engram_hashes is not None:
+                    residual = self.engram(
+                        residual,
+                        engram_hashes[:, self.engram.layer_hash_index],
+                        engram_mask,
+                    )
                 post_mix, res_mix, x, attn_pre = mhc_pre(
                     residual,
                     self.hc_attn_fn,
