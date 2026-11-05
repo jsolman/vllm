@@ -946,6 +946,11 @@ def combine_topk_swa_indices(
         )
     else:
         combined_indices, combined_lens = out
+        # Upstream 9bd5c2a0582 (#60613): the caller-provided workspace is
+        # reused across chunks/batches - rows past the kernel's
+        # combined len can hold stale indices from a previous step, so
+        # seed the sentinel before the gather kernel runs.
+        combined_indices.fill_(-1)
 
     _COMBINE_TOPK_SWA_INDICES_KERNEL(
         combined_indices,
