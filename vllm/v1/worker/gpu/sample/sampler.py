@@ -83,6 +83,15 @@ if not _DSV41_LOG_TOP64:
         pass
 _DSV41_TOP64_PATH = os.environ.get(
     "VLLM_DSV41_TOP64_PATH", "/tmp/dsv41-top64.jsonl")
+# THE IMPORT-TIME TRACE (why did 362 not fire?): one line to the
+# worker log, always.
+try:
+    logger.warning("DSV41 TOP64 import: env=%r file=%r state=%r",
+                   os.environ.get("VLLM_DSV41_LOG_TOP64", "<unset>"),
+                   (open("/tmp/dsv41-flags").read() if os.path.exists("/tmp/dsv41-flags") else "<no file>"),
+                   _DSV41_LOG_TOP64)
+except Exception:
+    pass
 _DSV41_TOP64_MAX_ROWS = int(os.environ.get("VLLM_DSV41_TOP64_MAX_ROWS", "4000"))
 _DSV41_TOP64_OUT = None
 _DSV41_TOP64_ROWS = 0
@@ -96,7 +105,19 @@ def _dsv41_log_top64(
 ) -> None:
     """Dump the top-64 logits rows of a decode batch to a JSONL."""
     global _DSV41_TOP64_OUT, _DSV41_TOP64_ROWS
-    if not _DSV41_LOG_TOP64:
+    # CALL-TIME resolution: the 369b/1g mystery - the import-time
+    # flag was True (the worker log) yet no calls ever landed; the
+    # per-call read (the dsv41_flag pattern in the indexer) is the
+    # reliable channel.
+    _on = _DSV41_LOG_TOP64
+    if not _on:
+        try:
+            with open("/tmp/dsv41-flags") as _f:
+                _on = any(line.strip() == "VLLM_DSV41_LOG_TOP64"
+                          for line in _f)
+        except OSError:
+            _on = False
+    if not _on:
         return
     if _DSV41_TOP64_ROWS >= _DSV41_TOP64_MAX_ROWS:
         return
