@@ -71,20 +71,11 @@ def _param_patterns(
     """
     # Temper anchor = the bracket-free DSML core so both `<｜DSML｜…` and
     # `</｜DSML｜…` trip `</?` (the optional slash sits between them).
-    _ESCAPED_DSML = re.escape(_DSML)
     start, close = re.escape(param_start), re.escape(param_close)
     head = rf'{start}\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
-    # Temper the value at ANY DSML tag boundary - opener OR closer must both
-    # trip the lookbehind anchor, so that anchor is the shared core (without
-    # the angle: </? supplies it), NOT the full opener prefix. Prevents a
-    # malformed closer from latching into a streamed value.
-    value = rf"((?:(?!</?{_ESCAPED_DSML}).)*)"
     return (
-        re.compile(rf"{head}{value}(?:{close}|(?={start}\\s+name=))", re.DOTALL),
-        # Partial (streamed) value gets the SAME temper: without it a closer
-        # arriving mid-stream leaks into the partial value until the closer
-        # completes the match.
-        re.compile(rf"{head}{value}", re.DOTALL),
+        re.compile(rf"{head}(.*?)(?:{close}|(?={start}\s+name=))", re.DOTALL),
+        re.compile(rf"{head}(.*)\Z", re.DOTALL),
     )
 
 
