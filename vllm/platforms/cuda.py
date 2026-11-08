@@ -554,6 +554,17 @@ class CudaPlatformBase(Platform):
         for vit_attn_backend in cls.get_supported_vit_attn_backends():
             if vit_attn_backend == AttentionBackendEnum.TORCH_SDPA:
                 return vit_attn_backend
+            if vit_attn_backend == AttentionBackendEnum.FLASH_ATTN:
+                # The selector runs before any model loads; a wheel without
+                # the FA2/FA3 extensions (e.g. SM110 builds) must fall
+                # through instead of crashing in the first ViT forward.
+                from vllm.vllm_flash_attn.flash_attn_interface import (
+                    FA2_AVAILABLE,
+                    FA3_AVAILABLE,
+                )
+
+                if not (FA2_AVAILABLE or FA3_AVAILABLE):
+                    continue
             try:
                 backend_class = vit_attn_backend.get_class()
                 is_backend_supported = backend_class.supports_head_size(
