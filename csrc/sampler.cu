@@ -485,7 +485,19 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
         auto logit = smemFinal.items.logits[i];
         for (int j = 0; j < smemFinalDstIdx[0]; j++) {
           auto otherLogit = smemFinal.items.logits[j];
-          if (logit < otherLogit || (logit == otherLogit && i < j)) {
+          // TIE-BREAK BY THE ORIGINAL COLUMN INDEX, not by the slot.
+          //
+          // The candidates were registered with atomicAdd, so the slot
+          // order is the (nondeterministic) thread arrival order.
+          // Using the slot as the tie-break made the selection of
+          // exactly-tied candidates nondeterministic - and the DSv4.1
+          // reference breaks such ties by the LOWEST column index
+          // (torch.topk on (scores + bias)), so we also differed from
+          // the reference. Comparing the stored column indices
+          // reproduces the reference AND is deterministic.
+          if (logit < otherLogit ||
+              (logit == otherLogit &&
+               smemFinal.items.indices[i] < smemFinal.items.indices[j])) {
             outIndex++;
           }
         }
