@@ -61,7 +61,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
-from vllm.models.deepseek_v41.compressor import DeepseekCompressor
+from vllm.models.deepseek_v41.compressor import DeepseekCompressor, _dsv41_flag
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
@@ -180,6 +180,22 @@ def _resolve_dsv4_kv_cache_dtype(
         return kv_cache_dtype, torch.float8_e4m3fn
     # auto / bfloat16 -> plain bf16 KV row.
     return kv_cache_dtype, torch.bfloat16
+
+
+def _dsv41_swa_replay_supported() -> bool:
+    """Whether this platform's sparse prefill kernel clamps the SWA window.
+
+    The decoder SWA bounded replay relies on a window clamp inside the
+    prefill kernel: the replayed layers read the SWA cache beyond the
+    window, and the clamp is what keeps them inside it. The clamp lives
+    in the FlashInfer and FlashMLA prefill kernels. On the platforms whose
+    sparse attention is served by the Triton sparse path (SM110 / Thor),
+    the clamp is absent, so the replay reads uninitialised slots: the
+    residual then grows without bound over the replayed layers and the
+    run-to-run blow-up is random in magnitude.
+    """
+    # The Triton sparse path serves the attention on SM110 (Thor).
+    return current_platform.get_device_capability()[0] < 11
 
 
 class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
@@ -562,6 +578,25 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 "takes part in prefix caching instead."
             )
             swa_bounded_replay = False
+        # The decoder SWA bounded replay needs the window clamp that lives in
+        # the FlashInfer / FlashMLA prefill kernels. On the platforms whose
+        # sparse attention is served by a different kernel (the Triton sparse
+        # path on SM110), that clamp is absent, so the replayed layers read
+        # the padded slots of the SWA cache. The result is a residual that
+        # grows without bound over the replayed layers (measured: the
+        # residual's absmax reached 3.2e5, a 200,000x growth, on a long
+        # prompt) and a run-to-run blow-up whose magnitude is random.
+        # The replay stays off on those platforms; the sliding-window cache
+        # takes part in prefix caching instead.
+        if swa_bounded_replay and not _dsv41_swa_replay_supported():
+            logger.warning_once(
+                "Decoder SWA bounded replay is off on this platform (the "
+                "window clamp it relies on lives in the FlashInfer and "
+                "FlashMLA prefill kernels, which this platform's sparse "
+                "attention does not use); the sliding-window cache takes "
+                "part in prefix caching instead."
+            )
+            swa_bounded_replay = False
         self.swa_cache_layer = DeepseekV4SWACache(
             head_dim=self.head_dim,
             window_size=self.window_size,
@@ -699,6 +734,35 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             positions,
             attn_out,
         )
+        if _dsv41_flag("VLLM_DSV41_LOG_DECODE_Q"):
+            # Debug: the attention's OUTPUT (the buffer the MLA
+            # attention wrote), taken BEFORE the projection. With the
+            # q checksum (logged in the decode path) this brackets the
+            # attention: q in, attn_out out. If the q matches across
+            # runs and this differs, the difference is inside the
+            # attention kernel itself; if this matches too, the
+            # difference is in the projection.
+            #
+            # The attention may have run on an AUX STREAM, so join
+            # before reading or the probe sees the buffer's previous
+            # contents instead of the result.
+            if isinstance(attn_out, torch.Tensor):
+                torch.cuda.current_stream().synchronize()
+                _of = attn_out.detach().reshape(attn_out.shape[0], -1)
+                # In a decode-only step the attention writes only
+                # output[:num_decode_tokens], so report row 0 on its
+                # own: the tail rows are stale and would swamp a sum.
+                _r0 = _of[:1].float()
+                logger.warning(
+                    "DSV41 AOUT shape=%s sum=%.10g amax=%.10g "
+                    "row0_sum=%.10g row0_amax=%.10g hash=%d",
+                    tuple(attn_out.shape),
+                    float(_of.float().sum()),
+                    float(_of.float().abs().max()) if _of.numel() else 0.0,
+                    float(_r0.sum()) if _r0.numel() else 0.0,
+                    float(_r0.abs().max()) if _r0.numel() else 0.0,
+                    hash(tuple(_r0.reshape(-1)[:16].tolist())),
+                )
         return self._o_proj(attn_out, positions)
 
     def forward_kv(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> None:
@@ -723,6 +787,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 else None,
                 self.kv_mxfp8,
             )
+            if _dsv41_flag("VLLM_DSV41_LOG_CACHE"):
+                # Debug: the SWA CACHE's contents after the write (the
+                # decode reads it). The per-layer probe covers the
+                # hidden states, not the cache.
+                _k = cache.detach()
+                _flat = _k.reshape(_k.shape[0], -1)
+                _n = min(64, _flat.shape[0])
+                logger.warning(
+                    "DSV41 SWACACHE shape=%s sum=%.10g hash=%d",
+                    tuple(_k.shape),
+                    float(_flat[:_n].float().sum()),
+                    hash(tuple(_flat[:_n, :16].float().reshape(-1).tolist())),
+                )
         if self.compressor is not None:
             latent = self.compressor(kv_score, positions)
             self.compressor.insert_cache(latent, positions, self.rotary_emb)
@@ -1045,6 +1122,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # ([num_tokens, padded_heads, head_dim]).
         self.forward_mqa(q, kv, positions, out)
 
+
     def _fused_qnorm_rope_kv_insert(
         self,
         q: torch.Tensor,
@@ -1140,6 +1218,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 not self.accepts_unnormed_unroped_query,  # apply_q_rope
                 self.accepts_unnormed_unroped_query,  # is_q_interleaved
             )
+            if _dsv41_flag("VLLM_DSV41_LOG_CACHE"):
+                # Debug: the SWA CACHE's contents after the write (the
+                # decode reads it). The per-layer probe covers the
+                # hidden states, not the cache.
+                _k = swa_kv_cache.detach()
+                _flat = _k.reshape(_k.shape[0], -1)
+                _n = min(64, _flat.shape[0])
+                logger.warning(
+                    "DSV41 SWACACHE shape=%s sum=%.10g hash=%d",
+                    tuple(_k.shape),
+                    float(_flat[:_n].float().sum()),
+                    hash(tuple(_flat[:_n, :16].float().reshape(-1).tolist())),
+                )
             return q if pad_to == 0 else q_padded
 
         assert not self.accepts_unnormed_unroped_query, (
@@ -1494,6 +1585,22 @@ class DeepseekV4Indexer(nn.Module):
             self.compress_ratio,
             self.use_fp4_kv,
         )
+        if _dsv41_flag("VLLM_DSV41_LOG_CACHE"):
+            # Debug: the INDEXER's K cache after the write. The decode's
+            # indexer scores against THIS cache (not the compressed
+            # cache), and it is a separate buffer, so the compressed-
+            # and SWA-cache probes do not cover it. The rows at the
+            # non-boundary tokens hold garbage (the store kernel skips
+            # them), so the hash covers only the first rows.
+            _ik = self.k_cache.kv_cache.detach()
+            _iflat = _ik.reshape(_ik.shape[0], -1)
+            _in = min(64, _iflat.shape[0])
+            logger.warning(
+                "DSV41 IKACHE shape=%s sum=%.10g hash=%d",
+                tuple(_ik.shape),
+                float(_iflat[:_in].float().sum()),
+                hash(tuple(_iflat[:_in, :16].float().reshape(-1).tolist())),
+            )
 
     def forward_q(
         self,
