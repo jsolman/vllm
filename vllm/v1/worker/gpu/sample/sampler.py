@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import os
 from collections.abc import Sequence
 
 import numpy as np
@@ -37,6 +39,173 @@ from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
 from vllm.v1.worker.gpu.states import RequestState
+from vllm.logger import init_logger
+
+
+logger = init_logger(__name__)
+
+
+# Debug probe: log the sampled token id and the top-2 logits of every
+# decode step, so a run-to-run divergence can be localised to the exact
+# step whose LOGITS differ (and not just to the step whose hidden state
+# differs). Off unless VLLM_DSV41_LOG_SAMPLED_TOKENS=1 (or the name is
+# in /tmp/dsv41-flags). It needs eager mode: it syncs the GPU.
+_DSV41_LOG_SAMPLED_TOKENS = os.environ.get(
+    "VLLM_DSV41_LOG_SAMPLED_TOKENS", "0") == "1"
+if not _DSV41_LOG_SAMPLED_TOKENS:
+    try:
+        with open("/tmp/dsv41-flags") as _f:
+            _DSV41_LOG_SAMPLED_TOKENS = any(
+                line.strip() == "VLLM_DSV41_LOG_SAMPLED_TOKENS"
+                for line in _f)
+    except OSError:
+        pass
+_DSV41_SAMPLED_COUNT = 0
+_DSV41_SAMPLED_BUDGET = 20000
+
+# Debug probe 2 (the fp32-replay harness): dump the top-64 token ids
+# and logits of EVERY decode row to a JSONL, one line per row, with the
+# request id and the sequence position. The replay (a separate script)
+# re-derives the same rows in fp32 from the captured KV and compares
+# SHAPES (the top-20 sets and their gaps), not just the argmax - the
+# temp-0 ignition is a confident attractor, so a near-tie comparison
+# cannot see it. Off unless VLLM_DSV41_LOG_TOP64=1 (env or the flags
+# file). No budget by row - the harness writes what it asks for;
+# instead it stops after _DSV41_TOP64_MAX_ROWS lines total.
+_DSV41_LOG_TOP64 = os.environ.get("VLLM_DSV41_LOG_TOP64", "0") == "1"
+if not _DSV41_LOG_TOP64:
+    try:
+        with open("/tmp/dsv41-flags") as _f64:
+            _DSV41_LOG_TOP64 = any(
+                line.strip() == "VLLM_DSV41_LOG_TOP64"
+                for line in _f64)
+    except OSError:
+        pass
+_DSV41_TOP64_PATH = os.environ.get(
+    "VLLM_DSV41_TOP64_PATH", "/tmp/dsv41-top64.jsonl")
+# THE IMPORT-TIME TRACE (why did 362 not fire?): one line to the
+# worker log, always.
+try:
+    logger.warning("DSV41 TOP64 import: env=%r file=%r state=%r",
+                   os.environ.get("VLLM_DSV41_LOG_TOP64", "<unset>"),
+                   (open("/tmp/dsv41-flags").read() if os.path.exists("/tmp/dsv41-flags") else "<no file>"),
+                   _DSV41_LOG_TOP64)
+except Exception:
+    pass
+_DSV41_TOP64_MAX_ROWS = int(os.environ.get("VLLM_DSV41_TOP64_MAX_ROWS", "4000"))
+_DSV41_TOP64_OUT = None
+_DSV41_TOP64_ROWS = 0
+
+
+def _dsv41_log_top64(
+    logits: torch.Tensor,
+    sampled: torch.Tensor,
+    req_ids: list[str] | None,
+    pos_list: list[int] | None,
+) -> None:
+    """Dump the top-64 logits rows of a decode batch to a JSONL."""
+    global _DSV41_TOP64_OUT, _DSV41_TOP64_ROWS
+    # CALL-TIME resolution: the 369b/1g mystery - the import-time
+    # flag was True (the worker log) yet no calls ever landed; the
+    # per-call read (the dsv41_flag pattern in the indexer) is the
+    # reliable channel.
+    _on = _DSV41_LOG_TOP64
+    if not _on:
+        try:
+            with open("/tmp/dsv41-flags") as _f:
+                _on = any(line.strip() == "VLLM_DSV41_LOG_TOP64"
+                          for line in _f)
+        except OSError:
+            _on = False
+    if not _on:
+        return
+    if _DSV41_TOP64_ROWS >= _DSV41_TOP64_MAX_ROWS:
+        return
+    try:
+        if _DSV41_TOP64_OUT is None:
+            _DSV41_TOP64_OUT = open(_DSV41_TOP64_PATH, "a")
+        k = min(64, logits.shape[-1])
+        _l64 = logits.float()
+        top = torch.topk(_l64, k=k, dim=-1)
+        vals = top.values.tolist()
+        ids = top.indices.tolist()
+        sids = sampled.view(-1).tolist()
+        for i in range(len(sids)):
+            if _DSV41_TOP64_ROWS >= _DSV41_TOP64_MAX_ROWS:
+                break
+            rid = req_ids[i] if req_ids is not None and i < len(req_ids) else "-"
+            pos = pos_list[i] if pos_list is not None else -1
+            # THE EXACT-TIE FORENSICS: when the top-2 logits are
+            # bit-equal, dump their RAW bits + the original (pre-
+            # float()) dtype values of both tokens, so the
+            # collapse point (quantization vs sampler) is
+            # identifiable.
+            if k >= 2 and vals[i][0] == vals[i][1]:
+                t0, t1 = int(ids[i][0]), int(ids[i][1])
+                row = logits[i].view(-1)
+                v0_raw = row[t0].detach()
+                v1_raw = row[t1].detach()
+                _DSV41_TOP64_OUT.write(json.dumps(dict(
+                    tie=True, req=rid, pos=pos,
+                    t0=t0, t1=t1,
+                    raw_dtype=str(v0_raw.dtype),
+                    v0=v0_raw.view(torch.int16).tolist()
+                       if v0_raw.dtype == torch.bfloat16 else
+                    (v0_raw.view(torch.int32).tolist()
+                     if v0_raw.dtype == torch.float32 else
+                     v0_raw.tolist()),
+                    v1=v1_raw.view(torch.int16).tolist()
+                       if v1_raw.dtype == torch.bfloat16 else
+                    (v1_raw.view(torch.int32).tolist()
+                     if v1_raw.dtype == torch.float32 else
+                     v1_raw.tolist()),
+                )) + "\n")
+            _DSV41_TOP64_OUT.write(json.dumps(dict(
+                req=rid, pos=pos, sampled=sids[i],
+                top=ids[i], lp=vals[i])) + "\n")
+            _DSV41_TOP64_ROWS += 1
+        _DSV41_TOP64_OUT.flush()
+    except Exception as e:  # a debug probe must never break the server
+        logger.warning("DSV41 TOP64 probe failed: %s", e)
+
+
+def _dsv41_log_sampled_tokens(
+    logits: torch.Tensor,
+    sampled: torch.Tensor,
+    req_ids: list[str] | None = None,
+    pos_list: list[int] | None = None,
+) -> None:
+    """Log the sampled token and the top-2 logits per row."""
+    global _DSV41_SAMPLED_COUNT
+    if not _DSV41_LOG_SAMPLED_TOKENS:
+        return
+    if _DSV41_SAMPLED_COUNT >= _DSV41_SAMPLED_BUDGET:
+        return
+    try:
+        top = torch.topk(logits.float(), k=2, dim=-1)
+        ids_l = sampled.view(-1).tolist()
+        t_ids = top.indices.tolist()
+        t_vals = top.values.tolist()
+        for i, tid in enumerate(ids_l):
+            if _DSV41_SAMPLED_COUNT >= _DSV41_SAMPLED_BUDGET:
+                return
+            _DSV41_SAMPLED_COUNT += 1
+            rid = req_ids[i] if req_ids is not None and i < len(req_ids) else "-"
+            logger.warning(
+                "DSV41 SAMP req=%s row=%d tok=%d top0=%d l0=%.10g "
+                "top1=%d l1=%.10g",
+                rid, i, tid, t_ids[i][0], t_vals[i][0], t_ids[i][1], t_vals[i][1],
+            )
+            if _DSV41_SAMPLED_COUNT <= 3:
+                # The first samples of a step: also log the request's
+                # position, which identifies the request uniquely (each
+                # request has its own decode step counter).
+                logger.warning(
+                    "DSV41 SAMPX req=%s row=%d pos=%s",
+                    rid, i, pos_list[i] if pos_list is not None else "-",
+                )
+    except Exception as e:  # a debug probe must never break the server
+        logger.warning("DSV41 SAMP probe failed: %s", e)
 
 
 class Sampler:
@@ -161,6 +330,18 @@ class Sampler:
             expanded_local_pos,
             seq_lens_upper_bound_np,
             return_logprobs=logprobs_dims is not None,
+        )
+        _dsv41_log_sampled_tokens(
+            logits,
+            sampled,
+            input_batch.req_ids,
+            input_batch.positions[input_batch.logits_indices].tolist(),
+        )
+        _dsv41_log_top64(
+            logits,
+            sampled,
+            input_batch.req_ids,
+            pos.tolist(),
         )
 
         if self.trace_replay_state is not None:
