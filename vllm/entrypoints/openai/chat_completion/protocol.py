@@ -78,12 +78,24 @@ class ChatMessage(OpenAIBaseModel):
 
     # vLLM-specific fields that are not in OpenAI spec
     reasoning: str | None = None
+    # The OpenAI-compatible name for the thinking. Together.ai (and most
+    # OpenAI-compatible servers) return the thinking in "reasoning_content";
+    # a client that reads that name sees NOTHING when only "reasoning" is
+    # emitted. Both are emitted so either client works.
+    reasoning_content: str | None = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if len(data.get("tool_calls", [])) == 0:
             data.pop("tool_calls", None)
+        # keep the two names in sync: whichever was set, emit both
+        rc = data.get("reasoning_content")
+        rs = data.get("reasoning")
+        if rc is None and rs is not None:
+            data["reasoning_content"] = rs
+        elif rs is None and rc is not None:
+            data["reasoning"] = rc
         return data
 
 
@@ -727,11 +739,63 @@ class ChatCompletionRequest(OpenAIBaseModel):
             self.response_format,
         )
 
+    def _apply_reasoning_guards(self) -> None:
+        """Guard against runaway reasoning on reasoning models.
+
+        A reasoning model asked to produce a long, self-verifying output (a
+        word count, a summary of a very long conversation) can enter a
+        repetition loop inside its reasoning trace and spend the whole
+        ``max_tokens`` budget there, leaving the content channel empty.
+
+        Two optional server-side guards, both disabled by default:
+
+        * ``VLLM_REASONING_MAX_THINKING_TOKENS`` (int): cap the number of
+          tokens the model may spend reasoning. Equivalent to the request
+          field ``thinking_token_budget``, but applies to every request that
+          does not set one.
+        * ``VLLM_REASONING_MAX_TEMPERATURE`` (float): clamp the sampling
+          temperature to at most this value. Guards against clients that send
+          a high default temperature, which makes the repetition loop far
+          more likely.
+
+        A request that explicitly sets the corresponding field always wins.
+        """
+        import os
+
+        budget = os.environ.get("VLLM_REASONING_MAX_THINKING_TOKENS")
+        if budget and self.thinking_token_budget is None:
+            try:
+                parsed = int(budget)
+            except ValueError:
+                parsed = 0
+            if parsed >= 0:
+                # The thinking budget is drawn from the same token pool as
+                # max_tokens, so a budget larger than the request's own
+                # max_tokens would let reasoning consume the entire response
+                # and leave the content channel empty. Cap it at a fraction
+                # of max_tokens so the answer always has room.
+                limit = self.max_tokens
+                if limit is None:
+                    limit = self.max_completion_tokens
+                if limit is not None and limit > 0:
+                    parsed = min(parsed, max(1, int(limit * 0.75)))
+                self.thinking_token_budget = parsed
+
+        max_temp = os.environ.get("VLLM_REASONING_MAX_TEMPERATURE")
+        if max_temp and self.temperature is not None:
+            try:
+                limit = float(max_temp)
+            except ValueError:
+                limit = None
+            if limit is not None and limit >= 0 and self.temperature > limit:
+                self.temperature = limit
+
     def to_sampling_params(
         self,
         max_tokens: int,
         default_sampling_params: dict,
     ) -> SamplingParams:
+        self._apply_reasoning_guards()
         # Priority: user -> server default -> OpenAI default
         sampling_params = {
             name: (

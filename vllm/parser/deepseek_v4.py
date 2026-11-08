@@ -28,6 +28,7 @@ import regex as re
 from vllm.parser.engine.events import EventType
 from vllm.parser.engine.parser_engine import ParserEngine
 from vllm.parser.engine.parser_engine_config import (
+    ArgValueExtender,
     ParserEngineConfig,
     ParserState,
     Transition,
@@ -64,27 +65,39 @@ def _param_patterns(
 
     The ``string`` attribute is optional: the model sometimes omits it, and
     dropping such a parameter hands the client a tool call with no arguments.
+    The trailing-partial regex captures the open value up to the end of the
+    text; ``_match_open_param`` holds back an unfinished next parameter tag
+    so a streamed string value never includes it.
     """
     # Temper anchor = the bracket-free DSML core so both `<｜DSML｜…` and
     # `</｜DSML｜…` trip `</?` (the optional slash sits between them).
-    _ESCAPED_DSML = re.escape(_DSML)
     start, close = re.escape(param_start), re.escape(param_close)
     head = rf'{start}\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
-    # Temper the value at ANY DSML tag boundary - opener OR closer must both
-    # trip the lookbehind anchor, so that anchor is the shared core (without
-    # the angle: </? supplies it), NOT the full opener prefix. Prevents a
-    # malformed closer from latching into a streamed value.
-    value = rf"((?:(?!</?{_ESCAPED_DSML}).)*)"
     return (
-        re.compile(rf"{head}{value}(?:{close}|(?={start}\s+name=))", re.DOTALL),
-        # Partial (streamed) value gets the SAME temper: without it a closer
-        # arriving mid-stream leaks into the partial value until the closer
-        # completes the match.
-        re.compile(rf"{head}{value}", re.DOTALL),
+        re.compile(rf"{head}(.*?)(?:{close}|(?={start}\s+name=))", re.DOTALL),
+        re.compile(rf"{head}(.*)\Z", re.DOTALL),
     )
 
 
 _PARAM_RE, _PARTIAL_PARAM_RE = _param_patterns(DSML_PARAM_START, DSML_PARAM_CLOSE)
+
+
+def _match_open_param(
+    raw_args: str, pos: int, partial_param_re: re.Pattern, param_start: str
+) -> tuple[str, str | None, str, bool] | None:
+    """Return (name, is_str, value, held_back) for the trailing open param.
+
+    An unfinished next parameter tag (``param_start`` with no ``>`` after it)
+    is cut from the value; ``held_back`` reports whether that happened.
+    """
+    pm = partial_param_re.search(raw_args, pos)
+    if pm is None:
+        return None
+    value = pm.group(3)
+    cut = value.find(param_start, value.rfind(">") + 1)
+    if cut >= 0:
+        return pm.group(1), pm.group(2), value[:cut], True
+    return pm.group(1), pm.group(2), value, False
 
 
 def _dsml_arg_converter(
@@ -93,6 +106,7 @@ def _dsml_arg_converter(
     *,
     param_re: re.Pattern = _PARAM_RE,
     partial_param_re: re.Pattern = _PARTIAL_PARAM_RE,
+    param_start: str = DSML_PARAM_START,
 ) -> str:
     params: dict[str, object] = {}
 
@@ -111,9 +125,11 @@ def _dsml_arg_converter(
         last_end = m.end()
 
     if partial:
-        pm = partial_param_re.search(raw_args, last_end)
-        if pm:
-            name, is_str, value = pm.group(1), pm.group(2), pm.group(3)
+        open_param = _match_open_param(
+            raw_args, last_end, partial_param_re, param_start
+        )
+        if open_param:
+            name, is_str, value, _ = open_param
             if is_str == "true":
                 params[name] = value
             else:
@@ -121,6 +137,44 @@ def _dsml_arg_converter(
                     params[name] = json.loads(value)
 
     return json.dumps(params, ensure_ascii=False)
+
+
+def _dsml_arg_value_extender(
+    raw_args: str,
+    *,
+    param_re: re.Pattern = _PARAM_RE,
+    partial_param_re: re.Pattern = _PARTIAL_PARAM_RE,
+    param_start: str = DSML_PARAM_START,
+    param_close: str = DSML_PARAM_CLOSE,
+) -> ArgValueExtender | None:
+    # ``arg_structural_chars`` skips every delta without ``>``, so a long
+    # string value would wait for its closing tag. Extend the open trailing
+    # ``string="true"`` value instead. The lexer can flush a held partial
+    # tag as text, so keep a tail to catch a tag split across deltas.
+    names = set()
+    last_end = 0
+    for m in param_re.finditer(raw_args):
+        names.add(m.group(1))
+        last_end = m.end()
+    open_param = _match_open_param(raw_args, last_end, partial_param_re, param_start)
+    if open_param is None:
+        return None
+    name, is_str, _, held_back = open_param
+    if is_str != "true" or name in names or held_back:
+        return None
+
+    keep = max(len(param_start), len(param_close)) - 1
+    tail = raw_args[-keep:]
+
+    def extend(delta: str) -> str | None:
+        nonlocal tail
+        text = tail + delta
+        if param_start in text or param_close in text:
+            return None
+        tail = text[-keep:]
+        return json.dumps(delta, ensure_ascii=False)[1:-1]
+
+    return extend
 
 
 def _unwrap_wrapper_args(
@@ -249,9 +303,35 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
         },
         arg_converter=_dsml_arg_converter,
         arg_structural_chars=frozenset(">"),
+        arg_value_extender=_dsml_arg_value_extender,
         strip_content_whitespace_with_tools=False,
         tool_args_json=False,
     )
+
+
+def _default_thinking_mode() -> bool:
+    """The default thinking mode, shared with the DSv4.1 tokenizer.
+
+    The tokenizer wrapper (vllm/tokenizers/deepseek_v41.py) renders the
+    prompt with this mode, and the parser must use the SAME one or the
+    reasoning and the content get swapped: the parser's initial state is
+    REASONING in the thinking mode and CONTENT otherwise.
+
+    The default is the THINKING mode. The SERVED reference deployment
+    uses it - the cloud's prompt_tokens match the thinking mode exactly
+    (6996 / 7849 / 8018 for the three test prompts) and not the chat
+    mode (6971 / 7822 / 7986). The model's standalone inference script
+    defaults to "chat" (inference/generate.py), but that is the script,
+    not the deployment.
+
+    Set VLLM_DSV41_THINKING_MODE=chat for the chat mode (no effort
+    prefix, no <think>).
+    """
+    import os
+
+    return os.environ.get(
+        "VLLM_DSV41_THINKING_MODE", "thinking"
+    ).strip().lower() not in ("chat", "0", "false", "off")
 
 
 class DeepSeekV4Parser(ParserEngine):
@@ -268,7 +348,19 @@ class DeepSeekV4Parser(ParserEngine):
             chat_kwargs.get("thinking") or chat_kwargs.get("enable_thinking")
         )
         if "thinking" not in chat_kwargs and "enable_thinking" not in chat_kwargs:
-            thinking = True
+            # The parser's thinking mode MUST match the mode the
+            # tokenizer rendered the prompt with, or the reasoning and
+            # the content get swapped: the parser's initial state is
+            # REASONING in the thinking mode and CONTENT otherwise.
+            #
+            # The DSv4.1 tokenizer's default thinking mode follows the
+            # model's own reference inference (the CHAT mode - see
+            # inference/generate.py's --thinking-mode default="chat"),
+            # and it is controlled by VLLM_DSV41_THINKING_MODE. The
+            # parser has to read the SAME switch, or a request with no
+            # kwargs would be parsed in the thinking mode while the
+            # prompt was rendered in the chat mode.
+            thinking = _default_thinking_mode()
         thinking = thinking and chat_kwargs.get("reasoning_effort") != "none"
         super().__init__(
             tokenizer,

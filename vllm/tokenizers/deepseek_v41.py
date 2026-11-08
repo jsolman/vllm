@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+import os
 from typing import Any
 
 from transformers import TokenizersBackend
@@ -87,8 +88,45 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 system["tools"] = tools
 
             thinking = bool(kwargs.get("thinking") or kwargs.get("enable_thinking"))
+            # An EXPLICIT reasoning effort implies the thinking mode: the
+            # effort prefix is only rendered in the thinking mode, so
+            # asking for an effort and getting the chat mode would
+            # silently drop it. This also matches the parser, which
+            # treats an effort other than "none" as the thinking mode
+            # (vllm/parser/deepseek_v4.py) - the tokenizer and the
+            # parser must agree, or the reasoning and the content get
+            # swapped.
             if "thinking" not in kwargs and "enable_thinking" not in kwargs:
-                thinking = True
+                if kwargs.get("reasoning_effort") is not None:
+                    thinking = kwargs.get("reasoning_effort") != "none"
+                else:
+                    # The DEFAULT thinking mode: the THINKING mode.
+                    #
+                    # The reference's STANDALONE inference script
+                    # defaults to the chat mode (inference/generate.py:
+                    # --thinking-mode default="chat"), but the SERVED
+                    # deployment uses the THINKING mode, and the token
+                    # counts prove it:
+                    #
+                    #   the single-turn sermon request:
+                    #     the cloud 6996, the thinking mode 6996, the chat mode 6971
+                    #   the multi-turn (2 tool results):
+                    #     the cloud 7849, the thinking mode 7849, the chat mode 7822
+                    #   the multi-turn (6 tool results):
+                    #     the cloud 8018, the thinking mode 8018, the chat mode 7986
+                    #
+                    # The cloud's counts match the THINKING mode EXACTLY,
+                    # so the thinking mode is what the reference
+                    # deployment serves - and matching it is what makes
+                    # the local's first-token distribution match the
+                    # cloud's.
+                    #
+                    # Set VLLM_DSV41_THINKING_MODE=chat for the
+                    # standalone script's behaviour (no effort prefix,
+                    # no <think>).
+                    thinking = os.environ.get(
+                        "VLLM_DSV41_THINKING_MODE", "thinking"
+                    ).strip().lower() not in ("chat", "0", "false", "off")
             effort = kwargs.get("reasoning_effort")
             if effort == "none":
                 thinking = False

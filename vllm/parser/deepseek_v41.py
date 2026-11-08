@@ -8,6 +8,7 @@ from dataclasses import replace
 from vllm.parser.deepseek_v4 import (
     DeepSeekV4Parser,
     _dsml_arg_converter,
+    _dsml_arg_value_extender,
     _param_patterns,
     deepseek_v4_config,
 )
@@ -46,6 +47,20 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
             _dsml_arg_converter,
             param_re=_PARAM_RE,
             partial_param_re=_PARTIAL_PARAM_RE,
+            param_start=DSML_PARAM_START,
+        ),
+        # Upstream PR 58822: without the extender path, the structural-char
+        # gate ('>') suppresses argument deltas until a '>' arrives - a
+        # long string value streams NOTHING during the wait, and the
+        # client sees the stream stall. The v41 config's extender handles
+        # the open string case; everything else streams raw deltas.
+        arg_structural_chars=None,
+        arg_value_extender=functools.partial(
+            _dsml_arg_value_extender,
+            param_re=_PARAM_RE,
+            partial_param_re=_PARTIAL_PARAM_RE,
+            param_start=DSML_PARAM_START,
+            param_close=DSML_PARAM_CLOSE,
         ),
     )
 
