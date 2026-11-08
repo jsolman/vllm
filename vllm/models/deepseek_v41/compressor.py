@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import dataclass
 from typing import Any, ClassVar, cast
 
@@ -18,6 +19,7 @@ from vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache import (
     rope_quant_insert,
     save_ring_rows,
 )
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
@@ -28,6 +30,41 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
+
+logger = init_logger(__name__)
+
+# Debug: log a per-token checksum of the compressor's pooled latent.
+def _dsv41_flag(name: str) -> bool:
+    """Read a debug flag from the env OR from /tmp/dsv41-flags (one name
+    per line). The engine process does not inherit every env var, so the
+    file is the reliable channel for a live experiment."""
+    if os.environ.get(name, "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            for line in f:
+                if line.strip() == name:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+_DSV41_LOG_COMPRESSOR = _dsv41_flag("VLLM_DSV41_LOG_COMPRESSOR")
+_DSV41_LOG_CACHE = _dsv41_flag("VLLM_DSV41_LOG_CACHE")
+# A hard cap on the probe's output per process (a debug run must never
+# fill the disk).
+_DSV41_LOG_MAX_TOKENS = int(os.environ.get("VLLM_DSV41_LOG_MAX_TOKENS", "64") or 64)
+_DSV41_LOG_BUDGET = int(os.environ.get("VLLM_DSV41_LOG_BUDGET", "20000") or 20000)
+_dsv41_log_used = 0
+
+
+def _dsv41_log(fmt: str, *args) -> None:
+    global _dsv41_log_used
+    if _dsv41_log_used >= _DSV41_LOG_BUDGET:
+        return
+    _dsv41_log_used += 1
+    logger.warning(fmt, *args)
 
 
 class CompressorBackend(AttentionBackend):
@@ -358,6 +395,20 @@ class DeepseekCompressor(nn.Module):
                 prev_row_indices = state_metadata.prev_row_indices
                 ring_write_slots = state_metadata.ring_write_slots
 
+        if _DSV41_LOG_COMPRESSOR and kv_score is not None and kv_score.numel():
+            # Debug: the compressor's INPUT, before the pooling. If this is
+            # identical across runs but the latent is not, the pooling (the
+            # ring) is the culprit; if it differs, the divergence is
+            # upstream in the FFN/MoE.
+            kf = kv_score.detach().float()
+            sums = kf.sum(dim=1)
+            mx = kf.abs().amax(dim=1)
+            nz = (mx > 0).nonzero().flatten()
+            for ti in nz[:_DSV41_LOG_MAX_TOKENS].tolist():
+                _dsv41_log(
+                    "DSV41 CIN tok=%d sum=%.10g absmax=%.10g",
+                    ti, float(sums[ti]), float(mx[ti]),
+                )
         latent = torch.empty(
             kv_score.shape[0],
             self.head_dim,
@@ -381,6 +432,20 @@ class DeepseekCompressor(nn.Module):
         if prev_rows is not None:
             assert state_cache is not None and ring_write_slots is not None
             save_ring_rows(prev_rows, ring_write_slots, state_cache)
+        if _DSV41_LOG_COMPRESSOR and latent is not None and latent.numel():
+            # Debug: a per-token checksum of the POOLED latent, so two runs
+            # of the same request can be compared offline. The latent is
+            # filled only at the group boundaries, so the tokens that
+            # differ are exactly the ones whose pooled row differs.
+            lf = latent.detach().float()
+            sums = lf.sum(dim=1)
+            mx = lf.abs().amax(dim=1)
+            nz = (mx > 0).nonzero().flatten()
+            for ti in nz[:_DSV41_LOG_MAX_TOKENS].tolist():
+                _dsv41_log(
+                    "DSV41 COMP tok=%d sum=%.10g absmax=%.10g",
+                    ti, float(sums[ti]), float(mx[ti]),
+                )
         return latent
 
     def insert_cache(
@@ -414,3 +479,27 @@ class DeepseekCompressor(nn.Module):
             self.compress_ratio,
             fp8_scale=fp8_scale,
         )
+
+        if _dsv41_flag("VLLM_DSV41_LOG_CACHE"):
+            # Debug: the COMPRESSED CACHE's contents after the write.
+            # The per-layer probe covers the hidden states, but NOT what
+            # the prefill wrote into the cache - and the decode reads
+            # the cache, so a difference there is invisible to the layer
+            # probe and visible in the decode.
+            #
+            # The ABSMAX matters as much as the hash: the latent is
+            # allocated with torch.empty and the pooling writes only the
+            # group-boundary rows, so if the insert read a row that was
+            # never written, the cache would hold allocator garbage
+            # (magnitude ~1e36) - and that garbage varies run to run
+            # because the allocator hands back different memory.
+            _k = kv_cache.detach()
+            _flat = _k.reshape(_k.shape[0], -1)
+            _n = min(64, _flat.shape[0])
+            logger.warning(
+                "DSV41 CCACHE shape=%s sum=%.10g amax=%.10g hash=%d",
+                tuple(_k.shape),
+                float(_flat[:_n].float().sum()),
+                float(_flat[:_n].float().abs().max()) if _n else 0.0,
+                hash(tuple(_flat[:_n, :16].float().reshape(-1).tolist())),
+            )

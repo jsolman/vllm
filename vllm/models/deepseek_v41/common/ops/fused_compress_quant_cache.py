@@ -8,6 +8,37 @@ from vllm.models.deepseek_v4.common.ops.fused_indexer_q import _fp32x2_to_fp4x2
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
+
+def _quant_e2m1_enabled() -> bool:
+    """Use the reference's compressed-cache format (e2m1 with one e4m3
+    scale per 16 dims) instead of our fp8/UE8M0-per-64 one.
+
+    The reference (`inference/model.py`) quantises the whole 512-dim
+    latent to e2m1 with an e4m3 scale per 16 dims and stores the
+    DEQUANTISED values. Our format is more accurate, but the model was
+    trained on the reference's, so the difference is a real difference
+    in the numbers the attention sees (~10% of the attention score's
+    spread, with 31 of the 512 selected positions changing). See
+    notes/DSV41-LOOPING-ROOTCAUSE.md (2aw).
+
+    Read from the env OR from /tmp/dsv41-flags (one name per line) - the
+    engine process does not inherit every env var, so the file is the
+    reliable channel for a live A/B.
+    """
+    import os
+
+    name = "VLLM_DSV41_QUANT_E2M1_CACHE"
+    if os.environ.get(name, "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            for line in f:
+                if line.strip() == name:
+                    return True
+    except OSError:
+        pass
+    return False
+
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX950
 else:
@@ -323,6 +354,7 @@ def rope_quant_insert(
     if num_tokens == 0:
         return
     launch_kwargs = {"launch_pdl": False} if current_platform.is_cuda() else {}
+    quant_e2m1 = _quant_e2m1_enabled()
     if kv_cache.dtype == torch.uint8:
         kernel = {
             584: _rope_quant_insert_kernel,
@@ -332,6 +364,10 @@ def rope_quant_insert(
         assert kernel is not None, (
             f"unsupported paged KV record width {kv_cache.shape[-1]}"
         )
+        if kernel is _rope_quant_insert_kernel and quant_e2m1:
+            # The reference's compressed-cache format (e2m1 with one e4m3
+            # scale per 16 dims), stored in our 584 B record.
+            kernel = _rope_quant_insert_e2m1_kernel
         kernel[(num_tokens,)](
             latent,
             positions,
@@ -373,6 +409,164 @@ def rope_quant_insert(
 
 
 @triton.jit
+def _round_e2m1(scaled, N: tl.constexpr):
+    """Round to the nearest e2m1 level, with the midpoints going to the
+    even level.
+
+    The e2m1 grid: {0, 0.5, 1, 1.5, 2, 3, 4, 6} x the sign. The
+    reference's tilelang kernel lowers its FP4 cast to the hardware's
+    `cvt.rn.satfinite.e2m1x2.f32`, which rounds to nearest with the
+    ties to even - so the midpoints (0.25, 0.75, 1.25, 1.75, 2.5, 3.5,
+    5.0) go to the even level (0, 1, 2, 4, 6). The hardware's PTX cast
+    is used, so the rounding is identical by construction.
+    """
+    # The hardware's FP4 cast: `cvt.rn.satfinite.e2m1x2.f32` - the SAME
+    # instruction the reference's tilelang kernel lowers to, so the
+    # rounding (nearest, ties to even) is identical by construction.
+    # It packs two fp32 into one byte (the high nibble from the first).
+    flat = tl.reshape(scaled, (N,))
+    lo, hi = tl.split(tl.reshape(flat, (N // 2, 2)))
+    packed = _fp32x2_to_fp4x2(lo, hi)
+    # Decode the nibbles back to the e2m1 levels: the grid is
+    # {0, 0.5, 1, 1.5, 2, 3, 4, 6} x the sign, and the magnitude index
+    # is the low 3 bits (0 -> 0, 1 -> 0.5, 2 -> 1, 3 -> 1.5, 4 -> 2,
+    # 5 -> 3, 6 -> 4, 7 -> 6).
+    # The LOW nibble holds the FIRST element of the pair and the high
+    # nibble the second (verified against the hardware cast: the inputs
+    # 1.0 and 3.0 pack to 0x52 - the low nibble 2 -> 1.0, the high
+    # nibble 5 -> 3.0).
+    first = (packed & 0x0F).to(tl.int32)
+    second = (packed & 0xF0).to(tl.int32) >> 4
+    me = first & 0x07
+    le = tl.where(me == 0, 0.0, tl.where(me == 1, 0.5,
+           tl.where(me == 2, 1.0, tl.where(me == 3, 1.5,
+           tl.where(me == 4, 2.0, tl.where(me == 5, 3.0,
+           tl.where(me == 6, 4.0, 6.0)))))))
+    le = tl.where(((first >> 3) & 1) > 0, -le, le)
+    mo = second & 0x07
+    lo_ = tl.where(mo == 0, 0.0, tl.where(mo == 1, 0.5,
+            tl.where(mo == 2, 1.0, tl.where(mo == 3, 1.5,
+            tl.where(mo == 4, 2.0, tl.where(mo == 5, 3.0,
+            tl.where(mo == 6, 4.0, 6.0)))))))
+    lo_ = tl.where(((second >> 3) & 1) > 0, -lo_, lo_)
+    return tl.reshape(tl.interleave(le, lo_), (N,))
+
+
+@triton.jit
+def _rope_quant_insert_e2m1_kernel(
+    latent,
+    positions,
+    cos_sin,
+    cache,
+    cache_slots,
+    COS_STRIDE: tl.constexpr,
+    CACHE_STRIDE: tl.constexpr,
+    CACHE_BLOCK: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    SANITIZE_CACHE_NANS: tl.constexpr,
+):
+    """The reference's compressed-cache format, in our record layout.
+
+    The reference (`inference/model.py`):
+        apply_rotary_emb(latent[..., -rope_head_dim:], freqs)
+        fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)
+    quantises the WHOLE 512-dim latent to e2m1 with one e4m3 scale per
+    16 dims and stores the DEQUANTISED values (the reference's cache is
+    a bf16 tensor).
+
+    Our record (the 584 B plain-row record) holds the NoPE dims as fp8
+    e4m3 with a UE8M0 scale per 64 dims and the RoPE tail as bf16. So
+    the reference's dequantised values are stored there instead - and
+    since the attention reads the record back through its own
+    dequantisation, the numbers it sees are the reference's.
+
+    **WHY:** the reference's cache is 4-bit and ours is 8-bit, and the
+    model was trained on the reference's. Our more accurate cache is a
+    DIFFERENT cache: a ~10% perturbation of the attention score, with
+    31 of the 512 selected positions changing. See
+    notes/DSV41-LOOPING-ROOTCAUSE.md (2aw).
+
+    The NoPE dims need no rotation (their cos/sin are (1, 0)), so they
+    are read straight from the latent; only the tail is rotated.
+    """
+    t = tl.program_id(0)
+    slot = tl.load(cache_slots + t)
+    if slot < 0:
+        return
+    position = tl.load(positions + t)
+    if (position + 1) % COMPRESS_RATIO != 0:
+        return
+
+    page = cache + (slot // CACHE_BLOCK).to(tl.int64) * CACHE_STRIDE
+    values = page + (slot % CACHE_BLOCK) * 576
+    scales = page + CACHE_BLOCK * 576 + (slot % CACHE_BLOCK) * 8
+    base = position // COMPRESS_RATIO * COMPRESS_RATIO
+
+    # ---- the latent as a [32, 16] tile: the 32 groups of 16 (the
+    # reference's e2m1 block size). The NoPE dims are the first 28 rows
+    # (448 dims) and the tail is the last 4 rows (64 dims).
+    row = tl.arange(0, 32)
+    col = tl.arange(0, 16)
+    loff = row[:, None] * 16 + col[None, :]
+    # The latent is BF16 (the reference's cache is a bf16 tensor, so the
+    # reference's group amax is a bf16 value). The load keeps the bf16
+    # precision and the arithmetic is done in fp32 FROM THE BF16 VALUES
+    # - which is what the reference does (its kernel reads the bf16
+    # tensor into an fp32 fragment).
+    lat = tl.load(latent + t.to(tl.int64) * 512 + loff).to(tl.float32)
+    # The rotation partner: the pair partner of dim d is d^1, and the
+    # pairs never cross a 16-dim row (the rows start at even dims).
+    part = tl.load(latent + t.to(tl.int64) * 512 + (loff ^ 1)).to(tl.float32)
+    # The cos/sin: the tail's 32 pairs (the NoPE dims' cos/sin are
+    # (1, 0), so they are not rotated).
+    in_tail = row >= 28
+    # The tail's 32 pairs: the pair p covers dims 448+2p and 448+2p+1.
+    # The tail's dims are 448..511, so dim 448+2p is in row 28 + p//8
+    # at column (p % 8) * 2 - and its pair index is p.
+    # (The NoPE dims' pairs have cos/sin (1, 0), so they are the
+    # identity.)
+    pidx = tl.where(in_tail[:, None],
+                    (row[:, None] - 28) * 8 + (col[None, :] // 2),
+                    0)
+    cs = cos_sin + base * COS_STRIDE
+    cc = tl.load(cs + pidx).to(tl.float32)
+    ss = tl.load(cs + 32 + pidx).to(tl.float32)
+    is_even = (col % 2) == 0
+    rot = tl.where(is_even, lat * cc - part * ss, lat * cc + part * ss)
+    rot = tl.where(in_tail[:, None], rot, lat)
+    if SANITIZE_CACHE_NANS:
+        rot = tl.where(rot == rot, rot, 0.0)
+
+    # The reference's scale: e4m3(amax/6) per group of 16, over the
+    # WHOLE 512 dims.
+    amax16 = tl.maximum(tl.max(tl.abs(rot), 1), 6.0 * (2.0**-9))
+    sc16 = (amax16 * (1.0 / 6.0)).to(tl.float8e4nv).to(tl.float32)
+    scaled = tl.clamp(tl.math.div_rn(rot, sc16[:, None]), -6.0, 6.0)
+    deq = tl.reshape(_round_e2m1(tl.reshape(scaled, (512,)), 512), (32, 16)) \
+        * sc16[:, None]
+
+    # ---- store: the NoPE dims as fp8 (our record), with the UE8M0
+    # scale per 64 dims. The [8, 64] view gives the 7 groups of 64
+    # NoPE dims (the 8th is the tail, which is stored as bf16).
+    d8 = tl.reshape(deq, (8, 64))
+    amax64 = tl.maximum(tl.max(tl.abs(d8), 1), 1e-4)
+    exponent = tl.ceil(tl.log2(amax64 * (1.0 / 448.0)))
+    fp8 = tl.clamp(d8 * tl.exp2(-exponent)[:, None], -448.0, 448.0)
+    fp8 = fp8.to(tl.float8e4nv)
+    n8 = tl.arange(0, 8)
+    c64 = tl.arange(0, 64)
+    nidx8 = n8[:, None] * 64 + c64[None, :]
+    tl.store(values + nidx8, fp8.to(tl.uint8, bitcast=True), nidx8 < 448)
+    enc = tl.minimum(tl.maximum(exponent + 127.0, 0.0), 255.0).to(tl.uint8)
+    tl.store(scales + n8, enc, n8 < 7)
+    tl.store(scales + 7, tl.full((), 0, tl.uint8))
+
+    # ---- store: the tail as bf16.
+    rope_dst = (values + 448).to(tl.pointer_type(tl.bfloat16))
+    tl.store(rope_dst + loff - 448, deq.to(tl.bfloat16), in_tail[:, None])
+
+
+@triton.jit
 def _rope_quant_insert_kernel(
     latent,
     positions,
@@ -398,6 +592,17 @@ def _rope_quant_insert_kernel(
     values = page + (slot % CACHE_BLOCK) * 576
     scales = page + CACHE_BLOCK * 576 + (slot % CACHE_BLOCK) * 8
 
+    even, odd = tl.split(tl.reshape(normed, (256, 2)))
+    pair = tl.arange(0, 256) - 224
+    cs = cos_sin + (position // COMPRESS_RATIO * COMPRESS_RATIO) * COS_STRIDE
+    c = tl.load(cs + tl.maximum(pair, 0), pair >= 0, other=1.0).to(tl.float32)
+    s = tl.load(cs + 32 + tl.maximum(pair, 0), pair >= 0, other=0.0).to(tl.float32)
+    rotated = tl.interleave(even * c - odd * s, odd * c + even * s)
+    if SANITIZE_CACHE_NANS:
+        rotated = tl.where(rotated == rotated, rotated, 0.0)
+
+    # The NoPE dims (the first 448 of the latent): our record stores
+    # them as fp8 e4m3 with a UE8M0 scale per 64 dims.
     quant = tl.reshape(normed, (8, 64))
     amax = tl.maximum(tl.max(tl.abs(quant), 1), 1e-4)
     exponent = tl.ceil(tl.log2(amax * (1.0 / 448.0)))
@@ -411,14 +616,6 @@ def _rope_quant_insert_kernel(
     tl.store(scales + s, encoded.to(tl.uint8), s < 7)
     tl.store(scales + 7, tl.full((), 0, tl.uint8))
 
-    even, odd = tl.split(tl.reshape(normed, (256, 2)))
-    pair = tl.arange(0, 256) - 224
-    cs = cos_sin + (position // COMPRESS_RATIO * COMPRESS_RATIO) * COS_STRIDE
-    c = tl.load(cs + tl.maximum(pair, 0), pair >= 0, other=1.0).to(tl.float32)
-    s = tl.load(cs + 32 + tl.maximum(pair, 0), pair >= 0, other=0.0).to(tl.float32)
-    rotated = tl.interleave(even * c - odd * s, odd * c + even * s)
-    if SANITIZE_CACHE_NANS:
-        rotated = tl.where(rotated == rotated, rotated, 0.0)
     rope_dst = (values + 448).to(tl.pointer_type(tl.bfloat16))
     tl.store(rope_dst + d - 448, rotated.to(tl.bfloat16), d >= 448)
 
