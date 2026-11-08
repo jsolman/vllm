@@ -11,6 +11,8 @@ instead of O(context). It requires the `DeepseekV41SparseIndexerBackend`
 metadata (see ``AttentionConfig.indexer_sparse_logits``).
 """
 
+import os
+from vllm.logger import init_logger
 import torch
 from torch import nn
 
@@ -70,6 +72,31 @@ def _gather_prefill_chunk_k(
             chunk.local_cu_seq_lens,
         )
     return k_quant, k_scale
+
+logger = init_logger(__name__)
+
+def _dsv41_flag(name: str) -> bool:
+    """Read a debug flag from the env OR from /tmp/dsv41-flags.
+
+    A flag must be exported in BOTH blocks of the launcher (the top-level
+    one, which the head's API server inherits, and the remote ssh one,
+    which the ranks 1-3 inherit). The flags file is the belt-and-braces
+    channel: it works even when a flag is missing from one of them.
+    """
+    if os.environ.get(name, "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            for line in f:
+                if line.strip() == name:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+# Debug: log the published top-k block indices.
+_DSV41_LOG_TOPK = _dsv41_flag("VLLM_DSV41_LOG_TOPK")
 
 
 class SparseMQAIndexer(nn.Module):
@@ -180,6 +207,23 @@ class SparseMQAIndexer(nn.Module):
                     col_indices=rows.col_indices,
                     kernel_metadata=rows.kernel_metadata,
                 )
+                if _DSV41_LOG_TOPK:
+                    # Debug: the PREFILL's published top-k selection.
+                    # This is the discrete set of context positions the
+                    # next layer's sparse attention reads. If it differs
+                    # between two runs of the SAME request, the indexer's
+                    # scores (or its top-k) are the race.
+                    _pt = topk_indices_buffer[start:end, :topk_tokens]
+                    for _r in range(min(_pt.shape[0], 4)):
+                        _v = _pt[_r].detach().to(torch.int64).tolist()
+                        logger.warning(
+                            "DSV41 PTOPK chunk=%d row=%d sum=%d hash=%d "
+                            "first=%s",
+                            start, _r,
+                            sum(int(x) for x in _v if x >= 0),
+                            hash(tuple(int(x) for x in _v)),
+                            _v[:12],
+                        )
 
         if metadata.num_decodes > 0:
             decode_rows = metadata.sparse_decode
@@ -205,5 +249,17 @@ class SparseMQAIndexer(nn.Module):
                     end=decode_rows.end,
                     col_indices=decode_rows.col_indices,
                     kernel_metadata=decode_rows.kernel_metadata,
+                )
+        if _DSV41_LOG_TOPK and hidden_states.shape[0]:
+            # Debug: the PUBLISHED top-k block indices, AFTER both branches
+            # have written them. This is the discrete selection the NEXT
+            # layer consumes. If it differs between two runs of the SAME
+            # request, the indexer's scores differ.
+            _t = topk_indices_buffer[: hidden_states.shape[0], :topk_tokens]
+            for _r in range(min(_t.shape[0], 8)):
+                _v = _t[_r].detach().to(torch.int64).tolist()
+                logger.warning(
+                    "DSV41 TOPK row=%d sum=%d first=%s",
+                    _r, sum(int(x) for x in _v if x >= 0), _v[:12],
                 )
         return topk_indices_buffer

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
 import torch
 import torch.distributed as dist
 
@@ -42,8 +43,13 @@ from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
     has_deep_gemm,
+    is_deep_gemm_supported,
     mqa_logits_mx_inputs,
     mqa_logits_use_mx_scales,
+)
+from vllm.v1.attention.ops.mqa_logits_triton import (
+    fp8_mqa_logits_triton,
+    fp8_paged_mqa_logits_triton,
 )
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.torch_utils import (
@@ -61,6 +67,69 @@ from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+# CANONICALISE THE TOP-K's OUTPUT ORDER.
+#
+# The compiled top-k returns the selected positions in an ARBITRARY
+# order: on the same logits, 10 runs produced 10 different orders (955
+# of 1024 positions moved). The sparse attention reduces over the
+# selected positions - the softmax denominator and the weighted sum -
+# so the reduction ORDER changes the BF16 rounding of the result. The
+# attention is order-invariant in exact arithmetic, so sorting the
+# selection ASCENDING costs nothing and makes the reduction
+# deterministic.
+#
+# The -1 padding must stay at the END, so only the valid prefix is
+# sorted.
+_DSV41_CANONICAL_TOPK = os.environ.get("VLLM_DSV41_CANONICAL_TOPK", "1") == "1"
+
+
+def _sort_topk_rows(out: torch.Tensor) -> None:
+    """Sort each row's selected positions ascending, in place."""
+    if out.numel() == 0:
+        return
+    valid = (out >= 0).sum(dim=1)
+    if int(valid.min()) == out.shape[1] and int(valid.max()) == out.shape[1]:
+        # Every row is full: sort the whole row.
+        #
+        # NOTE: the IN-PLACE sort (out.sort(dim=1)) is BROKEN in this
+        # build - it silently leaves the tensor unchanged for an int32
+        # CUDA tensor of this shape. The out-of-place form
+        # (torch.sort(out, dim=1).values) is correct, so use it and copy
+        # the result back.
+        out.copy_(torch.sort(out, dim=1).values)
+        return
+    # A ragged sort: the -1 padding must stay at the END. Replace the
+    # padding with a large sentinel, sort ascending (stable, so the
+    # valid entries keep their relative order among equal values), then
+    # put the padding back.
+    big = torch.iinfo(torch.int32).max
+    padded = torch.where(out >= 0, out, torch.full_like(out, big))
+    order = torch.argsort(padded.to(torch.int64), dim=1, stable=True)
+    out.copy_(torch.gather(padded, 1, order))
+    out.copy_(torch.where(out == big, torch.full_like(out, -1), out))
+
+
+
+def _dsv41_flag(name: str) -> bool:
+    """Read a debug flag from the env OR from /tmp/dsv41-flags.
+
+    A flag must be exported in BOTH blocks of the launcher (the top-level
+    one, which the head's API server inherits, and the remote ssh one,
+    which the ranks 1-3 inherit). The flags file is the belt-and-braces
+    channel: it works even when a flag is missing from one of them.
+    """
+    if os.environ.get(name, "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            for line in f:
+                if line.strip() == name:
+                    return True
+    except OSError:
+        pass
+    return False
+
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -723,18 +792,38 @@ def sparse_attn_indexer(
                     q_scale_slice, chunk_weights = mqa_logits_mx_inputs(
                         q_slice_cast, q_scale_slice, weights[row_start:row_end]
                     )
-                    row_ends = cu_seqlen_ke - cu_seqlen_ks
-                    logits = as_fp32_logits(
-                        fp8_fp4_mqa_logits(
-                            (q_slice_cast, q_scale_slice),
+                    # The candidate-block kernel's columns are ABSOLUTE
+                    # (the logits are [rows, the whole compressed cache]),
+                    # so its row bounds must be absolute too. Passing the
+                    # RELATIVE end (cu_seqlen_ke - cu_seqlen_ks) with no
+                    # start made the kernel score the columns [0, ke-ks)
+                    # - which for every chunk after the first are the
+                    # UNREACHABLE (-inf) positions - so it selected one
+                    # block instead of 256, and the wrong ones.
+                    # (Measured: the block set became IDENTICAL to the
+                    #  reference's select_candidate_blocks at every chunk.)
+                    row_starts = cu_seqlen_ks
+                    row_ends = cu_seqlen_ke
+                    if use_deep_gemm():
+                        logits = as_fp32_logits(
+                            fp8_fp4_mqa_logits(
+                                (q_slice_cast, q_scale_slice),
+                                (k_quant_cast, k_scale_cast),
+                                chunk_weights,
+                                cu_seqlen_ks,
+                                cu_seqlen_ke,
+                                chunk.max_seqlen_k,
+                            ),
+                            row_ends,
+                        )
+                    else:
+                        logits = fp8_mqa_logits_triton(
+                            q_slice_cast,
                             (k_quant_cast, k_scale_cast),
-                            chunk_weights,
+                            weights[row_start:row_end].float(),
                             cu_seqlen_ks,
                             cu_seqlen_ke,
-                            chunk.max_seqlen_k,
-                        ),
-                        row_ends,
-                    )
+                        )
                 num_rows = logits.shape[0]
                 if candidate_blocks is not None:
                     # Two-level selection (v4.1): the candidate source
@@ -760,6 +849,10 @@ def sparse_attn_indexer(
                             chunk_candidates,
                             candidate_block_size,
                         )
+                logger.warning(
+                    "DSV41 PREFILL-TOPK-SITE reached logits=%s",
+                    tuple(logits.shape),
+                )
                 ops.top_k_per_row_prefill(
                     logits,
                     torch.zeros_like(row_ends) if row_starts is None else row_starts,
@@ -770,6 +863,63 @@ def sparse_attn_indexer(
                     logits.stride(1),
                     topk_tokens,
                 )
+                if _DSV41_CANONICAL_TOPK:
+                    _sort_topk_rows(topk_indices)
+                if _dsv41_flag("VLLM_DSV41_LOG_TOPK"):
+                    # Debug: the indexer's SCORES and the SELECTION they
+                    # produce (the prefill path). The selection is the
+                    # discrete choice the attention consumes, so if it
+                    # differs between two runs of the SAME request, the
+                    # scores differ.
+                    # NOTE: the probe must NOT copy or sort the whole
+                    # logits: they are (4096, 32768) fp32 = 537 MB, and
+                    # torch.sort / the isfinite() mask each materialise
+                    # another gigabyte - per layer, per rank. That is what
+                    # OOM-killed the worker during the 89K prefill.
+                    # Only the FIRST ROW is examined, and it is examined
+                    # with a partial sort over a bounded slice.
+                    _row0 = logits[0].detach().float()
+                    _fin0 = _row0[torch.isfinite(_row0)]
+                    if _fin0.numel():
+                        # the top-k selects the top topk_tokens scores; the
+                        # tie that matters is at the CUTOFF (the 1024th
+                        # score), not at the maximum.
+                        _k = min(topk_tokens, _fin0.numel())
+                        # torch.kthvalue is O(n) and does not materialise
+                        # a sorted copy of the whole row.
+                        _cut = torch.kthvalue(
+                            _fin0, _fin0.numel() - _k + 1
+                        ).values
+                        _ties = int((_fin0 == _cut).sum())
+                        _above = int((_fin0 > _cut).sum())
+                        logger.warning(
+                            "DSV41 ITIE row0 n=%d k=%d cutoff=%.10g "
+                            "above=%d ties_at_cutoff=%d",
+                            _fin0.numel(), _k, float(_cut), _above, _ties,
+                        )
+                    # hash the FINITE entries only: the mask makes the rest
+                    # -inf. If two runs of the same chunk produce the same
+                    # hash but different selections, the selection is the
+                    # race (the scores are identical).
+                    # hash a BOUNDED slice of the first row (not the
+                    # whole tensor: the isfinite() mask would copy it all)
+                    _sl = logits[0].detach().float()[:1024]
+                    logger.warning(
+                        "DSV41 ILOGITS shape=%s hash=%d",
+                        tuple(logits.shape),
+                        hash(tuple(_sl.tolist())),
+                    )
+                    _tk = topk_indices.detach().to(torch.int64)
+                    for _r in range(min(_tk.shape[0], 4)):
+                        _v = _tk[_r].tolist()
+                        # a hash of the WHOLE selection: if two runs of the
+                        # same request pick the same set, the hash matches.
+                        _hash = hash(tuple(int(x) for x in _v))
+                        logger.warning(
+                            "DSV41 TOPK row=%d sum=%d hash=%d first=%s",
+                            _r, sum(int(x) for x in _v if x >= 0), _hash,
+                            _v[:8],
+                        )
 
             if deinterleave_idx is None:
                 # Under the PCP path the top-k already ran over the whole
@@ -877,20 +1027,65 @@ def sparse_attn_indexer(
             padded_q_scale, decode_weights = mqa_logits_mx_inputs(
                 padded_q_quant_cast, padded_q_scale, weights[:num_padded_tokens]
             )
-            logits = fp8_fp4_paged_mqa_logits(
-                (padded_q_quant_cast, padded_q_scale),
-                kv_cache,
-                decode_weights,
-                seq_lens,
-                decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
-                indices=decode_metadata.indices,
-            )
+            if use_deep_gemm():
+                logits = fp8_fp4_paged_mqa_logits(
+                    (padded_q_quant_cast, padded_q_scale),
+                    kv_cache,
+                    decode_weights,
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_model_len,
+                    indices=decode_metadata.indices,
+                )
+            else:
+                # Triton fallback (fp32 scales, fp32 weights off SM100).
+                # No DCP varlen support: single-GPU-per-node serving only.
+                if decode_metadata.indices is not None:
+                    raise NotImplementedError(
+                        "fp8_paged_mqa_logits triton fallback has no varlen "
+                        "indices path (decode-context-parallel)."
+                    )
+                context_lens = (
+                    seq_lens[:, -1].contiguous() if seq_lens.ndim == 2 else seq_lens
+                )
+                logits = fp8_paged_mqa_logits_triton(
+                    padded_q_quant_cast,
+                    kv_cache,
+                    weights[:num_padded_tokens].float(),
+                    context_lens,
+                    decode_metadata.block_table,
+                    max_model_len,
+                )
             # Keeping bf16 halves top-k/candidate reads; other top-k backends and
             # DCP need fp32. SM100 decode is varlen: one context length per row.
             if topk_backend != "deep_select" or dcp_world_size != 1:
                 logits = as_fp32_logits(logits, seq_lens.view(-1))
+                if _dsv41_flag("VLLM_DSV41_LOG_TOPK"):
+                    # Debug: the RAW indexer logits, BEFORE the candidate
+                    # mask and the top-k. The ILOGITS probe below hashes
+                    # the logits AFTER the mask, so it cannot tell a
+                    # difference in the paged-MQA kernel from a
+                    # difference in the mask. This one isolates the
+                    # kernel.
+                    _rl = logits.detach().float()
+                    # The row is mostly -inf (the invalid columns are
+                    # masked), so a hash of the first 16 elements
+                    # says nothing. Report the FINITE values instead:
+                    # their count, their sum and their positions.
+                    _fin = torch.isfinite(_rl[0])
+                    _nfin = int(_fin.sum())
+                    _fv = _rl[0][_fin]
+                    logger.warning(
+                        "DSV41 RAWLOGITS shape=%s nfinite=%d fsum=%.10g "
+                        "fmax=%.10g fmin=%.10g first=%s",
+                        tuple(_rl.shape),
+                        _nfin,
+                        float(_fv.sum()) if _nfin else 0.0,
+                        float(_fv.max()) if _nfin else 0.0,
+                        float(_fv.min()) if _nfin else 0.0,
+                        _rl[0][_fin][:8].tolist(),
+                    )
         num_rows = logits.shape[0]
         if candidate_blocks is not None:
             # Two-level selection (v4.1) on the decode logits; columns are
@@ -932,6 +1127,25 @@ def sparse_attn_indexer(
             topk_tokens,
             attn_metadata_narrowed.max_seq_len,
         )
+        if _dsv41_flag("VLLM_DSV41_LOG_TOPK"):
+            # Debug: the indexer's SCORES and the SELECTION they produce.
+            # The selection is the discrete choice the attention consumes, so
+            # if it differs between two runs of the SAME request, the
+            # scores differ. The scores' checksum localises it further.
+            _lg = logits.detach().float()
+            logger.warning(
+                "DSV41 ILOGITS shape=%s sum=%.10g absmax=%.10g",
+                tuple(_lg.shape),
+                float(_lg.sum()),
+                float(_lg.abs().amax()),
+            )
+            _tk = topk_indices.detach().to(torch.int64)
+            for _r in range(min(_tk.shape[0], 4)):
+                _v = _tk[_r].tolist()
+                logger.warning(
+                    "DSV41 TOPK row=%d sum=%d first=%s",
+                    _r, sum(int(x) for x in _v if x >= 0), _v[:12],
+                )
 
         if decode_metadata.global_seq_lens is not None:
             _merge_dcp_topk_global(
@@ -955,6 +1169,11 @@ def sparse_attn_indexer(
             )
 
     return topk_indices_buffer
+
+
+def use_deep_gemm() -> bool:
+    """DeepGEMM MQA-logits kernels, honoring VLLM_USE_DEEP_GEMM=0."""
+    return has_deep_gemm() and is_deep_gemm_supported()
 
 
 def sparse_attn_indexer_fake(
@@ -1058,10 +1277,17 @@ class SparseAttnIndexer(CustomOp):
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
         self._cp_kv_cache_interleave_size: int | None = None
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if (
+            current_platform.is_cuda()
+            and not has_deep_gemm()
+            and self.use_fp4_cache
+        ):
+            # FP8 K caches have a Triton fallback (mqa_logits_triton) that
+            # matches the non-MX format this layer produces off SM100; the
+            # FP4/mx-scaled path has no fallback (SM100-class hardware).
             raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
-                "the current vLLM environment."
+                "Sparse Attention Indexer CUDA op requires DeepGEMM support "
+                "in the current vLLM environment for MXFP4 indexer caches."
             )
 
         if vllm_config.kernel_config.enable_jit_warmup:
