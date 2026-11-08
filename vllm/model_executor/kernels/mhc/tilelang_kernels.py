@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from functools import cache
 from typing import Any
@@ -51,6 +52,13 @@ def compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
         num_block_k = cdiv(k, block_k)
         split_k = min(split_k, num_block_k // 4)
     split_k = max(split_k, 1)
+    if _MHC_SPLIT_K_FIXED:
+        # A split-K GEMM sums its partials in the split's order, so a
+        # different split count is a different accumulation order and the
+        # SAME tokens give different results in a different batch size
+        # (grid_size is ceil(num_tokens/block_k)). Fixing the split count
+        # makes the arithmetic independent of the batch shape.
+        split_k = min(split_k, _MHC_SPLIT_K_FIXED)
     return split_k
 
 
@@ -61,7 +69,21 @@ def compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
 # optimum is ~1-2%, while one fixed config gives up to 18% at the top of the
 # range.
 _FUSED_POST_PRE_N_THR = 128
-_FUSED_POST_PRE_MAX_TOKENS = 32
+# Debug/fix switch: force the projection tile size so the mHC GEMM's
+# accumulation order does not depend on the batch's token count.
+# VLLM_MHC_TILE_N=2 (or 6) makes every batch shape use the same tile.
+_MHC_TILE_N_FIXED = int(os.environ.get("VLLM_MHC_TILE_N", "0") or 0) or None
+# Debug/fix switch: fix the mHC GEMM's split-K so it does not depend on
+# the batch's token count (see compute_num_split).
+_MHC_SPLIT_K_FIXED = int(os.environ.get("VLLM_MHC_SPLIT_K", "0") or 0) or None
+# Debug/fix switch: the token count above which the fused post + pre-norm
+# path is NOT used. The fused path has one program per (token, tile,
+# split); the separate path uses a one-program-per-token post kernel plus
+# a split-k GEMM. Setting this to 0 forces the separate path, which is
+# an A/B against the fused kernel.
+_FUSED_POST_PRE_MAX_TOKENS = int(
+    os.environ.get("VLLM_MHC_FUSED_MAX_TOKENS", "32") or 32
+)
 
 
 def mhc_fused_post_pre_split_config(
@@ -82,7 +104,18 @@ def mhc_fused_post_pre_split_config(
     # The projection tiles supply the parallelism a small token count cannot,
     # so the tile grows with the batch: 1.3x at one token and 1.03x at 32
     # against a split-k GEMM given the split its own estimator computes.
-    if num_tokens < 16:
+    #
+    # The tile shape MUST NOT depend on num_tokens: a different tile shape
+    # is a different float accumulation order, so the SAME tokens would
+    # give different results in a different batch size (and the same
+    # request would give different results run to run, because the batch
+    # it lands in varies). The tile is chosen from the hidden size alone;
+    # the parallelism for a small batch comes from the split count, which
+    # is a power of two and does not change the accumulation order per
+    # element the way the tile does.
+    if _MHC_TILE_N_FIXED:
+        tile_n, n_splits = _MHC_TILE_N_FIXED, 8
+    elif num_tokens < 16:
         tile_n, n_splits = 2, 8
     else:
         tile_n, n_splits = 6, 8
@@ -707,7 +740,7 @@ def mhc_fused_tilelang(
         warp_id = tid // 32
         lane = tid % 32
 
-        s_warp = T.alloc_shared((num_warps, tile_n + 1), T.float32)
+        s_warp = T.alloc_shared((num_warps * n_tiles, tile_n + 1), T.float32)
         s_post = T.alloc_shared((hc,), T.float32)
         s_comb = T.alloc_shared((hc, hc), T.float32)
 
@@ -759,12 +792,16 @@ def mhc_fused_tilelang(
         if i_nt == 0:
             sqr[0] = T.warp_reduce_sum(sqr[0])
 
-        # Cross-warp reduce via shared mem
+        # Cross-warp reduce via shared mem. The shared slot is indexed by
+        # the tile as well as the warp: every tile program runs the SAME
+        # code, so a slot indexed only by the warp would be written by
+        # all n_tiles programs and the last writer would win - a race
+        # whose winner is not deterministic.
         if lane == 0:
             for n in T.unroll(tile_n):
-                s_warp[warp_id, n] = acc[n]
+                s_warp[warp_id * n_tiles + i_nt, n] = acc[n]
             if i_nt == 0:
-                s_warp[warp_id, tile_n] = sqr[0]
+                s_warp[warp_id * n_tiles, tile_n] = sqr[0]
         T.sync_threads()
 
         # Warp 0 does the final cross-warp sum and writes outputs
@@ -772,13 +809,13 @@ def mhc_fused_tilelang(
             if lane < tile_n:
                 v = T.alloc_var(T.float32, init=0.0)
                 for w in T.unroll(num_warps):
-                    v += s_warp[w, lane]
+                    v += s_warp[w * n_tiles + i_nt, lane]
                 yp_out[i_ks, i_n, i_nt * tile_n + lane] = v
 
             if i_nt == 0 and lane == 0:
                 v2 = T.alloc_var(T.float32, init=0.0)
                 for w in T.unroll(num_warps):
-                    v2 += s_warp[w, tile_n]
+                    v2 += s_warp[w * n_tiles, tile_n]
                 rp_out[i_ks, i_n] = v2
 
         if ENABLE_PDL:
@@ -833,7 +870,17 @@ def mhc_post_tilelang(
                 for i_hci in T.vectorized(hc):
                     x_local[i_hco, i1_h] += a_local[i_hci, i_hco] * b_local[i_hci, i1_h]
 
-            T.copy(x_local, x[i_n, 0, i0_h * h_blk])
+            # Write EVERY hc row, not just row 0. The reference's
+            # hc_post produces the full [b, s, hc, d] stream:
+            #   y = post.unsqueeze(-1) * x.unsqueeze(-2)
+            #       + sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+            # The Engram layers then read ALL hc rows of this post
+            # (the engram kernel indexes hidden_states[token, hc, :]),
+            # so leaving rows 1..hc-1 unwritten fed UNINITIALIZED memory
+            # into the gate - which is what made the whole forward pass
+            # nondeterministic at the engram layers.
+            for i_hco, i1_h in T.Parallel(hc, h_blk):
+                x[i_n, i_hco, i0_h * h_blk + i1_h] = x_local[i_hco, i1_h]
         if ENABLE_PDL:
             T.pdl_trigger()
 
@@ -894,12 +941,17 @@ def hc_prenorm_gemm_tilelang(
         lane = tid % 32
         warp_id = tid // 32
         num_warps = n_thr // 32
-        warp_acc = T.alloc_shared((num_warps, tile_n), T.float32)
+        warp_acc = T.alloc_shared((num_warps * n_tiles, tile_n), T.float32)
         warp_sqr = T.alloc_shared(num_warps, T.float32)
 
+        # The shared slot is indexed by the tile as well as the warp:
+        # every tile program runs the SAME code, so a slot indexed only
+        # by the warp would be written by all n_tiles programs and the
+        # last writer would win - a race whose winner is not
+        # deterministic.
         if lane == 0:
             for i_o in T.unroll(tile_n):
-                warp_acc[warp_id, i_o] = acc[i_o]
+                warp_acc[warp_id * n_tiles + i_t, i_o] = acc[i_o]
             if i_t == 0:
                 warp_sqr[warp_id] = sqr[0]
         T.sync_threads()
@@ -908,7 +960,7 @@ def hc_prenorm_gemm_tilelang(
             if lane < tile_n:
                 reduced_acc = T.alloc_var(T.float32, init=0.0)
                 for i_w in T.unroll(num_warps):
-                    reduced_acc += warp_acc[i_w, lane]
+                    reduced_acc += warp_acc[i_w * n_tiles + i_t, lane]
                 out_idx = i_t * tile_n + lane
                 if out_idx < n_out:
                     out[i_s, i_n, out_idx] = reduced_acc
@@ -983,13 +1035,19 @@ def hc_prenorm_gemm_block_m_tilelang(
         lane = tid % 32
         warp_id = tid // 32
         num_warps = n_thr // 32
-        warp_acc = T.alloc_shared((num_warps, block_m, tile_n), T.float32)
+        warp_acc = T.alloc_shared((num_warps * n_tiles, block_m, tile_n),
+                                  T.float32)
         warp_sqr = T.alloc_shared((num_warps, block_m), T.float32)
 
+        # The shared slot is indexed by the tile as well as the warp:
+        # every tile program runs the SAME code, so a slot indexed only
+        # by the warp would be written by all n_tiles programs and the
+        # last writer would win - a race whose winner is not
+        # deterministic.
         if lane == 0:
             for i_m in T.unroll(block_m):
                 for i_o in T.unroll(tile_n):
-                    warp_acc[warp_id, i_m, i_o] = acc[i_m, i_o]
+                    warp_acc[warp_id * n_tiles + i_t, i_m, i_o] = acc[i_m, i_o]
                 if i_t == 0:
                     warp_sqr[warp_id, i_m] = sqr[i_m]
         T.sync_threads()
@@ -1004,7 +1062,9 @@ def hc_prenorm_gemm_block_m_tilelang(
                 if token_idx < num_tokens:
                     if lane < tile_n:
                         for i_w in T.unroll(num_warps):
-                            reduced_acc[i_m] += warp_acc[i_w, i_m, lane]
+                            reduced_acc[i_m] += warp_acc[
+                                i_w * n_tiles + i_t, i_m, lane
+                            ]
                         out_idx = i_t * tile_n + lane
                         if out_idx < n_out:
                             out[0, token_idx, out_idx] = reduced_acc[i_m]
