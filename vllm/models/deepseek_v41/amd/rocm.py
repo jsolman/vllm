@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -69,6 +70,27 @@ from vllm.v1.worker.workspace import current_workspace_manager
 logger = init_logger(__name__)
 
 
+def _dsv41_flag(name: str) -> bool:
+    """Read a debug flag from the env OR from /tmp/dsv41-flags.
+
+    The flags file is read at CALL time, so a flag can be turned on
+    without a restart (a restart with a heavy probe can stall the
+    startup's shared-memory broadcast).
+    """
+    if os.environ.get(name, "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            for line in f:
+                if line.strip() == name:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+
+
 def _trust_dsv4_extra_cache_nan_free(
     kv_cache_dtype: str,
     has_kv_transfer: bool,
@@ -93,6 +115,103 @@ def _aiter_sparse_mla_enabled(has_kv_transfer: bool) -> bool:
         logger.warning_once(
             "VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA is ignored with a KV "
             "connector; DeepSeek V4 keeps the Triton sparse attention."
+        )
+        return False
+    return True
+
+
+def _ragged_to_2d(
+    indices: torch.Tensor,
+    indptr: torch.Tensor,
+    num_rows: int,
+    max_width: int | None = None,
+) -> torch.Tensor:
+    """Turn a ragged (flat indices, indptr) pair into a dense [rows, width].
+
+    The TileLang path needs a rectangular index list per query. The ragged
+    form has a per-query length; we use the maximum width and pad the
+    shorter rows with -1, which the reference kernel treats as "no valid
+    position".
+
+    VECTORISED on purpose: the first version looped over the rows and
+    called .item() on each, which is a GPU->CPU sync per row and made the
+    decode step ~35x slower than the Triton path (0.2 tok/s vs 7).
+
+    The width is taken from ``max_width`` when given, so there is NO
+    device->host sync at all: the caller knows the packed width (it built
+    the dense form), and the ragged form was derived from it. Without it
+    we fall back to lengths.max(), which costs one sync per step - still
+    far better than one per row, but it serialises the step.
+
+    The row count comes from the indptr, not from num_rows: the ragged
+    metadata can describe FEWER rows than the query count (the warmup
+    batch is 128 tokens wide but the metadata covers 3 rows). The extra
+    rows of ``out`` stay -1.
+    """
+    lengths = (indptr[1:] - indptr[:-1]).to(torch.int64)
+    if max_width is None:
+        max_width = int(lengths.max().item()) if lengths.numel() else 0
+    width = int(max_width)
+    if width == 0:
+        return torch.zeros((num_rows, 0), dtype=torch.int32,
+                           device=indices.device)
+    out = torch.full((num_rows, width), -1, dtype=torch.int32,
+                     device=indices.device)
+    n_rows = int(lengths.numel())
+    starts = indptr[:n_rows].to(torch.int64)
+    # Per FLAT INDEX, the row it belongs to and its offset within that
+    # row. Both are repeat_interleave over the per-row lengths, so they
+    # have one entry per flat index - not one per row. Their LENGTH is the
+    # true entry count (sum of the lengths), which is also how much of the
+    # over-long indices buffer is real data: the buffer is a slice of a
+    # fixed-capacity graph buffer (see _copy_ragged_to_graph_buffers), so
+    # indices.numel() is the CAPACITY, not the data length.
+    row_ids = torch.repeat_interleave(
+        torch.arange(n_rows, device=indices.device),
+        lengths,
+    )
+    starts_per_index = torch.repeat_interleave(starts, lengths)
+    total = starts_per_index.numel()
+    if total == 0 or n_rows == 0:
+        return out
+    offsets = torch.arange(total, device=indices.device) - starts_per_index
+    keep = offsets < width
+    # A row beyond num_rows would index out of `out`; drop it.
+    keep = keep & (row_ids < num_rows)
+    out[row_ids[keep], offsets[keep]] = indices[:total][keep].to(torch.int32)
+    return out
+
+
+def _tilelang_sparse_mla_enabled() -> bool:
+    """Whether the reference TileLang sparse attention should be used.
+
+    Enabled with VLLM_DSV41_USE_TILELANG_SPARSE=1. The reference's TileLang
+    kernels compile and run natively on SM110 (all six of them, with
+    CUDA_HOME pointing at a CUDA whose nvcc matches its headers), so this
+    is a real alternative to the Triton sparse attention - not a stub.
+
+    It is a DIAGNOSTIC path: the reference kernel wants a dense bf16 KV
+    tensor, so we dequantise the packed fp8 cache into one. For decode
+    that gather is small (topk x head_dim x 2 bytes per query).
+    """
+    if os.environ.get("VLLM_DSV41_USE_TILELANG_SPARSE", "0") not in ("1", "true"):
+        return False
+    from vllm.models.deepseek_v41.ampere.tilelang_sparse import (
+        _reference_kernel_module,
+        _tilelang_available,
+    )
+
+    if not _tilelang_available():
+        logger.warning_once(
+            "VLLM_DSV41_USE_TILELANG_SPARSE=1 but TileLang is unavailable; "
+            "keeping the Triton sparse attention."
+        )
+        return False
+    if _reference_kernel_module() is None:
+        logger.warning_once(
+            "VLLM_DSV41_USE_TILELANG_SPARSE=1 but the reference kernel module "
+            "was not found (set VLLM_DSV41_REFERENCE_MODEL to the model dir); "
+            "keeping the Triton sparse attention."
         )
         return False
     return True
@@ -555,6 +674,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
     backend_cls = DeepseekV41ROCMAiterMLASparseBackend
     swa_backend_cls = DeepseekV41ROCMAiterSparseSWABackend
     _use_aiter_sparse_mla = False
+    _use_tilelang_sparse_mla = False
 
     def _indexer_cls(
         self, k_cache: DeepseekV4IndexerCache | None
@@ -599,6 +719,18 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                     "are not supported."
                 )
         self._use_aiter_sparse_mla = _aiter_sparse_mla_enabled(self._has_kv_transfer)
+        # The reference TileLang sparse attention (diagnostic path): the
+        # reference's own kernel, run over our packed fp8 caches.
+        self._use_tilelang_sparse_mla = (
+            _tilelang_sparse_mla_enabled()
+            and not self._use_aiter_sparse_mla
+            and not self._has_kv_transfer
+        )
+        if self._use_tilelang_sparse_mla:
+            logger.info_once(
+                "Using the reference TileLang sparse attention for DSv4.1 "
+                "(VLLM_DSV41_USE_TILELANG_SPARSE)."
+            )
         if self.compressor is None and self.indexer is None:
             # Dense layers have nothing to overlap; keep the base serial path.
             self.aux_stream_list = None
@@ -726,6 +858,36 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             positions,
             attn_out,
         )
+        if _dsv41_flag("VLLM_DSV41_LOG_DECODE_Q"):
+            # Debug: the attention's OUTPUT, taken here (after the
+            # attention has written into attn_out) and BEFORE the
+            # projection. With the q checksum (logged in the decode
+            # path) this brackets the attention: q in, attn_out out. If
+            # the q matches across runs and this differs, the
+            # difference is inside the attention kernel itself; if this
+            # matches, the difference is in the projection.
+            _o = attn_out
+            if isinstance(_o, torch.Tensor):
+                # The attention may have run on an AUX STREAM, so the
+                # write is not yet visible on this stream. Join
+                # before reading, or the probe sees the buffer's
+                # previous contents (zeros) instead of the result.
+                torch.cuda.current_stream().synchronize()
+                _of = _o.detach().reshape(_o.shape[0], -1)
+                # Report the first row separately: in a decode-only step
+                # the attention writes only output[:num_decode_tokens],
+                # so the tail rows are stale and would swamp the sum.
+                _r0 = _of[:1].float()
+                logger.warning(
+                    "DSV41 AOUT shape=%s sum=%.10g amax=%.10g "
+                    "row0_sum=%.10g row0_amax=%.10g hash=%d",
+                    tuple(_o.shape),
+                    float(_of.float().sum()),
+                    float(_of.float().abs().max()) if _of.numel() else 0.0,
+                    float(_r0.sum()) if _r0.numel() else 0.0,
+                    float(_r0.abs().max()) if _r0.numel() else 0.0,
+                    hash(tuple(_r0.reshape(-1)[:16].tolist())),
+                )
         return self._o_proj(attn_out, positions)
 
     def _forward_csa2_full(
@@ -935,6 +1097,27 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
     def _o_proj(
         self, attn_out: torch.Tensor | QuantizedActivation, positions: torch.Tensor
     ) -> torch.Tensor:
+        if _dsv41_flag("VLLM_DSV41_LOG_DECODE_Q"):
+            # Debug: which projection path is live, and the checksum of
+            # the attention's OUTPUT (the input to the projection). With
+            # the q checksum this brackets the attention: if the q and
+            # the attention output both match but the projection output
+            # differs, the projection is the culprit.
+            if isinstance(attn_out, QuantizedActivation):
+                _d = attn_out.data.detach()
+                _ds = attn_out.scale.detach()
+                logger.warning(
+                    "DSV41 OPROJ path=mxfp8 attn_sum=%.10g attn_amax=%.10g",
+                    float(_d.float().sum()),
+                    float(_d.float().abs().max()) if _d.numel() else 0.0,
+                )
+            else:
+                _o = attn_out.detach()
+                logger.warning(
+                    "DSV41 OPROJ path=bf16 attn_sum=%.10g attn_amax=%.10g",
+                    float(_o.float().sum()),
+                    float(_o.float().abs().max()) if _o.numel() else 0.0,
+                )
         if isinstance(attn_out, QuantizedActivation):
             z = rocm_mxfp8_wo_a_bmm(
                 attn_out.data,
@@ -1196,6 +1379,173 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             # The aiter kernel leaves the inverse RoPE to the caller.
             return 0
 
+        if self._use_tilelang_sparse_mla:
+            if not getattr(self, "_tl_logged", False):
+                self._tl_logged = True
+                c = self.swa_cache_layer.kv_cache
+                _ri = swa_metadata.decode_swa_ragged_indices
+                _rp = swa_metadata.decode_swa_ragged_indptr
+                _di = swa_metadata.decode_swa_indices
+                logger.warning(
+                    "TILELANG INPUTS: "
+                    f"ragged_idx_numel={None if _ri is None else _ri.numel()} "
+                    f"ragged_indptr={None if _rp is None else _rp[:4].tolist()} "
+                    f"dense_idx_shape={None if _di is None else tuple(_di.shape)} "
+                    f"dense_row0={None if _di is None else _di[0][:8].tolist()} "
+                    f"ragged_first8={None if _ri is None else _ri[:8].tolist()}"
+                )
+                logger.warning(
+                    "TILELANG DECODE BRANCH REACHED: "
+                    f"q rows={q.shape[0]} "
+                    f"output_mxfp8={output_mxfp8 is not None} "
+                    f"output={output is not None} "
+                    f"cache_shape={tuple(c.shape)} "
+                    f"cache_stride={tuple(c.stride())} "
+                    f"q_head0_rope="
+                    f"{q[0, 0, -self.rope_head_dim:].float().tolist()[:4]}"
+                )
+            # The reference's TileLang sparse attention over the packed fp8
+            # caches. It wants a dense bf16 KV, so the module dequantises
+            # the selected rows and concatenates the window and compressed
+            # sources exactly as the reference does (one softmax, one
+            # attn_sink). The inverse RoPE is left to the caller, as with
+            # the Triton path.
+            from vllm.models.deepseek_v41.ampere.tilelang_sparse import (
+                tilelang_sparse_attn_decode,
+            )
+
+            assert swa_metadata.decode_swa_ragged_indices is not None
+            assert swa_metadata.decode_swa_ragged_indptr is not None
+            # decode_swa_width is the packed dense width the ragged form was
+            # derived from, so passing it avoids a device->host sync.
+            swa_width = getattr(swa_metadata, 'decode_swa_width', None)
+            swa_slots = _ragged_to_2d(
+                swa_metadata.decode_swa_ragged_indices,
+                swa_metadata.decode_swa_ragged_indptr,
+                q.shape[0],
+                max_width=swa_width,
+            )
+            extra_slots = None
+            if not swa_only and topk_ragged_indices is not None:
+                extra_slots = _ragged_to_2d(
+                    topk_ragged_indices,
+                    topk_ragged_indptr,
+                    q.shape[0],
+                )
+            if _dsv41_flag("VLLM_DSV41_LOG_DECODE_Q"):
+                # Debug: the decode's QUERY and its ATTENTION OUTPUT. These are
+                # the steps between the cache read and the layer output that no
+                # other probe covers: the q norm, the RoPE and the FP8
+                # quantization of q, and the output projection.
+                _q = q.detach()
+                _qf = _q.reshape(_q.shape[0], -1)
+                _n = min(32, _qf.shape[0])
+                logger.warning(
+                    "DSV41 DQ qsum=%.10g qhash=%d",
+                    float(_qf[:_n].float().sum()),
+                    hash(tuple(_qf[:_n, :16].float().reshape(-1).tolist())),
+                )
+            out = tilelang_sparse_attn_decode(
+                q=q,
+                swa_k_cache=self.swa_cache_layer.kv_cache,
+                swa_slots=swa_slots,
+                attn_sink=self.attn_sink,
+                scale=self.scale,
+                extra_k_cache=kv_cache if not swa_only else None,
+                extra_slots=extra_slots,
+            )
+            # DIAGNOSTIC: run the Triton path on the same inputs and diff.
+            if os.environ.get("VLLM_DSV41_TL_COMPARE", "0") == "1":
+                ref_out = torch.zeros_like(out)
+                try:
+                    rocm_sparse_attn_decode(
+                        q=q,
+                        kv_cache=kv_cache,
+                        swa_k_cache=self.swa_cache_layer.kv_cache,
+                        swa_only=swa_only,
+                        topk_indices=None,
+                        topk_lens=topk_lens,
+                        swa_indices=swa_metadata.decode_swa_indices,
+                        swa_lens=swa_metadata.decode_swa_lens,
+                        swa_ragged_indices=swa_metadata.decode_swa_ragged_indices,
+                        swa_ragged_indptr=swa_metadata.decode_swa_ragged_indptr,
+                        topk_ragged_indices=topk_ragged_indices,
+                        topk_ragged_indptr=topk_ragged_indptr,
+                        attn_sink=self.attn_sink,
+                        scale=self.scale,
+                        head_dim=self.head_dim,
+                        nope_head_dim=self.nope_head_dim,
+                        rope_head_dim=self.rope_head_dim,
+                        output=ref_out,
+                    )
+                    torch.cuda.synchronize()
+                    d = (out.float() - ref_out.float()).abs()
+                    logger.warning(
+                        "TILELANG vs TRITON: "
+                        f"max err {d.max().item():.6f} "
+                        f"mean {d.mean().item():.6f} "
+                        f"tl[0]={out[0, 0, :4].float().tolist()} "
+                        f"tr[0]={ref_out[0, 0, :4].float().tolist()}"
+                    )
+                except Exception as e:
+                    logger.warning(f"TILELANG COMPARE failed: {e!r}")
+            if output is not None:
+                output[:out.shape[0], :out.shape[1]] = out
+            # The reference's sparse_attn does NOT rotate its output: the
+            # reference's Attention.forward applies the inverse GPT-J RoPE
+            # to the output separately (apply_rotary_emb(o[..., -rd:], ...,
+            # True)). The Triton decode fuses that rotation into its
+            # reduce epilogue, but the TileLang kernel has no such
+            # epilogue, so we owe it here. Without it the output keeps the
+            # query's rotation and the model emits garbage.
+            rocm_inverse_rope_rows_(
+                out,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.rope_head_dim,
+            )
+            if output_mxfp8 is not None:
+                # The MXFP8 path: the caller passes output=None and expects
+                # the attention output as MXFP8 (wo_a's input), not bf16.
+                # The format (see _mxfp8_quantize_rows / the Triton
+                # reduce epilogue):
+                #   data  [T, H * D] e4m3
+                #   scale [T, H * D // 32] E8M0 (biased exponents)
+                # with one scale per 32 lanes: bits = ceil(log2(amax/448))
+                # + 127, and the values scaled by exp2(127 - bits).
+                data, scale = output_mxfp8
+                rows, heads, dim = out.shape
+                flat = out.reshape(rows, heads * dim).float()
+                blocks = flat.reshape(rows, heads * dim // 32, 32)
+                amax = blocks.abs().amax(-1).clamp_min(1.1754943508222875e-38)
+                bits = (torch.ceil(torch.log2(amax / 448.0)) + 127.0).clamp(
+                    0.0, 254.0)
+                q = (blocks * torch.pow(2.0, 127.0 - bits.unsqueeze(-1))
+                     ).reshape(rows, heads * dim)
+                data[:rows] = q.to(torch.float8_e4m3fn).view(
+                    torch.float8_e4m3fn).reshape(rows, -1)
+                scale[:rows] = bits.to(torch.uint8)
+            # The return value is how many decode rows are ALREADY rotated.
+            # We rotated them above, so the caller must not rotate them
+            # again: returning 0 would make it apply the standalone pass
+            # over output[0:] and double-rotate the decode rows (which
+            # produces garbage output).
+            return q.shape[0]
+
+        if _dsv41_flag("VLLM_DSV41_LOG_DECODE_Q"):
+            # Debug: the decode's QUERY. This is the step between the
+            # cache read and the attention output that no other probe
+            # covers: the q norm, the RoPE and the FP8 quantization of
+            # q (which the fused Q+KV op does together with the KV
+            # write).
+            _q = q.detach()
+            _qf = _q.reshape(_q.shape[0], -1)
+            _qn = min(32, _qf.shape[0])
+            logger.warning(
+                "DSV41 DQ qsum=%.10g qhash=%d",
+                float(_qf[:_qn].float().sum()),
+                hash(tuple(_qf[:_qn, :16].float().reshape(-1).tolist())),
+            )
         return rocm_sparse_attn_decode(
             q=q,
             kv_cache=kv_cache,

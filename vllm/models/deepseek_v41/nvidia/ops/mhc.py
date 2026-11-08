@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Dispatch DSV4.1 mHC operations and overlap coefficient generation."""
 
+import os
 from functools import partial
 from typing import TYPE_CHECKING, cast
 
@@ -13,6 +14,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     mhc_fused_post_pre_delayed_tilelang,
     mhc_post_tilelang,
+)
+from vllm.model_executor.kernels.mhc.torch_fused import (
+    mhc_fused_post_pre_torch,
+    mhc_post_torch,
 )
 from vllm.model_executor.layers.fused_moe.moe_output import (
     MoEOutput,
@@ -32,6 +37,10 @@ if TYPE_CHECKING:
     from .cute_dsl import AllReduceMHC
 
 logger = init_logger(__name__)
+
+# Debug/fix switch: use the pure-torch MHC kernels (an A/B against the
+# TileLang ones).
+_MHC_TORCH = os.environ.get("DSV4_MHC_TORCH", "0") == "1"
 
 # GB200 TP4/FlashInfer improves through 16 tokens; larger screens tie or regress.
 MHC_OVERLAP_MAX_TOKENS = 16
@@ -256,7 +265,18 @@ def mhc_shifted_post_pre(
     if stream is not None:
         if layer_input is None:
             assert isinstance(x, torch.Tensor)
-            residual = mhc_post_tilelang(x, residual, post_layer_mix, comb_res_mix)
+            # Debug/fix switch: the pure-torch MHC post, as an A/B
+            # against the TileLang kernel (whose cross-warp reduction
+            # had a shared-memory race: all the tile programs wrote the
+            # same slot).
+            if _MHC_TORCH:
+                residual = mhc_post_torch(
+                    x, residual, post_layer_mix, comb_res_mix
+                )
+            else:
+                residual = mhc_post_tilelang(
+                    x, residual, post_layer_mix, comb_res_mix
+                )
         aux = (
             residual.mean(dim=1)
             if capture_aux
@@ -301,6 +321,39 @@ def mhc_shifted_post_pre(
             norm_eps,
         )
         return *outputs, x.new_empty(0, x.shape[1])
+
+    if _MHC_TORCH:
+        # Debug/fix switch: the whole fused MHC path in pure torch (the
+        # A/B against the TileLang kernels, whose cross-warp reduction
+        # had a shared-memory race).
+        _out = mhc_fused_post_pre_torch(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+        # the tilelang path returns (residual_cur, post_mix, comb_mix,
+        # layer_input, next_pre_mix, aux); the torch one has no
+        # next_pre_mix, so it reuses post_mix.
+        _res, _post, _comb, _layer_input = _out
+        # the torch path returns post_mix with a trailing dim; the model
+        # expects (T, hc_mult).
+        _post = _post.reshape(_post.shape[0], _post.shape[1])
+        if capture_aux:
+            _aux = _res.mean(dim=1)
+        else:
+            _aux = _res.new_empty(0, _res.shape[-1])
+        return (_res, _post, _comb, _layer_input, _post, _aux)
 
     return mhc_fused_post_pre_delayed_tilelang(
         x,
