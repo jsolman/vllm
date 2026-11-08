@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, cast
@@ -910,6 +911,24 @@ class MoERunner(MoERunnerInterface):
                     self, hidden_states, self._combined_gate_weight, None
                 )
             else:
+                if os.environ.get("VLLM_DSV41_LOG_GATE_INPUT", "0") == "1":
+                    # Debug: the GATE's actual input. The checksum is too
+                    # weak (two tensors can share a sum and an absmax), so
+                    # hash the FIRST ROW's bytes as well.
+                    _gi = hidden_states.detach().float()
+                    # hash EVERY token's row, so the first DIVERGING token
+                    # can be identified.
+                    _rows = hidden_states.detach().contiguous().view(
+                        torch.uint8).view(hidden_states.shape[0], -1)
+                    _h = [
+                        hash(tuple(_rows[t].tolist()[:128]))
+                        for t in range(min(_rows.shape[0], 12))
+                    ]
+                    logger.warning(
+                        "DSV41 GIN shape=%s sum=%.10g absmax=%.10g h=%s",
+                        tuple(_gi.shape), float(_gi.sum()),
+                        float(_gi.abs().amax()), _h,
+                    )
                 router_logits, _ = self.gate(hidden_states)
 
         with self._sequence_parallel_context():
