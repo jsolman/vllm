@@ -3,7 +3,25 @@
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, cast
 
+import os
+
 import torch
+
+
+def _dsv41_flag(name: str) -> bool:
+    """Read a debug flag from the env OR from /tmp/dsv41-flags."""
+    if os.environ.get(name, "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            for line in f:
+                if line.strip() == name:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 from transformers import DeepseekV4Config
 
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
@@ -306,6 +324,20 @@ class DeepseekSparseSWAMetadata:
         gather_lens_cpu = self.prefill_query_lens_cpu + torch.clamp(
             prefix_lens_cpu, min=0, max=self.prefill_window_size - 1
         )
+        if _dsv41_flag("VLLM_DSV41_LOG_GATHER"):
+            # Debug: the PREFILL's gather length. The gather length is
+            #   query_len + min(prefix_len, window_size - 1)
+            # so it DEPENDS on the prefix length - and the prefix length
+            # is the CACHED prefix length when the prefix cache is on.
+            # A cache hit therefore gathers a DIFFERENT number of window
+            # tokens than a cold run, so the prefill's sparse attention
+            # reduces over a different set and the BF16 accumulation
+            # order differs. That is the remaining cold-vs-warm
+            # divergence.
+            _pl = prefix_lens_cpu.tolist()
+            _gl = gather_lens_cpu.tolist()
+            print(f"DSV41 GATHER the prefixes {_pl[:8]} the gathers {_gl[:8]}",
+                  flush=True)
         compressed_lens_cpu = (
             torch.div(
                 self.prefill_seq_lens_cpu,
