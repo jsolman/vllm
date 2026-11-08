@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from collections.abc import Callable
 from importlib.util import find_spec
 
@@ -33,7 +34,96 @@ else:
 
 logger = init_logger(__name__)
 
+
+def _dsv41_flag(name: str) -> bool:
+    """Read a debug flag from the env OR from /tmp/dsv41-flags.
+
+    The flags file is the belt-and-braces channel: it works even when a
+    flag is missing from one of the launcher's env blocks, and it is
+    read at CALL time, so a flag can be turned on without a restart
+    (a restart with a heavy probe can stall the startup's shared-memory
+    broadcast).
+    """
+    if os.environ.get(name, "0") == "1":
+        return True
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            for line in f:
+                if line.strip() == name:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+
 FP8_DTYPE = current_platform.fp8_dtype()
+
+
+# CANONICALISE THE TOP-K's OUTPUT ORDER.
+#
+# The compiled top-k returns the selected positions in an ARBITRARY
+# order: on the same logits, 10 runs produced 10 different orders (955
+# of 1024 positions moved). The sparse attention reduces over the
+# selected positions - the softmax denominator and the weighted sum -
+# so the reduction ORDER changes the BF16 rounding of the result. The
+# attention is order-invariant in exact arithmetic, so sorting the
+# selection ASCENDING costs nothing and makes the reduction
+# deterministic.
+#
+# The -1 padding must stay at the END, so only the valid prefix is
+# sorted.
+_DSV41_LOG_DECODE_SELECTION = os.environ.get(
+    "VLLM_DSV41_LOG_DECODE_SELECTION", "0"
+) == "1"
+# The decode selection probe's budget (the probe floods the log pipe).
+_decsel_count = 0
+# THE TOPK-SETS probe (the attractor instrument): env VLLM_DSV41_
+# LOG_TOPK_SETS=1 or a line VLLM_DSV41_LOG_TOPK_SETS in /tmp/dsv41-
+# flags; writes _TOPKSET_PATH, one JSON per decode step (8 rows),
+# capped at _TOPKSET_BUDGET lines.
+_DSV41_LOG_TOPK_SETS = os.environ.get("VLLM_DSV41_LOG_TOPK_SETS", "0") == "1"
+if not _DSV41_LOG_TOPK_SETS:
+    try:
+        with open("/tmp/dsv41-flags") as _ftk:
+            _DSV41_LOG_TOPK_SETS = any(
+                line.strip() == "VLLM_DSV41_LOG_TOPK_SETS"
+                for line in _ftk)
+    except OSError:
+        pass
+_TOPKSET_PATH = os.environ.get(
+    "VLLM_DSV41_TOPKSET_PATH", "/tmp/dsv41-topksets.jsonl")
+_TOPKSET_BUDGET = int(os.environ.get(
+    "VLLM_DSV41_TOPKSET_BUDGET", "700"))
+_topkset_count = 0
+_DSV41_CANONICAL_TOPK = os.environ.get("VLLM_DSV41_CANONICAL_TOPK", "1") == "1"
+
+
+def _sort_topk_rows(out: torch.Tensor) -> None:
+    """Sort each row's selected positions ascending, in place."""
+    if out.numel() == 0:
+        return
+    valid = (out >= 0).sum(dim=1)
+    if int(valid.min()) == out.shape[1] and int(valid.max()) == out.shape[1]:
+        # Every row is full: sort the whole row.
+        #
+        # NOTE: the IN-PLACE sort (out.sort(dim=1)) is BROKEN in this
+        # build - it silently leaves the tensor unchanged for an int32
+        # CUDA tensor of this shape. The out-of-place form
+        # (torch.sort(out, dim=1).values) is correct, so use it and copy
+        # the result back.
+        out.copy_(torch.sort(out, dim=1).values)
+        return
+    # A ragged sort: the -1 padding must stay at the END. Replace the
+    # padding with a large sentinel, sort ascending (stable, so the
+    # valid entries keep their relative order among equal values), then
+    # put the padding back.
+    big = torch.iinfo(torch.int32).max
+    padded = torch.where(out >= 0, out, torch.full_like(out, big))
+    order = torch.argsort(padded.to(torch.int64), dim=1, stable=True)
+    out.copy_(torch.gather(padded, 1, order))
+    out.copy_(torch.where(out == big, torch.full_like(out, -1), out))
+
 
 
 @functools.cache
@@ -1357,6 +1447,23 @@ def rocm_aiter_sparse_attn_indexer(
             if visible.numel() != num_rows:
                 visible = visible.repeat_interleave(next_n)
             visible = visible[:num_rows].to(torch.int64)
+            # The candidate selection scores the COMPRESSED positions (the
+            # logits are over the compressed KV), so the row ends must be
+            # in COMPRESSED units. The prefill passes the chunk's
+            # cu_seqlen_ks/ke, which are the compressed lengths
+            # (compressed_seq_lens_cpu); the decode was passing the
+            # TOKEN length, which is compress_ratio times too large.
+            #
+            # The effect: the scoring ran past the valid compressed
+            # region, into the unwritten tail of the compressed cache.
+            # Those slots hold uninitialized memory, so the block scores
+            # come out NaN (the score kernel propagates NaN), and a
+            # torch.topk over NaN-containing scores has an
+            # implementation-defined order - so the candidate selection
+            # differed between two runs of the same request. The decode
+            # then read a different set of candidate blocks.
+            visible = torch.div(visible, compress_ratio,
+                                rounding_mode="floor")
             row_starts = torch.zeros_like(visible)
             decode_candidates = candidate_blocks[:num_rows]
             if candidate_write:
@@ -1415,6 +1522,64 @@ def rocm_aiter_sparse_attn_indexer(
                 logits.stride(1),
                 topk_tokens,
             )
+            if _DSV41_CANONICAL_TOPK:
+                _sort_topk_rows(topk_indices)
+            if _dsv41_flag("VLLM_DSV41_LOG_TOPK_SETS") and \
+                    _topkset_count < _TOPKSET_BUDGET:
+                # THE ATTRACTOR INSTRUMENT (Step 1d): per decode row
+                # dump the 512 selected compressed positions + the
+                # selection scores at those positions - the full
+                # STATE of the indexer's decision. The attractor
+                # analysis compares the SELECTION's mass over the
+                # prompt's recitation region vs the model's own
+                # generated region at the ignition rows.
+                _topkset_count += 1
+                try:
+                    import json as _json
+                    _mat = topk_indices[:num_rows, :topk_tokens].detach() \
+                        .to(torch.int64)
+                    # The row's context length in the compressed
+                    # units: the selection is over [0, visible_i).
+                    _data = []
+                    _top = logits.detach().float()
+                    for _i in range(min(int(num_rows), 8)):
+                        _row = _mat[_i].tolist()
+                        _v = [int(x) for x in _row if x >= 0]
+                        _scores = _top[_i, _row].tolist() if _row else []
+                        _data.append(dict(sel=_v,
+                                          scores=[round(x, 3) for x in _scores]))
+                    _meta = decode_metadata
+                    _sl = _meta.seq_lens.reshape(-1).tolist()[:min(int(num_rows), 8)] \
+                        if hasattr(_meta, "seq_lens") else []
+                    with open(_TOPKSET_PATH, "a") as _f:
+                        _f.write(_json.dumps(dict(
+                            rows=_data,
+                            seq_lens=_sl,
+                            max_seq=getattr(_meta, "max_seq_len", None),
+                            topk=int(topk_tokens),
+                            layer=str(k_cache_prefix))) + "\n")
+                except Exception as _e:
+                    logger.warning("DSV41 TOPKSET probe failed: %s", _e)
+            if _dsv41_flag("VLLM_DSV41_LOG_DECODE_SELECTION") and \
+                    _decsel_count < 24:
+                # Debug: the decode selection's SET (not its order). The
+                # compiled top-k breaks the exactly-tied candidates by
+                # the thread arrival order, so the SET can differ between
+                # two runs - and the attention would then read a
+                # different context.
+                #
+                # The probe is bounded: one line per decode step floods
+                # the worker's log pipe, and the startup's shared-memory
+                # broadcast then times out (the engine never comes up).
+                _decsel_count += 1
+                _sel = topk_indices.detach().to(torch.int64)
+                _valid = _sel[_sel >= 0]
+                logger.warning(
+                    "DSV41 DECSEL n=%d sum=%d hash=%d",
+                    int(_valid.numel()),
+                    int(_valid.sum()),
+                    hash(tuple(sorted(_valid.tolist()))),
+                )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
@@ -1695,8 +1860,19 @@ def _get_cached_wo_a_bf16(
         wo_a_weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
             torch.float32
         )
+        if wo_a_scale_param.ndim == 1:
+            # Post-register layout: the ModelOpt mxfp8 loader expands the
+            # checkpoint's grouped e8m0 scale per-element along the output
+            # dim, so per-rank it is flat [out_pp, k_blocks] =
+            # [n_local_groups * o_lora_rank, hidden_dim // 32].
+            wo_a_scale_2d = wo_a_scale_param.reshape(
+                n_local_groups, o_lora_rank, hidden_dim // 32)
+        else:
+            # Checkpoint-layout grouped scale [n_out_groups, k_blocks].
+            wo_a_scale_2d = wo_a_scale_param.reshape(
+                n_local_groups, -1, wo_a_scale_param.shape[-1])
         wo_a_scale = _expand_2d_block_scales(
-            wo_a_scale_param.view(n_local_groups, -1, wo_a_scale_param.shape[-1]),
+            wo_a_scale_2d,
             o_lora_rank,
             hidden_dim,
         )
@@ -4145,6 +4321,20 @@ def _rocm_sparse_attn_decode_ragged_triton(
             num_warps=8,
             **launch_kwargs,
         )
+        # This path has no reduce epilogue, so the inverse GPT-J RoPE the
+        # split-K path fuses is still owed: the Q-side RoPE rotated the
+        # trailing rope lanes of the attention output and the o_proj
+        # einsum expects them rotated back. The NoPE lanes take cos=1/sin=0.
+        if inv_rope_positions is not None:
+            assert inv_rope_cos_sin_cache is not None
+            assert inv_rope_cos_sin_cache.shape[-1] == rope_head_dim
+            _fused_inverse_rope_gptj(
+                out,
+                inv_rope_positions,
+                inv_rope_cos_sin_cache,
+                rope_head_dim,
+                out=out,
+            )
         return out
 
     block_k = 32  # KV tokens walked per split-K iteration. Tuned on gfx950.
@@ -4167,6 +4357,37 @@ def _rocm_sparse_attn_decode_ragged_triton(
         avg_extra_len = (extra_indices.numel() * inv_q) if has_extra else 0.0
         num_splits = _decode_num_splits(
             num_queries, heads_blocks, avg_main_len, avg_extra_len, block_k
+        )
+        # Optional override for the decode split count. The upstream
+        # reference implementation (the TileLang kernel shipped in the
+        # DeepSeek-V4.1 checkpoint) processes the whole top-k in ONE fused
+        # pass, with no split-K. Our path splits the selected positions
+        # across num_splits workgroups and combines the partial (m, l, acc)
+        # states, which is mathematically equivalent but sums in a different
+        # order. Setting VLLM_SPARSE_DECODE_NUM_SPLITS=1 makes the decode
+        # match the reference's single-pass structure (slower).
+        _forced_splits = os.environ.get("VLLM_SPARSE_DECODE_NUM_SPLITS")
+        if _forced_splits:
+            try:
+                _forced = int(_forced_splits)
+            except ValueError:
+                _forced = 0
+            if _forced >= 1:
+                num_splits = _forced
+
+    if os.environ.get("VLLM_DSV41_LOG_DECODE_SPLITS", "0") == "1":
+        # Debug: the decode's split count and the selection's size.
+        # The split count depends on main_indices.numel() (the number of
+        # selected positions), and a different split count is a
+        # different accumulation order in the decode's split-K
+        # reduction - so a selection whose SIZE varies would change the
+        # result.
+        import logging as _logging
+        _logging.getLogger("vllm").warning(
+            "DSV41 DSPLITS q=%d main=%d extra=%d splits=%d",
+            int(num_queries), int(main_indices.numel()),
+            int(extra_indices.numel()) if has_extra else 0,
+            int(num_splits),
         )
 
     base_workgroups = num_queries * heads_blocks

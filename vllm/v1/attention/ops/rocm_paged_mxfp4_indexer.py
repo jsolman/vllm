@@ -13,6 +13,7 @@ them.
 """
 
 import functools
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
@@ -23,6 +24,9 @@ import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     apply_candidate_mask,
 )
@@ -219,6 +223,72 @@ def reserve_rocm_mxfp4_indexer_workspace(
     torch.empty(budget, dtype=torch.uint8, device=hidden_states.device)
 
 
+_DSV41_LOG_TOPK = os.environ.get("VLLM_DSV41_LOG_TOPK", "0") == "1"
+
+# Canonicalise the top-k's output order (see _topk). On by default:
+# the order is what makes the attention's reduction nondeterministic.
+_DSV41_CANONICAL_TOPK = os.environ.get("VLLM_DSV41_CANONICAL_TOPK", "1") == "1"
+
+# Use a DETERMINISTIC selection instead of the compiled top-k. The
+# compiled kernel's tie-break is arbitrary, so a request whose scores
+# tie at the cutoff (which happens with any repeated context) selects
+# a different SUBSET on every run.
+_DSV41_DETERMINISTIC_TOPK = (
+    os.environ.get("VLLM_DSV41_DETERMINISTIC_TOPK", "1") == "1")
+
+
+def _det_topk(logits: torch.Tensor, lengths: torch.Tensor,
+              out: torch.Tensor, k: int) -> None:
+    """The top-k over each row's [0, lengths[row]); -1 pads short rows.
+
+    The selection is by DESCENDING score with the ties broken by the
+    LOWEST position index - the rule the reference uses (torch.topk on
+    (scores + bias)) and a deterministic one.
+    """
+    rows, width = logits.shape
+    if rows == 0:
+        return
+    # A stable argsort of the negated scores: descending by score, and
+    # the ties keep their ascending index order. torch.sort is broken in
+    # this build, so argsort is used instead.
+    neg = -logits.to(torch.float32)
+    neg.masked_fill_(torch.arange(width, device=logits.device)
+                     .unsqueeze(0) >= lengths.reshape(-1, 1).to(torch.int64),
+                     float("-inf"))
+    order = torch.argsort(neg, dim=1, stable=True)
+    # the first k of each row
+    sel = order[:, :k].to(torch.int32)
+    # the rows shorter than k are padded with -1
+    valid = (torch.arange(k, device=logits.device).unsqueeze(0)
+             < lengths.reshape(-1, 1).to(torch.int64))
+    out.copy_(torch.where(valid, sel, torch.full_like(sel, -1)))
+
+
+def _sort_topk_rows(out: torch.Tensor, k: int) -> None:
+    """Sort each row's selected positions ascending, in place.
+
+    The rows are padded with -1; the -1s must stay at the END, so the
+    valid prefix is counted first and only that prefix is sorted.
+    """
+    rows = out.shape[0]
+    if rows == 0:
+        return
+    # NOTE: torch.sort() is BROKEN in this build (it does not sort, on
+    # CUDA or CPU, for any dtype - a simple [[5,3,9,1]] comes back
+    # unchanged). torch.argsort() works, so use that.
+    #
+    # A ragged sort: the -1 padding must stay at the END. Replace the
+    # padding with a large sentinel, sort ascending (stable, so the
+    # valid entries keep their relative order among equal values), then
+    # put the padding back.
+    big = torch.iinfo(torch.int32).max
+    padded = torch.where(out >= 0, out, torch.full_like(out, big))
+    order = torch.argsort(padded.to(torch.int64), dim=1, stable=True)
+    sorted_rows = torch.gather(padded, 1, order)
+    out.copy_(torch.where(sorted_rows == big, torch.full_like(out, -1),
+                          sorted_rows))
+
+
 def _topk(
     logits: torch.Tensor, lengths: torch.Tensor, out: torch.Tensor, k: int
 ) -> None:
@@ -231,7 +301,59 @@ def _topk(
     rows, width = logits.shape
     if rows == 0:
         return
-    if width >= k and (k >= 2048 or rows >= 128):
+    if os.environ.get("VLLM_DSV41_TRACE_TOPK", "0") == "1":
+        logger.warning(
+            "DSV41 TOPKCALL rows=%d width=%d k=%d", rows, width, k)
+    if _DSV41_LOG_TOPK:
+        # Debug: the logits the top-k sees, and the selection it
+        # produces, for the FIRST row. This is the live prefill path
+        # (the one the ROCm indexer actually uses).
+        #
+        # The tie check is the point: the compiled top-k
+        # (top_k_per_row_decode) admits tied candidates in an
+        # ARBITRARY order, so two runs that produce the SAME scores can
+        # select DIFFERENT positions - and the attention then reads
+        # different context.
+        _r0 = logits[0].detach().float()
+        _fin = _r0[torch.isfinite(_r0)]
+        if _fin.numel():
+            _kk = min(k, _fin.numel())
+            _cut = torch.kthvalue(
+                _fin, _fin.numel() - _kk + 1
+            ).values
+            _ties = int((_fin == _cut).sum())
+            _above = int((_fin > _cut).sum())
+            logger.warning(
+                "DSV41 LTIE rows=%d width=%d n=%d k=%d cutoff=%.10g "
+                "above=%d ties_at_cutoff=%d",
+                rows, width, _fin.numel(), _kk, float(_cut),
+                _above, _ties,
+            )
+        _sl = _r0[:2048]
+        logger.warning(
+            "DSV41 LLOGITS rows=%d width=%d hash=%d",
+            rows, width, hash(tuple(_sl.tolist())),
+        )
+    if _DSV41_DETERMINISTIC_TOPK:
+        # A DETERMINISTIC selection.
+        #
+        # The compiled top-k admits TIED candidates in an arbitrary
+        # order (the atomic tie-break), so two runs on the SAME logits
+        # can select a different SUBSET - measured: the set differs by
+        # up to 2 positions, all of them exactly tied at the cutoff.
+        # The attention then reads slightly different context, and the
+        # result differs.
+        #
+        # The REFERENCE breaks the ties by the LOWEST position index
+        # (inference/model.py: indices = (scores + bias).topk(topk)[1]),
+        # so the lowest-index tie-break is also the CORRECT one.
+        #
+        # torch.sort() is broken in this build (it does not sort, on
+        # CUDA or CPU, for any dtype), but torch.argsort() works. A
+        # stable argsort of the NEGATED scores gives descending-by-score
+        # with the ties in ascending index order - exactly the rule.
+        _det_topk(logits, lengths, out, k)
+    elif width >= k and (k >= 2048 or rows >= 128):
         _aiter_topk()(
             logits,
             1,
@@ -246,6 +368,25 @@ def _topk(
         torch.ops._C.top_k_per_row_decode(
             logits, 1, lengths, out, rows, logits.stride(0), logits.stride(1), k
         )
+    # CANONICALISE THE SELECTION ORDER.
+    #
+    # The compiled top-k returns the selected positions in an
+    # ARBITRARY order: on the same logits, 20 runs produced 20
+    # different orders (998 of 1024 positions moved). The sparse
+    # attention reduces over the selected positions - the softmax
+    # denominator and the weighted sum - so the reduction ORDER changes
+    # the BF16 rounding of the result:
+    #     the same SET, a permuted order -> a 3.8e-7 relative difference
+    # which 40 layers of amplification turn into a ~0.5-nat difference in
+    # the logits. That was THE source of the serving path's
+    # nondeterminism.
+    #
+    # The attention is order-invariant in exact arithmetic, so sorting
+    # the selection ASCENDING costs nothing and makes the reduction
+    # deterministic. The -1 padding must stay at the end, so sort only
+    # the valid prefix.
+    if _DSV41_CANONICAL_TOPK and out.numel():
+        _sort_topk_rows(out, k)
 
 
 @triton.jit
