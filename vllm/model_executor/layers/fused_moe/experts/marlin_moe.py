@@ -3,11 +3,13 @@
 """Fused MoE utilities for GPTQ."""
 
 import math
+import os
 from collections.abc import Callable
 
 import torch
 
 import vllm._custom_ops as ops
+from vllm.logger import init_logger
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import (
     ApplyMoEActivationConfig,
@@ -24,6 +26,16 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
     LoRAExpertsMixin,
 )
+
+logger = init_logger(__name__)
+_DSV41_LOG_ALIGN = os.environ.get("VLLM_DSV41_LOG_ALIGN", "0") == "1"
+
+# Canonicalise the expert slot order (see the align call). On by
+# default: the align's nondeterministic slot order makes moe_sum's
+# reduction order vary between runs.
+_DSV41_CANONICAL_EXPERTS = (
+    os.environ.get("VLLM_DSV41_CANONICAL_EXPERTS", "1") == "1")
+
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     batched_moe_align_block_size,
     moe_align_block_size,
@@ -55,6 +67,43 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+
+
+def _dsv41_quant_act_fp8(x: torch.Tensor) -> torch.Tensor:
+    """Quantise the activations to FP8 (per 32, UE8M0) and back to the
+    input dtype.
+
+    The reference implementation quantises the activations to FP8 for
+    every FP4-weight GEMM (the FP4 tensor cores require it), with a
+    per-32 activation scale rounded UP to a power of two (UE8M0). Marlin
+    has no W4A8-FP8 path on SM110, so our live path is W4A16 and the
+    activations would otherwise stay in BF16 - a different function from
+    the reference's.
+
+    Quantising and dequantising here reproduces the reference's INPUT to
+    the GEMM while keeping the arithmetic in BF16, so it runs on SM110.
+
+    Controlled by VLLM_DSV41_FP4_ACT_QUANT=1.
+    """
+    import os
+
+    if os.environ.get("VLLM_DSV41_FP4_ACT_QUANT", "0") != "1":
+        return x
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8,
+    )
+
+    # the per-32 group size and the UE8M0 (a power of two, rounded up)
+    # scale, matching the reference's fp8_block_size=32 and
+    # scale_fmt="ue8m0".
+    q, s = per_token_group_quant_fp8(
+        x,
+        group_size=32,
+        use_ue8m0=True,
+    )
+    # dequantise back to the input dtype
+    out = q.to(torch.float32) * s.repeat_interleave(32, dim=1)
+    return out.to(x.dtype)
 
 
 def _fused_marlin_moe(
@@ -121,6 +170,10 @@ def _fused_marlin_moe(
 
     a_scales1 = None
     gate_up_input = hidden_states
+    # The reference quantises the activations to FP8 for every FP4-weight
+    # GEMM; Marlin has no W4A8-FP8 path on SM110, so this reproduces the
+    # reference's input by quantising and dequantising.
+    gate_up_input = _dsv41_quant_act_fp8(gate_up_input)
     if input_dtype == torch.int8:
         gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
         if input_global_scale1 is not None:
@@ -192,6 +245,18 @@ def _fused_marlin_moe(
             intermediate_cache2, input_dtype
         )
 
+    if _DSV41_LOG_ALIGN:
+        # The intermediate cache (the first GEMM's output, before the
+        # second GEMM reduces over the intermediate dim). If THIS is
+        # identical and the final output differs, the divergence is in
+        # the SECOND GEMM's reduction; if it differs, it is in the
+        # first.
+        _ic = intermediate_cache2.detach().float()
+        logger.warning(
+            "DSV41 ICACHE n=%d sum=%.10g absmax=%.10g hash=%d",
+            int(_ic.numel()), float(_ic.sum()), float(_ic.abs().amax()),
+            hash(tuple(_ic.reshape(-1)[:64].tolist())),
+        )
     output = ops.moe_wna16_marlin_gemm(
         intermediate_cache2,
         output,
@@ -346,6 +411,25 @@ def fused_marlin_moe(
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
 
+    if _DSV41_CANONICAL_EXPERTS and topk_ids.numel():
+        # CANONICALISE THE EXPERT SLOT ORDER.
+        #
+        # moe_sum reduces a token's top-k experts in SLOT ORDER:
+        #     for k in 0..topk-1: acc += in_tok[k]
+        # and the align assigns the slots with atomicAdd, so the ORDER
+        # of a token's experts within its slots differs between runs.
+        # FP addition is not associative, so a different summation order
+        # gives a different result - a ~1e-7 relative perturbation that
+        # 40 layers amplify into a ~0.5-nat difference in the logits.
+        #
+        # Sorting each token's experts by expert id makes the slot
+        # order canonical. The routing WEIGHTS are indexed by the slot,
+        # so they must be permuted to match.
+        _order = torch.argsort(topk_ids.to(torch.int64), dim=1, stable=True)
+        topk_ids = torch.gather(topk_ids, 1, _order)
+        if topk_weights.shape == topk_ids.shape:
+            topk_weights = torch.gather(topk_weights, 1, _order)
+
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids,
         block_size_m,
@@ -353,6 +437,38 @@ def fused_marlin_moe(
         expert_map,
         ignore_invalid_experts=True,
     )
+    if _DSV41_LOG_ALIGN:
+        # The ROUTING WEIGHTS, as the GEMM applies them: topk_weights is
+        # indexed by the SLOT (token * top_k + slot), and the align
+        # decides which expert is in which slot. So this hashes BOTH the
+        # weights and the token->slot->expert mapping.
+        _tw = topk_weights.detach().float()
+        _st0 = sorted_token_ids.detach().to(torch.int64)
+        logger.warning(
+            "DSV41 RW n=%d w_hash=%d st_map_hash=%d first_w=%s "
+            "first_st=%s",
+            int(_tw.numel()),
+            hash(tuple(_tw.reshape(-1)[:64].tolist())),
+            hash(tuple((_st0.reshape(-1)[:64] // 6).tolist())),
+            tuple(round(float(x), 6) for x in _tw.reshape(-1)[:6].tolist()),
+            tuple(_st0.reshape(-1)[:6].tolist()),
+        )
+        # Debug: the align's slot assignment. The align hands out slots
+        # with atomicAdd, so the ORDER of the tokens within a block is
+        # NOT deterministic. The expert GEMM then reduces over that
+        # order, so the reduction's rounding differs between runs.
+        # This hashes the assignment so two runs can be compared.
+        _st = sorted_token_ids.detach().to(torch.int64)
+        _ex = expert_ids.detach().to(torch.int64)
+        logger.warning(
+            "DSV41 ALIGN n=%d bs=%d st_hash=%d ex_hash=%d "
+            "first=%s exfirst=%s",
+            int(_st.numel()), int(block_size_m),
+            hash(tuple(_st[:256].tolist())),
+            hash(tuple(_ex[:64].tolist())),
+            tuple(_st[:8].tolist()),
+            tuple(_ex[:8].tolist()),
+        )
 
     assert activation is not None
     moe_output = _fused_marlin_moe(
@@ -391,6 +507,17 @@ def fused_marlin_moe(
 
     if output is None:
         output = torch.empty_like(hidden_states)
+
+    if _DSV41_LOG_ALIGN:
+        # The SECOND GEMM's output (the moe_output, before moe_sum):
+        # one row per (token, slot). If this is identical and the
+        # final output differs, the divergence is in moe_sum.
+        _mo = output.detach().float()
+        logger.warning(
+            "DSV41 MOUT n=%d sum=%.10g absmax=%.10g hash=%d",
+            int(_mo.numel()), float(_mo.sum()), float(_mo.abs().amax()),
+            hash(tuple(_mo.reshape(-1)[:64].tolist())),
+        )
 
     if moe_sum is None:
         if expert_map is not None:

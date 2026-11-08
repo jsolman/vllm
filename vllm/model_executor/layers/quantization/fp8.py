@@ -370,6 +370,15 @@ class Fp8LinearMethod(LinearMethodBase):
             return
 
         if self.use_marlin:
+            if getattr(layer, "is_bmm", False):
+                # The DeepSeek V4/V4.1 attention o_proj consumes the RAW
+                # block-fp8 weight + per-block scale (dequantized in
+                # `_get_cached_wo_a_bf16`), which the Marlin repack
+                # rewrites into a packed layout that cannot be reshaped
+                # back into the grouped form. Leave the loaded tensors
+                # untouched, like the SM86 fork does.
+                layer.input_scale = None
+                return
             if not self.block_quant:
                 # Canonicalize to (K, N) for the kernel.
                 replace_parameter(layer, "weight", layer.weight.t())
