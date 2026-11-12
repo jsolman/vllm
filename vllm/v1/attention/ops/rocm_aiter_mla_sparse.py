@@ -3668,6 +3668,33 @@ def _sparse_attn_decode_reduce_kernel(
     )
 
 
+def _prefill_block_h(num_heads: int) -> int:
+    """Head tile for the ragged sparse prefill kernel.
+
+    Each head's softmax reduction is independent, so sizing the tile to the
+    heads that exist is bit-identical; a fixed 16 masks off half of every
+    ``tl.dot`` when a rank owns fewer heads.
+    """
+    return min(16, max(1, num_heads))
+
+
+def _prefill_block_k(head_dim: int) -> int:
+    """KV tile width for the ragged sparse prefill kernel.
+
+    A wider KV tile halves the loop trip count and the online-softmax tile
+    count. It also raises shared memory (49,664 B/CTA at 16 vs 82,944 B at 32)
+    and changes the accumulation order, so it is only used where the device
+    reports room for it.
+    """
+    if head_dim < 256:
+        return 32
+    try:
+        smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+    except Exception:
+        return 16
+    return 32 if smem >= 96 * 1024 else 16
+
+
 def _rocm_sparse_attn_prefill_ragged_triton(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -3704,9 +3731,9 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         "_rocm_sparse_attn_prefill_ragged_triton",
     )
 
-    block_h = 16
+    block_h = _prefill_block_h(num_heads)
     block_d = triton.next_power_of_2(head_dim)
-    block_k = 16 if head_dim >= 256 else 32
+    block_k = _prefill_block_k(head_dim)
     num_warps = 4
     if out is None:
         out = torch.empty_like(q)
