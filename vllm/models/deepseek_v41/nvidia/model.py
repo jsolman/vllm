@@ -754,6 +754,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                     norm_weight=self.attn_norm.weight,
                     norm_eps=self.attn_norm.variance_epsilon,
                 )
+                if _DSV41_LOG_LAYER_SUMS:
+                    _ap = attn_pre.detach().float()
+                    logger.info(
+                        "DSV41 L0ATTNMIX sum=%.10g absmax=%.10g hash=%d",
+                        float(_ap.sum()), float(_ap.abs().max()),
+                        hash(tuple(_ap.reshape(-1)[:32].tolist())),
+                    )
             else:
                 residual = x
                 # Upstream 8a1c02efca9 (#62208): the engram must be
