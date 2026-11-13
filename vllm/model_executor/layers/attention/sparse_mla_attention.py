@@ -645,7 +645,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
     # conversion runs on the side stream; flipping this to True forces the
     # inline per-call conversion (the known-good path) for the experiment.
     group_conversion_decode_only: ClassVar[bool] = (
-        os.environ.get("VLLM_DSV41_INLINE_TOPK_CONVERT", "0") == "1"
+        os.environ.get("VLLM_DSV41_INLINE_TOPK_CONVERT", "1") == "1"
     )
 
     def __init__(
