@@ -605,6 +605,18 @@ def sparse_attn_indexer(
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
     slot_mapping = attn_metadata_narrowed.slot_mapping
+    if _dsv41_flag("VLLM_DSV41_LOG_QQANT"):
+        _q = q_quant.detach().float() if not isinstance(q_quant, tuple) else q_quant[0].detach().float()
+        _qs = ""
+        if isinstance(q_quant, tuple) and q_quant[1] is not None:
+            _qs = f" qscale_sum={float(q_quant[1].detach().float().sum()):.10g}"
+        logger.warning(
+            "DSV41 QQANT layer=%s shape=%s sum=%.10g absmax=%.10g hash=%d%s slots0=%s",
+            k_cache_prefix, tuple(_q.shape),
+            float(_q.sum()), float(_q.abs().max()),
+            hash(tuple(_q.reshape(-1)[:32].tolist())), _qs,
+            int(slot_mapping[0]) if slot_mapping.numel() else -1,
+        )
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
