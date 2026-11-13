@@ -3,6 +3,7 @@
 """Shared MHA implementation and metadata builder for sparse MLA backends."""
 
 import math
+import os
 from dataclasses import dataclass
 from shutil import which
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
@@ -638,7 +639,14 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
     is_sparse = True
     # Reuse the index group's top-k conversion only for uniform decode batches
     # of multi-layer groups; other batches convert per layer.
-    group_conversion_decode_only: ClassVar[bool] = False
+    # A/B switch: the group's shared side-stream conversion vs the inline
+    # per-call conversion the FlashAttention-sparse impl uses. The A/B pair
+    # capture showed first divergence at decode step 8 in L24+ whose group's
+    # conversion runs on the side stream; flipping this to True forces the
+    # inline per-call conversion (the known-good path) for the experiment.
+    group_conversion_decode_only: ClassVar[bool] = (
+        os.environ.get("VLLM_DSV41_INLINE_TOPK_CONVERT", "0") == "1"
+    )
 
     def __init__(
         self,
