@@ -1312,6 +1312,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
+                if _DSV41_LOG_LAYER_SUMS and hidden_states is not None:
+                    # Debug: the L0 INPUT (the embedding output before any layer).
+                    _e = hidden_states.detach().float()
+                    logger.warning(
+                        "DSV41 EMBED sum=%.10g absmax=%.10g hash=%d",
+                        float(_e.sum()), float(_e.abs().max()),
+                        hash(tuple(_e.reshape(-1)[:64].tolist())),
+                    )
+                if engram_hashes is not None and _DSV41_LOG_LAYER_SUMS:
+                    _eh = engram_hashes.detach()
+                    logger.warning(
+                        "DSV41 EHASHINPUT shape=%s hash=%d",
+                        tuple(_eh.shape), hash(tuple(_eh.reshape(-1)[:64].tolist())),
+                    )
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -1367,6 +1381,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 # DP-sharded lookups are collective, so a replica skipping the
                 # hash still has to reach them.
                 engram_hashes, engram_mask = self.engram_hash.dummy_hashes(input_ids)
+            if engram_hashes is not None and _DSV41_LOG_LAYER_SUMS:
+                # Debug: the raw engram HASH IDs the layers will consume.
+                _eh = engram_hashes.detach()
+                logger.warning(
+                    "DSV41 EHASHINPUT shape=%s hash=%d",
+                    tuple(_eh.shape), hash(tuple(_eh.reshape(-1)[:64].tolist())),
+                )
             if engram_hashes is not None:
                 # Gather all Engram rows before entering the decoder layers.
                 # One gather feeds every layer sharing the DP-split table.
