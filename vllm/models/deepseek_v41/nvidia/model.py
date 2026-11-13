@@ -770,6 +770,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                         engram_hashes[:, self.engram.layer_hash_index],
                         engram_mask,
                     )
+                if _dsv41_flag("VLLM_DSV41_LOG_ENGRAM_INJECT"):
+                    _ei = residual.detach().float()
+                    logger.warning(
+                        "DSV41 ENGINJECT layer=%d sum=%.10g absmax=%.10g hash=%d",
+                        self.layer_id, float(_ei.sum()), float(_ei.abs().max()),
+                        hash(tuple(_ei.reshape(-1)[:64].tolist())),
+                    )
                 post_mix, res_mix, x, attn_pre = mhc_pre(
                     residual,
                     self.hc_attn_fn,
@@ -811,6 +818,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                 engram_hashes[:, self.engram.layer_hash_index],
                 engram_mask,
             )
+            if _dsv41_flag("VLLM_DSV41_LOG_ENGRAM_INJECT"):
+                _ei = residual.detach().float()
+                logger.warning(
+                    "DSV41 ENGINJECT layer=%d sum=%.10g absmax=%.10g hash=%d",
+                    self.layer_id, float(_ei.sum()), float(_ei.abs().max()),
+                    hash(tuple(_ei.reshape(-1)[:64].tolist())),
+                )
             post_mix, res_mix, x, attn_pre = mhc_pre(
                 residual,
                 self.hc_attn_fn,
