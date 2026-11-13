@@ -774,7 +774,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     _ei = residual.detach().float()
                     logger.warning(
                         "DSV41 ENGINJECT layer=%d sum=%.10g absmax=%.10g hash=%d",
-                        self.layer_id, float(_ei.sum()), float(_ei.abs().max()),
+                        self._dsv41_layer_id, float(_ei.sum()), float(_ei.abs().max()),
                         hash(tuple(_ei.reshape(-1)[:64].tolist())),
                     )
                 post_mix, res_mix, x, attn_pre = mhc_pre(
@@ -822,7 +822,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 _ei = residual.detach().float()
                 logger.warning(
                     "DSV41 ENGINJECT layer=%d sum=%.10g absmax=%.10g hash=%d",
-                    self.layer_id, float(_ei.sum()), float(_ei.abs().max()),
+                    self._dsv41_layer_id, float(_ei.sum()), float(_ei.abs().max()),
                     hash(tuple(_ei.reshape(-1)[:64].tolist())),
                 )
             post_mix, res_mix, x, attn_pre = mhc_pre(
