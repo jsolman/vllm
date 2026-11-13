@@ -1510,7 +1510,21 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 float(_hc.abs().max()),
                 hash(tuple(_hc.reshape(-1)[:64].tolist())),
             )
+        if _DSV41_LOG_LAYER_SUMS and pre_mix is not None:
+            _pm = pre_mix.detach().float()
+            logger.warning(
+                "DSV41 PREMIX sum=%.10g absmax=%.10g hash=%d",
+                float(_pm.sum()), float(_pm.abs().max()),
+                hash(tuple(_pm.reshape(-1)[:64].tolist())),
+            )
         hidden_states = hc_collapse_triton(hidden_states, pre_mix)
+        if _DSV41_LOG_LAYER_SUMS and hidden_states is not None:
+            _co = hidden_states.detach().float()
+            logger.warning(
+                "DSV41 COLLIN sum=%.10g absmax=%.10g hash=%d",
+                float(_co.sum()), float(_co.abs().max()),
+                hash(tuple(_co.reshape(-1)[:64].tolist())),
+            )
         hidden_states = self.norm(hidden_states)
         if _DSV41_LOG_LAYER_SUMS and hidden_states is not None:
             _hn = hidden_states.detach().float()
