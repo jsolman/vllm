@@ -788,6 +788,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.kv_mxfp8,
             )
             if _dsv41_flag("VLLM_DSV41_LOG_SWAROWS"):
+                _m = re.match(r".*layers\.(\d+)\.", self.prefix)
+                _layid = int(_m.group(1)) if _m else -1
                 _sm = cast(Any, attn_metadata[self.swa_cache_layer.prefix]).slot_mapping
                 _k = cache.detach()
                 _nb, _bs, _c = _k.shape
@@ -805,7 +807,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 if _rows:
                     logger.warning(
                         "DSV41 SWAROWS layer=%s nslots=%d first=%s sums=%s",
-                        self._dsv41_layer_id, len(_rows),
+                        _layid, len(_rows),
                         _rows[0],
                         [f"{s:.6g}" for s in _sums[:8]],
                     )
@@ -1241,6 +1243,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.accepts_unnormed_unroped_query,  # is_q_interleaved
             )
             if _dsv41_flag("VLLM_DSV41_LOG_SWAROWS"):
+                _m = re.match(r".*layers\.(\d+)\.", self.prefix)
+                _layid = int(_m.group(1)) if _m else -1
                 _sm = slot_mapping
                 _k = swa_kv_cache.detach()
                 _nb, _bs, _c = _k.shape
@@ -1255,7 +1259,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 if _rows:
                     logger.warning(
                         "DSV41 SWAROWS layer=%s nslots=%d first=%s sums=%s",
-                        self._dsv41_layer_id, len(_rows),
+                        _layid, len(_rows),
                         _rows[0],
                         [f"{s:.6g}" for s in _sums[:8]],
                     )
