@@ -943,6 +943,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 float(residual.detach().float().sum()),
                 float(residual.detach().float().abs().max()),
             )
+        if _DSV41_LOG_LAYER_SUMS and attn_pre is not None:
+            _ap = attn_pre.detach().float()
+            logger.info(
+                "DSV41 ATTNMIX L%d sum=%.10g absmax=%.10g hash=%d",
+                getattr(self, "_dsv41_layer_id", -1),
+                float(_ap.sum()), float(_ap.abs().max()),
+                hash(tuple(_ap.reshape(-1)[:32].tolist())),
+            )
         residual, post_mix, res_mix, x, ffn_pre, _ = mhc_shifted_post_pre(
             x,
             residual,
