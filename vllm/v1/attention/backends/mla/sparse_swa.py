@@ -946,6 +946,14 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 num_tokens=metadata.num_decode_tokens,
                 token_offset=0,
             )
+        if _dsv41_flag("VLLM_DSV41_LOG_SWAIDX"):
+            _idx = metadata.decode_swa_indices[:1, 0, :].detach().to(torch.int64)
+            _lens = metadata.decode_swa_lens[:1].detach().to(torch.int64)
+            logger.warning(
+                "DSV41 SWAIDX lens=%s idx0=%s",
+                _lens.tolist(),
+                _idx[0, :16].tolist(),
+            )
         tile_sched = self.build_tile_scheduler(metadata.num_decode_tokens)
         metadata.tile_sched_swaonly = tile_sched[_LAYER_TYPE_SWAONLY]
         metadata.tile_sched_c4a = tile_sched[_LAYER_TYPE_C4A]
