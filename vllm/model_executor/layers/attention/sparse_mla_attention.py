@@ -636,9 +636,13 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
     """Sparse MLA base with dense and masked-MHA prefill paths."""
 
     is_sparse = True
-    # Reuse the index group's top-k conversion only for uniform decode batches
-    # of multi-layer groups; other batches convert per layer.
-    group_conversion_decode_only: ClassVar[bool] = False
+    # Reuse the index group's shared top-k conversion only for uniform decode
+    # batches of multi-layer groups; other batches convert per layer, inline
+    # (the FlashAttention-sparse path). Env-switchable so both paths can be
+    # A/B'd; the inline path is the validated default on this serving stack.
+    group_conversion_decode_only: ClassVar[bool] = (
+        os.environ.get("VLLM_DSV41_INLINE_TOPK_CONVERT", "1") == "1"
+    )
 
     def __init__(
         self,
