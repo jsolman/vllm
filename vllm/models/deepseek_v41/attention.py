@@ -1240,6 +1240,25 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 not self.accepts_unnormed_unroped_query,  # apply_q_rope
                 self.accepts_unnormed_unroped_query,  # is_q_interleaved
             )
+            if _dsv41_flag("VLLM_DSV41_LOG_SWAROWS"):
+                _sm = slot_mapping
+                _k = swa_kv_cache.detach()
+                _nb, _bs, _c = _k.shape
+                _flat = _k.reshape(_nb * _bs, _c)
+                _rows = []
+                _sums = []
+                for _s in _sm.to(torch.long).tolist():
+                    if _s < 0:
+                        continue
+                    _rows.append(_s)
+                    _sums.append(float(_flat[_s].float().sum()))
+                if _rows:
+                    logger.warning(
+                        "DSV41 SWAROWS layer=%s nslots=%d first=%s sums=%s",
+                        self._dsv41_layer_id, len(_rows),
+                        _rows[0],
+                        [f"{s:.6g}" for s in _sums[:8]],
+                    )
             if _dsv41_flag("VLLM_DSV41_LOG_CACHE"):
                 # Debug: the SWA CACHE's contents after the write (the
                 # decode reads it). The per-layer probe covers the
