@@ -787,6 +787,28 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 else None,
                 self.kv_mxfp8,
             )
+            if _dsv41_flag("VLLM_DSV41_LOG_SWAROWS"):
+                _sm = cast(Any, attn_metadata[self.swa_cache_layer.prefix]).slot_mapping
+                _k = cache.detach()
+                _nb, _bs, _c = _k.shape
+                _flat = _k.reshape(_nb * _bs, _c)
+                _rows = []
+                _sums = []
+                for _i in range(0, _sm.numel(), 64):
+                    _sl = _sm[_i:_i + 64].to(torch.long)
+                    for _s in _sl.tolist():
+                        if _s < 0:
+                            continue
+                        _r = _flat[_s]
+                        _rows.append(_s)
+                        _sums.append(float(_r[:576].float().sum()))
+                if _rows:
+                    logger.warning(
+                        "DSV41 SWAROWS layer=%s nslots=%d first=%s sums=%s",
+                        self._dsv41_layer_id, len(_rows),
+                        _rows[0],
+                        [f"{s:.6g}" for s in _sums[:8]],
+                    )
             if _dsv41_flag("VLLM_DSV41_LOG_CACHE"):
                 # Debug: the SWA CACHE's contents after the write (the
                 # decode reads it). The per-layer probe covers the
