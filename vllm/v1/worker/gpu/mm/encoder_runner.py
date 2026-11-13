@@ -303,6 +303,16 @@ class EncoderRunner:
         x = self.model.embed_input_ids(
             input_ids, multimodal_embeddings=mm_embeds, is_multimodal=is_mm_embed
         )
+        import os as _os
+        if _os.environ.get("VLLM_DSV41_LOG_LAYER_SUMS", "0") == "1" and x.numel():
+            # Debug: the L0 INPUT (the embedding output the runner builds
+            # and hands to the model as inputs_embeds).
+            _e = x.detach().float()
+            logger.warning(
+                "DSV41 EMBED sum=%.10g absmax=%.10g hash=%d",
+                float(_e.sum()), float(_e.abs().max()),
+                hash(tuple(_e.reshape(-1)[:64].tolist())),
+            )
         # Copy to the pre-allocated buffer for CUDA graphs.
         self.inputs_embeds[: x.shape[0]] = x
         return self.inputs_embeds
