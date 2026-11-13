@@ -1077,8 +1077,9 @@ def sparse_attn_indexer(
                     _nfin = int(_fin.sum())
                     _fv = _rl[0][_fin]
                     logger.warning(
-                        "DSV41 RAWLOGITS shape=%s nfinite=%d fsum=%.10g "
+                        "DSV41 RAWLOGITS layer=%s shape=%s nfinite=%d fsum=%.10g "
                         "fmax=%.10g fmin=%.10g first=%s",
+                        k_cache_prefix,
                         tuple(_rl.shape),
                         _nfin,
                         float(_fv.sum()) if _nfin else 0.0,
