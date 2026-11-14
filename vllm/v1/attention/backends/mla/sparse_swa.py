@@ -742,6 +742,28 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 _lens.tolist(),
                 _idx[0].tolist(),
             )
+        if _dsv41_flag("VLLM_DSV41_LOG_SWAWIN") and num_decode_tokens > 0:
+            # Hash every cache row that token 0's window reads. The rows
+            # are addressed by slot ids; find this backend's cache tensor
+            # via the bound layers (kv_cache was squeeze(1)'d to [B,N,C]).
+            _idx = decode_swa_indices[:1, 0, :].detach().to(torch.int64)
+            _rows = []
+            try:
+                _cache = self.kv_cache.reshape(-1, self.kv_cache.shape[-1])
+                for _s in _idx[0].tolist():
+                    if 0 <= _s < _cache.shape[0]:
+                        _r = _cache[_s]
+                        _rows.append(int(_r[:64].to(torch.int64).sum().item()) ^ (_s & 0xFFFF))
+                    else:
+                        _rows.append(-999999)
+            except Exception:
+                _rows = []
+            _sl = seq_lens[:1].detach().to(torch.int64)
+            logger.warning(
+                "DSV41 SWAWIN seqlen=%s rows=%s",
+                _sl.tolist(),
+                _rows[:64],
+            )
 
         # Vision variant: per-token in-image visibility for prefill tokens.
         # Decode tokens are always past the image spans (spans are prefilled
