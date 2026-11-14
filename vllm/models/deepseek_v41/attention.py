@@ -805,11 +805,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                         _rows.append(_s)
                         _sums.append(float(_r[:576].float().sum()))
                 if _rows:
+                    _w = torch.arange(64, dtype=torch.int64, device=_flat.device)
+                    _wh = [int((_flat[_r][:64].to(torch.int64) * _w).sum().item()) for _r in _rows]
                     logger.warning(
-                        "DSV41 SWAROWS layer=%s nslots=%d first=%s sums=%s",
-                        _layid, len(_rows),
-                        _rows[0],
-                        [f"{s:.6g}" for s in _sums[:8]],
+                        "DSV41 SWAWRITE layer=%s slots=%s hashes=%s",
+                        _layid, _rows, _wh,
                     )
             if _dsv41_flag("VLLM_DSV41_LOG_CACHE"):
                 # Debug: the SWA CACHE's contents after the write (the
@@ -1257,11 +1257,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     _rows.append(_s)
                     _sums.append(float(_flat[_s].float().sum()))
                 if _rows:
+                    _w = torch.arange(64, dtype=torch.int64, device=_flat.device)
+                    _wh = [int((_flat[_r][:64].to(torch.int64) * _w).sum().item()) for _r in _rows]
                     logger.warning(
-                        "DSV41 SWAROWS layer=%s nslots=%d first=%s sums=%s",
-                        _layid, len(_rows),
-                        _rows[0],
-                        [f"{s:.6g}" for s in _sums[:8]],
+                        "DSV41 SWAWRITE layer=%s slots=%s hashes=%s",
+                        _layid, _rows, _wh,
                     )
             if _dsv41_flag("VLLM_DSV41_LOG_CACHE"):
                 # Debug: the SWA CACHE's contents after the write (the
