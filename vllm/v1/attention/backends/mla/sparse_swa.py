@@ -742,6 +742,18 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 _lens.tolist(),
                 _idx[0].tolist(),
             )
+        if _dsv41_flag("VLLM_DSV41_LOG_BTSLOT") and num_decode_tokens > 0:
+            _sl = int(seq_lens_cpu[0]) if seq_lens_cpu is not None else -1
+            _row = block_table[0].detach().to(torch.int64)
+            _sm = slot_mapping.detach().to(torch.int64)
+            logger.warning(
+                "DSV41 BTSLOT seqlen=%d tokcol=%d tokrow=%d tablecol=%d "
+                "slotmap=%d pos=%d",
+                _sl, (_sl - 1) // self.block_size, (_sl - 1) % self.block_size,
+                int(_row[(_sl - 1) // self.block_size]),
+                int(_sm[0]),
+                int(common_attn_metadata.positions[0]) if common_attn_metadata.positions is not None else -1,
+            )
         if _dsv41_flag("VLLM_DSV41_LOG_BTAB") and num_decode_tokens > 0:
             # Log req0's gathered block-table row around the SWA window
             # boundary, plus the exact window column range: the index
