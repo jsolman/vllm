@@ -1711,7 +1711,6 @@ class DeepseekV41LLMForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-        return logits
 
     def compute_logits_local(
         self,
