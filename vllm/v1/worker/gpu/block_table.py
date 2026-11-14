@@ -232,6 +232,14 @@ class BlockTables:
         num_reqs = idx_mapping.shape[0]
         num_groups = self.num_kv_cache_groups
         slot_mappings = self.slot_mappings if out is None else out
+        import os as _os
+        if _os.path.exists("/tmp/dsv41-alloc-flags") and num_reqs == 1:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "DSV41 SLOTMAP idxmap0=%d pos0=%d",
+                int(idx_mapping[0]) if idx_mapping.numel() else -1,
+                int(positions[0]) if positions.numel() else -1,
+            )
         _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
             slot_mappings.shape[1],
             idx_mapping,
