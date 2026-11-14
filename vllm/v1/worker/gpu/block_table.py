@@ -258,6 +258,15 @@ class BlockTables:
             PAD_ID=PAD_SLOT_ID,
             TRITON_BLOCK_SIZE=1024,  # type: ignore
         )
+        import os as _os
+        if _os.path.exists("/tmp/dsv41-alloc-flags") and num_reqs == 1:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "DSV41 SLOTOUT pos_last=%d sm_gid0_last=%d sm_all=%s",
+                int(positions[-1]),
+                int(slot_mappings[0, num_tokens_padded - 1]),
+                [int(slot_mappings[g, num_tokens_padded - 1]) for g in range(min(num_groups, 6))],
+            )
         return slot_mappings[:, :num_tokens_padded]
 
     def get_dummy_slot_mappings(self, num_tokens: int) -> torch.Tensor:
