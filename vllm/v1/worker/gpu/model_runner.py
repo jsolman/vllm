@@ -706,6 +706,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             additional_attn_cg_support=additional_attn_cg_support,
         )
 
+        import os as _os
+        if _os.path.exists("/tmp/dsv41-alloc-flags"):
+            for _gid, _g in enumerate(self.kv_cache_config.kv_cache_groups):
+                _ln = getattr(_g, "layer_names", None)
+                import logging as _lg
+                _lg.getLogger(__name__).warning(
+                    "DSV41 GROUPS gid=%d spec=%s block_size=%s layers=%s",
+                    _gid, type(_g.kv_cache_spec).__name__,
+                    getattr(_g.kv_cache_spec, "block_size", None),
+                    (_ln[:3] if _ln else None),
+                )
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
             max_num_reqs=self.max_num_reqs,
