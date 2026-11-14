@@ -728,6 +728,16 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     num_tokens=num_decode_tokens,
                     token_offset=0,
                 )
+        if _dsv41_flag("VLLM_DSV41_LOG_SWAIDX") and num_decode_tokens > 0:
+            _idx = decode_swa_indices[:1, 0, :].detach().to(torch.int64)
+            _lens = self.decode_swa_lens[:1].detach().to(torch.int64)
+            _sl = seq_lens[:1].detach().to(torch.int64)
+            logger.warning(
+                "DSV41 SWAIDX seqlen=%s lens=%s idx0=%s",
+                _sl.tolist(),
+                _lens.tolist(),
+                _idx[0, :20].tolist(),
+            )
 
         # Vision variant: per-token in-image visibility for prefill tokens.
         # Decode tokens are always past the image spans (spans are prefilled
@@ -945,14 +955,6 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 metadata.replay_start,
                 num_tokens=metadata.num_decode_tokens,
                 token_offset=0,
-            )
-        if _dsv41_flag("VLLM_DSV41_LOG_SWAIDX"):
-            _idx = metadata.decode_swa_indices[:1, 0, :].detach().to(torch.int64)
-            _lens = metadata.decode_swa_lens[:1].detach().to(torch.int64)
-            logger.warning(
-                "DSV41 SWAIDX lens=%s idx0=%s",
-                _lens.tolist(),
-                _idx[0, :16].tolist(),
             )
         tile_sched = self.build_tile_scheduler(metadata.num_decode_tokens)
         metadata.tile_sched_swaonly = tile_sched[_LAYER_TYPE_SWAONLY]
