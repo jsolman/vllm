@@ -863,6 +863,33 @@ class Scheduler(SchedulerInterface):
                     and request.is_prefill_chunk is False
                 ):
                     _gl53_lookahead = 1
+                # Async-scheduling allocation-lag fix (DSv4.1 SWA loop root
+                # cause; abpair35-44 data; independent minimax-m3.1 review
+                # concurs): the schedule that produces exec(k)'s
+                # SchedulerOutput ran while num_computed was still one
+                # token behind the position the worker actually writes at
+                # exec(k) (the token sampled at exec(k-1) is scheduled at
+                # the NEXT schedule). num_tokens_need_slot
+                # (= computed + num_new) therefore covers only through
+                # write_pos - 1. Harmless except when write_pos starts a
+                # block: its table column does not exist yet (pristine
+                # row: slot-mapping reads 0 -> KV written to the null
+                # slot; recycled row: the gathered column is zeroed by
+                # the short count -> the window reads a null row). One
+                # token of lookahead makes the boundary block exist in
+                # the SAME SchedulerOutput that carries the boundary
+                # token. Same failure class as the GLM-5.3 compressed-
+                # page drift above, at block_size granularity.
+                # NOTE: num_output_placeholders is 0 at schedule time
+                # (placeholders are added in _update_after_schedule), so
+                # a placeholder-count-based reserve never fires - the
+                # gate must be async_scheduling itself.
+                if (
+                    _gl53_lookahead < 1
+                    and self.scheduler_config.async_scheduling
+                    and request.is_prefill_chunk is False
+                ):
+                    _gl53_lookahead = 1
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
