@@ -742,6 +742,21 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 _lens.tolist(),
                 _idx[0].tolist(),
             )
+        if _dsv41_flag("VLLM_DSV41_LOG_BTAB") and num_decode_tokens > 0:
+            # Log req0's gathered block-table row around the SWA window
+            # boundary, plus the exact window column range: the index
+            # kernel maps pos p -> table[p//32]. Compare legs step by step.
+            _sl = int(seq_lens_cpu[0]) if seq_lens_cpu is not None else -1
+            _win_lo = max(0, (_sl - self.window_size) // self.block_size - 2)
+            _win_hi = min(
+                block_table.shape[1], (_sl + 1) // self.block_size + 3
+            )
+            _row = block_table[0].detach().to(torch.int64)
+            logger.warning(
+                "DSV41 BTAB seqlen=%d cols=%d..%d row=%s",
+                _sl, _win_lo, _win_hi,
+                _row[_win_lo:_win_hi].tolist(),
+            )
         if _dsv41_flag("VLLM_DSV41_LOG_SWAWIN") and num_decode_tokens > 0:
             # Hash every cache row that token 0's window reads. The rows
             # are addressed by slot ids; find this backend's cache tensor
@@ -758,11 +773,13 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     else {}
                 )
                 _mod = None
-                for _v in _mods.values():
+                _mod_prefix = None
+                for _pname, _v in _mods.items():
                     if isinstance(_v, AttentionLayerBase) and hasattr(_v, "kv_cache"):
                         _t = getattr(_v, "kv_cache", None)
                         if _t is not None and _t.numel() > 0 and _t.dtype == torch.uint8:
                             _mod = _t
+                            _mod_prefix = _pname
                             break
                 if _mod is None:
                     raise RuntimeError("no bound swa cache in forward context")
@@ -779,8 +796,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 _rows = []
             _sl = seq_lens[:1].detach().to(torch.int64)
             logger.warning(
-                "DSV41 SWAWIN seqlen=%s rows=%s",
-                _sl.tolist(),
+                "DSV41 SWAWIN layer=%s seqlen=%s rows=%s",
+                _mod_prefix, _sl.tolist(),
                 _rows[:64],
             )
 
