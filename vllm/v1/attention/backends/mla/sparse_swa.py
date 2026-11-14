@@ -770,7 +770,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 for _s in _idx[0].tolist():
                     if 0 <= _s < _cache.shape[0]:
                         _r = _cache[_s]
-                        _rows.append(int(_r[:64].to(torch.int64).sum().item()) ^ (_s & 0xFFFF))
+                        _w = torch.arange(64, dtype=torch.int64, device=_r.device)
+                        _rows.append(int((_r[:64].to(torch.int64) * _w).sum().item()))
                     else:
                         _rows.append(-999999)
             except Exception as _e:
