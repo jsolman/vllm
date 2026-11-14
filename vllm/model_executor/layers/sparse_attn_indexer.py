@@ -980,6 +980,7 @@ def sparse_attn_indexer(
             # DCP need fp32. SM100 decode is varlen: one context length per row.
             if topk_backend != "deep_select" or dcp_world_size != 1:
                 logits = as_fp32_logits(logits, seq_lens.view(-1))
+        num_rows = logits.shape[0]
         if candidate_blocks is not None:
             # Two-level selection (v4.1) on the decode logits; columns are
             # request-local compressed positions. seq_lens is (B, next_n)
