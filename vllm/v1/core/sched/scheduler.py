@@ -863,6 +863,31 @@ class Scheduler(SchedulerInterface):
                     and request.is_prefill_chunk is False
                 ):
                     _gl53_lookahead = 1
+                # Async-scheduling drift fix: reserve one token of
+                # lookahead per in-flight output placeholder. Under async
+                # scheduling the KV write the worker performs at exec(k)
+                # targets position num_computed + placeholders (the token
+                # sampled at exec(k-1)), but num_new_tokens
+                # (= num_tokens_with_spec + placeholders - num_computed)
+                # covers only through num_computed + placeholders - 1
+                # because it counts the placeholder, whose slot was
+                # already allocated when it was scheduled. The deficit is
+                # invisible unless the write position starts a new block:
+                # the block-table column is missing, the gather zeroes it
+                # in the gathered row, and the slot-mapping kernel reads
+                # the persistent row's stale residue, writing the token's
+                # KV into a recycled block. Reserving the placeholder
+                # count makes num_tokens_need_slot cover the write
+                # position one schedule early. Placeholders are nonzero
+                # only under AsyncScheduler, so sync scheduling is
+                # unchanged. Cost: zero extra blocks except exactly at a
+                # boundary (cdiv granularity).
+                if (
+                    _gl53_lookahead < 1
+                    and getattr(request, "num_output_placeholders", 0) > 0
+                    and request.is_prefill_chunk is False
+                ):
+                    _gl53_lookahead = request.num_output_placeholders
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
