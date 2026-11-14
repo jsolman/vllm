@@ -756,7 +756,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                         _rows.append(int(_r[:64].to(torch.int64).sum().item()) ^ (_s & 0xFFFF))
                     else:
                         _rows.append(-999999)
-            except Exception:
+            except Exception as _e:
+                logger.warning("DSV41 SWAWIN probe error: %s", _e)
                 _rows = []
             _sl = seq_lens[:1].detach().to(torch.int64)
             logger.warning(
