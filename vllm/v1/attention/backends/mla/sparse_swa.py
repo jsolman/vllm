@@ -749,13 +749,16 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             _idx = decode_swa_indices[:1, 0, :].detach().to(torch.int64)
             _rows = []
             try:
-                from vllm.forward_context import get_forward_context
                 from vllm.model_executor.layers.attention_layer_base import (
                     AttentionLayerBase,
                 )
-                _ctx = get_forward_context()
+                _mods = (
+                    self.vllm_config.compilation_config.static_forward_context
+                    if hasattr(self, "vllm_config")
+                    else {}
+                )
                 _mod = None
-                for _v in _ctx.static_forward_context.values():
+                for _v in _mods.values():
                     if isinstance(_v, AttentionLayerBase) and hasattr(_v, "kv_cache"):
                         _t = getattr(_v, "kv_cache", None)
                         if _t is not None and _t.numel() > 0 and _t.dtype == torch.uint8:
