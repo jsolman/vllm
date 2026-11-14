@@ -554,7 +554,19 @@ class KVCacheManager:
         # tokens can roll it back.
         self.coordinator.remove_skipped_blocks(
             request.request_id,
-            max(0, total_computed_tokens - request.num_in_flight_tokens),
+            max(
+                0,
+                total_computed_tokens
+                - request.num_in_flight_tokens
+                # Async scheduling: placeholders are scheduled but their
+                # KV writes have not committed. Counting them as
+                # 'processed' lets the R-SWA gap-free range advance past
+                # the allocation frontier, nulling the block that holds
+                # the next write position at every block boundary (the
+                # token's KV then goes to slot 0 and the SWA window later
+                # reads a wrong row - the DSv4.1 loop).
+                - getattr(request, "num_output_placeholders", 0),
+            ),
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
