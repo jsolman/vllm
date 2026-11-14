@@ -884,14 +884,29 @@ class Scheduler(SchedulerInterface):
                 # boundary (cdiv granularity).
                 if (
                     _gl53_lookahead < 1
-                    and getattr(request, "num_output_placeholders", 0) > 0
+                    and self.scheduler_config.async_scheduling
                     and request.is_prefill_chunk is False
                 ):
-                    # Empirically the async pipeline's KV write frontier is
-                    # TWO tokens past the allocation frontier at a block
-                    # boundary (the sampled token of exec(k-1) plus the
-                    # placeholder accounting), so reserve both.
-                    _gl53_lookahead = request.num_output_placeholders + 1
+                    # Async-scheduling allocation-lag fix (DSv4.1 SWA
+                    # loop root cause, abpair35-43 data): the schedule
+                    # that produces exec(k)'s SchedulerOutput ran while
+                    # num_computed was still one token behind the
+                    # position the worker actually writes at exec(k)
+                    # (the token sampled at exec(k-1) is scheduled at
+                    # the NEXT schedule). num_tokens_need_slot
+                    # (= computed + num_new) therefore covers only
+                    # through write_pos - 1. Harmless except when
+                    # write_pos starts a block: its table column does
+                    # not exist yet (leg A: slot-mapping reads the
+                    # persistent row's residue/0 -> KV written to the
+                    # null slot; leg B: gathered column zeroed by the
+                    # short count -> window reads a null row). One
+                    # token of lookahead makes the boundary block
+                    # exist in the SAME SchedulerOutput that carries
+                    # the boundary token. Placeholders already cover
+                    # their own slots; the +1 covers the sampled
+                    # token ahead of the allocation frontier.
+                    _gl53_lookahead = 1
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
