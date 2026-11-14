@@ -740,7 +740,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 "DSV41 SWAIDX seqlen=%s lens=%s idx0=%s",
                 _sl.tolist(),
                 _lens.tolist(),
-                _idx[0, :20].tolist(),
+                _idx[0].tolist(),
             )
 
         # Vision variant: per-token in-image visibility for prefill tokens.
