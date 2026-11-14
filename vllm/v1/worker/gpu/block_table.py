@@ -4,6 +4,17 @@ from collections.abc import Iterable
 
 import torch
 
+
+def _dsv41_flag(name: str) -> bool:
+    try:
+        with open("/tmp/dsv41-flags") as f:
+            return name in f.read()
+    except OSError:
+        return False
+
+import logging
+logger = logging.getLogger(__name__)
+
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.buffer_utils import (
@@ -162,6 +173,23 @@ class BlockTables:
         else:
             assert out_ptrs is not None
             assert len(out) == self.num_kv_cache_groups
+        if _dsv41_flag("VLLM_DSV41_LOG_NBLK"):
+            # Count desync probe: for batch row 0, log the per-group copy
+            # length the kernel will use (num_blocks.gpu) and the CPU-side
+            # count (num_blocks.np) plus the SRC row's tail values.
+            import numpy as _np
+            _req0 = int(idx_mapping[0]) if idx_mapping.numel() else -1
+            _gpu_counts = self.num_blocks.gpu[:, _req0].tolist() if self.num_blocks.gpu is not None else []
+            _np_counts = self.num_blocks.np[:, _req0].tolist()
+            _tails = []
+            for _i in range(self.num_kv_cache_groups):
+                _src = self.block_tables[_i].gpu
+                _c = _np_counts[_i]
+                _tails.append(_src[_req0, max(0, _c - 4):_c + 3].tolist())
+            logger.warning(
+                "DSV41 NBLK req0=%d gpu=%s np=%s srctails=%s",
+                _req0, _gpu_counts, _np_counts, _tails,
+            )
         # Also clear rows left by a larger batch in the shared buffer.
         _gather_block_tables_kernel[(self.num_kv_cache_groups, num_rows)](
             idx_mapping,
