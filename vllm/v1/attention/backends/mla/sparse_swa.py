@@ -22,6 +22,10 @@ def _dsv41_flag(name: str) -> bool:
     return False
 
 
+import logging
+logger = logging.getLogger(__name__)
+
+
 from transformers import DeepseekV4Config
 
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
