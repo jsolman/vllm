@@ -863,49 +863,32 @@ class Scheduler(SchedulerInterface):
                     and request.is_prefill_chunk is False
                 ):
                     _gl53_lookahead = 1
-                # Async-scheduling drift fix: reserve one token of
-                # lookahead per in-flight output placeholder. Under async
-                # scheduling the KV write the worker performs at exec(k)
-                # targets position num_computed + placeholders (the token
-                # sampled at exec(k-1)), but num_new_tokens
-                # (= num_tokens_with_spec + placeholders - num_computed)
-                # covers only through num_computed + placeholders - 1
-                # because it counts the placeholder, whose slot was
-                # already allocated when it was scheduled. The deficit is
-                # invisible unless the write position starts a new block:
-                # the block-table column is missing, the gather zeroes it
-                # in the gathered row, and the slot-mapping kernel reads
-                # the persistent row's stale residue, writing the token's
-                # KV into a recycled block. Reserving the placeholder
-                # count makes num_tokens_need_slot cover the write
-                # position one schedule early. Placeholders are nonzero
-                # only under AsyncScheduler, so sync scheduling is
-                # unchanged. Cost: zero extra blocks except exactly at a
-                # boundary (cdiv granularity).
+                # Async-scheduling allocation-lag fix (DSv4.1 SWA loop
+                # root cause, abpair35-44 data; independent minimax-m3.1
+                # review concurs): the schedule that produces exec(k)'s
+                # SchedulerOutput ran while num_computed was still one
+                # token behind the position the worker actually writes
+                # at exec(k) (the token sampled at exec(k-1) is
+                # scheduled at the NEXT schedule). num_tokens_need_slot
+                # (= computed + num_new) therefore covers only through
+                # write_pos - 1. Harmless except when write_pos starts
+                # a block: its table column does not exist yet (leg A:
+                # slot-mapping reads the persistent row's residue/0 ->
+                # KV written to the null slot; leg B: gathered column
+                # zeroed by the short count -> window reads a null
+                # row). One token of lookahead makes the boundary block
+                # exist in the SAME SchedulerOutput that carries the
+                # boundary token. Same failure class as the GLM-5.3
+                # compressed-page drift above, at block_size granularity.
+                # NOTE: num_output_placeholders is 0 at schedule time
+                # (placeholders are added in _update_after_schedule), so
+                # a placeholder-count-based reserve never fires - the
+                # gate must be async_scheduling itself.
                 if (
                     _gl53_lookahead < 1
                     and self.scheduler_config.async_scheduling
                     and request.is_prefill_chunk is False
                 ):
-                    # Async-scheduling allocation-lag fix (DSv4.1 SWA
-                    # loop root cause, abpair35-43 data): the schedule
-                    # that produces exec(k)'s SchedulerOutput ran while
-                    # num_computed was still one token behind the
-                    # position the worker actually writes at exec(k)
-                    # (the token sampled at exec(k-1) is scheduled at
-                    # the NEXT schedule). num_tokens_need_slot
-                    # (= computed + num_new) therefore covers only
-                    # through write_pos - 1. Harmless except when
-                    # write_pos starts a block: its table column does
-                    # not exist yet (leg A: slot-mapping reads the
-                    # persistent row's residue/0 -> KV written to the
-                    # null slot; leg B: gathered column zeroed by the
-                    # short count -> window reads a null row). One
-                    # token of lookahead makes the boundary block
-                    # exist in the SAME SchedulerOutput that carries
-                    # the boundary token. Placeholders already cover
-                    # their own slots; the +1 covers the sampled
-                    # token ahead of the allocation frontier.
                     _gl53_lookahead = 1
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
