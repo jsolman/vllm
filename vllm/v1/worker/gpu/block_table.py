@@ -261,11 +261,16 @@ class BlockTables:
         import os as _os
         if _os.path.exists("/tmp/dsv41-alloc-flags") and num_reqs == 1:
             import logging as _lg
+            _pos = int(positions[-1])
+            _nbc = [
+                int(self.num_blocks.np[g, int(idx_mapping[0])])
+                for g in range(min(num_groups, 4))
+            ]
             _lg.getLogger(__name__).warning(
-                "DSV41 SLOTOUT pos_last=%d sm_gid0_last=%d sm_all=%s",
-                int(positions[-1]),
-                int(slot_mappings[0, num_tokens_padded - 1]),
+                "DSV41 SLOTOUT pos_last=%d sm_all=%s nbc=%s",
+                _pos,
                 [int(slot_mappings[g, num_tokens_padded - 1]) for g in range(min(num_groups, 6))],
+                _nbc,
             )
         return slot_mappings[:, :num_tokens_padded]
 
