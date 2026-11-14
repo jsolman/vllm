@@ -610,6 +610,18 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
         )
+        import os as _os
+        if _os.path.exists("/tmp/dsv41-alloc-flags") and num_new_tokens <= 2:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "DSV41 ALLOC req=%s new=%d need_slot=%d main=%d lookahead=%d "
+                "computed=%d inflight=%d ph=%d nblocks_by_group=%s",
+                request.request_id, num_new_tokens, num_tokens_need_slot,
+                num_tokens_main_model, num_lookahead_tokens,
+                total_computed_tokens, request.num_in_flight_tokens,
+                getattr(request, "num_output_placeholders", -1),
+                [len(b) for b in self.get_block_ids(request.request_id)],
+            )
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.

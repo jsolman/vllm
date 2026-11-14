@@ -938,6 +938,16 @@ class RSWAManager(FullAttentionManager):
             num_prompt_tokens, processed_computed_tokens - self.rswa_window
         )
         last_gap_block = window_start // bs  # exclusive upper bound
+        import os as _os
+        if _os.path.exists("/tmp/dsv41-alloc-flags") and last_gap_block > first_gap_block:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "DSV41 RSWAFREE req=%s prompt=%d processed=%d window=%d "
+                "free_cols=[%d,%d) nblocks=%d",
+                request_id, num_prompt_tokens, processed_computed_tokens,
+                self.rswa_window, first_gap_block, last_gap_block,
+                len(self.req_to_blocks[request_id]),
+            )
         self._remove_blocks_in_range(request_id, first_gap_block, last_gap_block)
 
 
