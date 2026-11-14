@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from vllm.logger import init_logger
-import os
 import torch
 
 from vllm.platforms import current_platform
@@ -14,27 +12,6 @@ _TOPK = 6
 # https://github.com/sgl-project/sglang/blob/main/python/sglang/jit_kernel/moe_fused_gate.py
 
 
-logger = init_logger(__name__)
-
-def _dsv41_flag(name: str) -> bool:
-    """Read a debug flag from the env OR from /tmp/dsv41-flags (one name
-    per line). The engine process does not inherit every env var, so the
-    file is the reliable channel for a live experiment."""
-    if os.environ.get(name, "0") == "1":
-        return True
-    try:
-        with open("/tmp/dsv41-flags") as f:
-            for line in f:
-                if line.strip() == name:
-                    return True
-    except OSError:
-        pass
-    return False
-
-
-# Debug: log the MoE's routing per token.
-_DSV41_LOG_ROUTING = _dsv41_flag("VLLM_DSV41_LOG_ROUTING")
-_DSV41_LOG_MAX_TOKENS = int(os.environ.get("VLLM_DSV41_LOG_MAX_TOKENS", "32") or 32)
 
 def can_use_dsv4_topk(
     gating_output: torch.Tensor,
@@ -68,7 +45,6 @@ if current_platform.is_cuda():
         is_padding_ptr,
         topk_weights_ptr,
         topk_ids_ptr,
-        rscore_ptr,
         routed_scaling_factor,
         input_ids_ptr,
         bias_vl_ptr,
@@ -78,7 +54,6 @@ if current_platform.is_cuda():
         HAS_PADDING: tl.constexpr,
         HAS_VL: tl.constexpr,
         launch_pdl: tl.constexpr,
-        LOG_ROUTING: tl.constexpr,
     ):
         row = tl.program_id(0)
         expert_offsets = tl.arange(0, BLOCK_N)
@@ -144,19 +119,6 @@ if current_platform.is_cuda():
 
         tl.store(topk_weights_ptr + output_offsets, selected_weights, mask=output_mask)
         tl.store(topk_ids_ptr + output_offsets, selected_ids, mask=output_mask)
-        if LOG_ROUTING:
-            # Debug: the CORRECTED SCORES the top-k selected from, and the
-            # MARGIN between the 6th and the 7th (a small margin = a
-            # near-tie, so a last-bit difference flips the selected set).
-            # A Triton kernel cannot call a logger, so the numbers go into
-            # a debug buffer that the caller reads and logs.
-            # selected_weights holds the 6 selected scores (the weights are
-            # the corrected scores, before the softmax).
-            # the sum of the 6 selected corrected scores, and the max of
-            # the gating output: both are scalars, so they are stored
-            # without a mask (one program per row).
-            tl.store(rscore_ptr + row * 2, tl.sum(logits, axis=0))
-            tl.store(rscore_ptr + row * 2 + 1, tl.sum(selected_weights, axis=0))
 
 
 def dsv4_topk(
@@ -187,12 +149,6 @@ def dsv4_topk(
     shape = (num_tokens, _TOPK)
     topk_weights = gating_output.new_empty(shape, dtype=torch.float32)
     topk_ids = gating_output.new_empty(shape, dtype=indices_dtype)
-    # Debug: the corrected scores per row (the gating sum, the 6th and the
-    # 7th score, and the max). The gap between the 6th and the 7th is the
-    # near-tie margin: a small margin means a last-bit difference flips the
-    # selected expert set.
-    rscore = (gating_output.new_empty((num_tokens, 2), dtype=torch.float32)
-              if _DSV41_LOG_ROUTING else gating_output.new_empty(1))
     if num_tokens > 0:
         _dsv4_topk_kernel[(num_tokens,)](
             gating_output,
@@ -200,12 +156,10 @@ def dsv4_topk(
             is_padding,
             topk_weights,
             topk_ids,
-            rscore,
             routed_scaling_factor,
             input_ids,
             bias_vl,
             image_sentinel_lo,
-            LOG_ROUTING=_DSV41_LOG_ROUTING,
             NUM_EXPERTS=num_experts,
             BLOCK_N=triton.next_power_of_2(num_experts),
             HAS_PADDING=is_padding is not None,
@@ -213,24 +167,4 @@ def dsv4_topk(
             num_warps=1,
             launch_pdl=current_platform.is_arch_support_pdl(),
         )
-    if _DSV41_LOG_ROUTING and num_tokens:
-        # Debug: the routing is the model's one DISCRETE choice (the
-        # bias-corrected top-k over the experts). Log the selected ids and
-        # weights per token so two runs of the same request can be
-        # compared: if the experts differ, the selection is flipping.
-        _ids = topk_ids.detach().to(torch.int32)
-        _w = topk_weights.detach().float()
-        for _t in range(min(num_tokens, _DSV41_LOG_MAX_TOKENS)):
-            _row = ",".join(str(int(v)) for v in _ids[_t].tolist())
-            _ws = ",".join("%.6g" % float(v) for v in _w[_t].tolist())
-            logger.warning(
-                "DSV41 ROUTE tok=%d ids=%s w=%s", _t, _row, _ws
-            )
-    if _DSV41_LOG_ROUTING and num_tokens > 0:
-        _rs = rscore.detach()
-        for _r in range(min(_rs.shape[0], 6)):
-            logger.warning(
-                "DSV41 RSCORE row=%d gsum=%.10g selwsum=%.10g",
-                _r, float(_rs[_r, 0]), float(_rs[_r, 1]),
-            )
     return topk_weights, topk_ids

@@ -35,25 +35,6 @@ else:
 logger = init_logger(__name__)
 
 
-def _dsv41_flag(name: str) -> bool:
-    """Read a debug flag from the env OR from /tmp/dsv41-flags.
-
-    The flags file is the belt-and-braces channel: it works even when a
-    flag is missing from one of the launcher's env blocks, and it is
-    read at CALL time, so a flag can be turned on without a restart
-    (a restart with a heavy probe can stall the startup's shared-memory
-    broadcast).
-    """
-    if os.environ.get(name, "0") == "1":
-        return True
-    try:
-        with open("/tmp/dsv41-flags") as f:
-            for line in f:
-                if line.strip() == name:
-                    return True
-    except OSError:
-        pass
-    return False
 
 
 
@@ -73,29 +54,6 @@ FP8_DTYPE = current_platform.fp8_dtype()
 #
 # The -1 padding must stay at the END, so only the valid prefix is
 # sorted.
-_DSV41_LOG_DECODE_SELECTION = os.environ.get(
-    "VLLM_DSV41_LOG_DECODE_SELECTION", "0"
-) == "1"
-# The decode selection probe's budget (the probe floods the log pipe).
-_decsel_count = 0
-# THE TOPK-SETS probe (the attractor instrument): env VLLM_DSV41_
-# LOG_TOPK_SETS=1 or a line VLLM_DSV41_LOG_TOPK_SETS in /tmp/dsv41-
-# flags; writes _TOPKSET_PATH, one JSON per decode step (8 rows),
-# capped at _TOPKSET_BUDGET lines.
-_DSV41_LOG_TOPK_SETS = os.environ.get("VLLM_DSV41_LOG_TOPK_SETS", "0") == "1"
-if not _DSV41_LOG_TOPK_SETS:
-    try:
-        with open("/tmp/dsv41-flags") as _ftk:
-            _DSV41_LOG_TOPK_SETS = any(
-                line.strip() == "VLLM_DSV41_LOG_TOPK_SETS"
-                for line in _ftk)
-    except OSError:
-        pass
-_TOPKSET_PATH = os.environ.get(
-    "VLLM_DSV41_TOPKSET_PATH", "/tmp/dsv41-topksets.jsonl")
-_TOPKSET_BUDGET = int(os.environ.get(
-    "VLLM_DSV41_TOPKSET_BUDGET", "700"))
-_topkset_count = 0
 _DSV41_CANONICAL_TOPK = os.environ.get("VLLM_DSV41_CANONICAL_TOPK", "1") == "1"
 
 
@@ -1524,62 +1482,6 @@ def rocm_aiter_sparse_attn_indexer(
             )
             if _DSV41_CANONICAL_TOPK:
                 _sort_topk_rows(topk_indices)
-            if _dsv41_flag("VLLM_DSV41_LOG_TOPK_SETS") and \
-                    _topkset_count < _TOPKSET_BUDGET:
-                # THE ATTRACTOR INSTRUMENT (Step 1d): per decode row
-                # dump the 512 selected compressed positions + the
-                # selection scores at those positions - the full
-                # STATE of the indexer's decision. The attractor
-                # analysis compares the SELECTION's mass over the
-                # prompt's recitation region vs the model's own
-                # generated region at the ignition rows.
-                _topkset_count += 1
-                try:
-                    import json as _json
-                    _mat = topk_indices[:num_rows, :topk_tokens].detach() \
-                        .to(torch.int64)
-                    # The row's context length in the compressed
-                    # units: the selection is over [0, visible_i).
-                    _data = []
-                    _top = logits.detach().float()
-                    for _i in range(min(int(num_rows), 8)):
-                        _row = _mat[_i].tolist()
-                        _v = [int(x) for x in _row if x >= 0]
-                        _scores = _top[_i, _row].tolist() if _row else []
-                        _data.append(dict(sel=_v,
-                                          scores=[round(x, 3) for x in _scores]))
-                    _meta = decode_metadata
-                    _sl = _meta.seq_lens.reshape(-1).tolist()[:min(int(num_rows), 8)] \
-                        if hasattr(_meta, "seq_lens") else []
-                    with open(_TOPKSET_PATH, "a") as _f:
-                        _f.write(_json.dumps(dict(
-                            rows=_data,
-                            seq_lens=_sl,
-                            max_seq=getattr(_meta, "max_seq_len", None),
-                            topk=int(topk_tokens),
-                            layer=str(k_cache_prefix))) + "\n")
-                except Exception as _e:
-                    logger.warning("DSV41 TOPKSET probe failed: %s", _e)
-            if _dsv41_flag("VLLM_DSV41_LOG_DECODE_SELECTION") and \
-                    _decsel_count < 24:
-                # Debug: the decode selection's SET (not its order). The
-                # compiled top-k breaks the exactly-tied candidates by
-                # the thread arrival order, so the SET can differ between
-                # two runs - and the attention would then read a
-                # different context.
-                #
-                # The probe is bounded: one line per decode step floods
-                # the worker's log pipe, and the startup's shared-memory
-                # broadcast then times out (the engine never comes up).
-                _decsel_count += 1
-                _sel = topk_indices.detach().to(torch.int64)
-                _valid = _sel[_sel >= 0]
-                logger.warning(
-                    "DSV41 DECSEL n=%d sum=%d hash=%d",
-                    int(_valid.numel()),
-                    int(_valid.sum()),
-                    hash(tuple(sorted(_valid.tolist()))),
-                )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
@@ -4402,20 +4304,6 @@ def _rocm_sparse_attn_decode_ragged_triton(
             if _forced >= 1:
                 num_splits = _forced
 
-    if os.environ.get("VLLM_DSV41_LOG_DECODE_SPLITS", "0") == "1":
-        # Debug: the decode's split count and the selection's size.
-        # The split count depends on main_indices.numel() (the number of
-        # selected positions), and a different split count is a
-        # different accumulation order in the decode's split-K
-        # reduction - so a selection whose SIZE varies would change the
-        # result.
-        import logging as _logging
-        _logging.getLogger("vllm").warning(
-            "DSV41 DSPLITS q=%d main=%d extra=%d splits=%d",
-            int(num_queries), int(main_indices.numel()),
-            int(extra_indices.numel()) if has_extra else 0,
-            int(num_splits),
-        )
 
     base_workgroups = num_queries * heads_blocks
     adaptive_splits = (

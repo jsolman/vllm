@@ -1,120 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import json
 import os
-
-# The single-layer harness's capture helpers. Gated by
-# VLLM_DSV41_DUMP_LAYER_DIR; the writes are request-keyed and
-# rotated, with a hard directory cap and a free-space floor, so
-# the probe can never fill the disk (the 11/5 incident: an
-# every-hit writer that filled /tmp with ~99GB).
-# WRITE BUDGET (per capture set): 40 layers x 2 sites x ~84MB x
-# 4 ranks ~= 32GB; the directory byte cap (192GB across hosts)
-# and the 64GB free floor refuse beyond it.
-#
-# ARMING: a write happens only while /tmp shows the run armed -
-# the arm marker is the existence of the dump dir ITSELF (the
-# operator creates it fresh + empty before the target request
-# and rotates it afterwards). Without the dir no capture runs;
-# with it, the first _DUMP_MAX_HITS writes per flavor per
-# process go through and the counters make the filenames unique.
-
-# DUMP counter namespace: unique filenames per hit flavor per
-# process (the class got dropped in the disk-safety edit).
-class _DumpCounters:
-    pass
-
-
-_dump_counters = _DumpCounters()
-
-
-def _dump_active(dirpath: str, tag: str) -> bool:
-    """True when this capture may write: a request-level gate.
-
-    Only ONE flavor (attnraw / attnout) and only the first
-    _DUMP_MAX_HITS hits within the ARMED request write; arming is
-    a marker file the operator drops (arm.txt) and every hit
-    checks the directory's free space against the floor.
-    """
-    import shutil
-    try:
-        fs = shutil.disk_usage(dirpath)
-        free = fs.free
-        if free < _DUMP_MIN_FREE_BYTES or free < _DUMP_MAX_BYTES // 4:
-            return False
-        used = sum(
-            os.path.getsize(os.path.join(dirpath, f))
-            for f in os.listdir(dirpath) if f.endswith(".pt")
-        )
-        return used < _DUMP_MAX_BYTES
-    except OSError:
-        return False
-
-
-def _dump_dir_prune(dirpath: str, keep_last: int) -> None:
-    """Delete the oldest capture files beyond a count."""
-    try:
-        fs_files = sorted(
-            (os.path.getmtime(os.path.join(dirpath, f)), f)
-            for f in os.listdir(dirpath) if f.endswith(".pt"))
-        excess = len(fs_files) - keep_last
-        for _, f in fs_files[:max(0, excess)]:
-            os.remove(os.path.join(dirpath, f))
-    except OSError:
-        pass
-
-
-_DUMP_MAX_BYTES = 192 * 1024**3   # 192GB TOTAL per directory (4
-                                 # ranks at 48GB)
-_DUMP_MIN_FREE_BYTES = 64 * 1024**3   # refuse below 64GB free
-_DUMP_KEEP_LAST = 480   # ~ the newest single capture set per host
-_DUMP_MAX_HITS = 1      # per forward-hit flavor within a request
-                        # the ENGTracks... the simplest guard: the
-                        # whole write happens once per flavor per
-                        # process lifetime for the ARMED run.
-
-
-def _dump_layer_dir() -> str:
-    """The capture dir: the env OR /tmp/dsv41-flags. The env does
-    not survive vLLM's spawn-env scrub on worker ranks - the flags
-    file is the reliable channel (one dir path per line, same
-    format as the e2m1 kernel's flag).
-    """
-    d = os.environ.get("VLLM_DSV41_DUMP_LAYER_DIR", "")
-    if d:
-        return d
-    try:
-        with open("/tmp/dsv41-flags") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("DUMP_LAYER_DIR="):
-                    return line.split("=", 1)[1]
-    except OSError:
-        pass
-    return ""
-
-
-def _layer_dump(dirpath, filename, state):
-    """Save a capture with all the guards. Refuses (silently, at
-    debug) rather than filling a disk."""
-    if not os.path.isdir(dirpath):
-        try:
-            os.makedirs(dirpath, exist_ok=True)
-        except OSError:
-            return
-    if not _dump_active(dirpath, filename):
-        return
-    _dump_dir_prune(dirpath, _DUMP_KEEP_LAST)
-    try:
-        torch.save(state, os.path.join(dirpath, filename))
-        t = state.get("attn_raw")
-        if t is not None:
-            logger.info(
-                "DSV41 LAYERDUMP wrote %s rows=%d sum=%.6g", filename,
-                t.shape[0], float(t.float().sum()))
-    except OSError:
-        logger.warning("DSV41 LAYERDUMP the write failed for %s",
-                       filename)
 
 import typing
 from collections.abc import Callable, Iterable
@@ -244,73 +130,6 @@ logger = init_logger(__name__)
 # TileLang kernel. The TileLang mHC kernels had a real shared-memory
 # race (every tile program wrote the same cross-warp reduction slot).
 _DSV41_MHC_TORCH = os.environ.get("DSV4_MHC_TORCH", "0") == "1"
-
-def _dsv41_flag(name: str) -> bool:
-    """Read a debug flag from the env OR from /tmp/dsv41-flags (one name
-    per line). The engine process does not inherit every env var, so the
-    file is the reliable channel for a live experiment."""
-    if os.environ.get(name, "0") == "1":
-        return True
-    try:
-        with open("/tmp/dsv41-flags") as f:
-            for line in f:
-                if line.strip() == name:
-                    return True
-    except OSError:
-        pass
-    return False
-
-
-def _dsv41_int(name: str, default: int) -> int:
-    """Read an integer setting from the env or from /tmp/dsv41-flags
-    (``NAME=value``), with a default."""
-    val = os.environ.get(name)
-    if val is None:
-        try:
-            with open("/tmp/dsv41-flags") as f:
-                for line in f:
-                    k, _, v = line.strip().partition("=")
-                    if k == name:
-                        val = v
-                        break
-        except OSError:
-            pass
-    if val is None:
-        return default
-    try:
-        return int(val)
-    except ValueError:
-        return default
-
-
-
-# Debug: log a per-layer checksum of the hidden states.
-_DSV41_LOG_LAYER_SUMS = _dsv41_flag("VLLM_DSV41_LOG_LAYER_SUMS")
-# Debug: log how the rows of one batch differ from each other.
-_DSV41_LOG_ROW_DIFF = _dsv41_flag("VLLM_DSV41_LOG_ROW_DIFF")
-logger.warning("DSV41 PROBE row_diff=%s layer_sums=%s",
-               _DSV41_LOG_ROW_DIFF, _DSV41_LOG_LAYER_SUMS)
-# How many requests the row-diff probe's batch has (so it can compare the
-# SAME token across requests).
-_DSV41_ROW_DIFF_REQS = int(os.environ.get("VLLM_DSV41_ROW_DIFF_REQS", "4") or 4)
-# Which layer's tokens to log, and how many tokens per pass.
-_DSV41_LOG_LAYER = _dsv41_int("VLLM_DSV41_LOG_LAYER", 0)
-_DSV41_LOG_MAX_TOKENS = _dsv41_int("VLLM_DSV41_LOG_MAX_TOKENS", 32)
-# A hard cap on the probe's total output per process, so a debug run can
-# never fill the disk (the profile run alone would emit 4096 tokens x 40
-# layers x every request).
-_DSV41_LOG_BUDGET = _dsv41_int("VLLM_DSV41_LOG_BUDGET", 4000)
-_dsv41_log_used = 0
-
-
-def _dsv41_log(fmt: str, *args) -> None:
-    """Log a probe line, within a per-process line budget."""
-    global _dsv41_log_used
-    if _dsv41_log_used >= _DSV41_LOG_BUDGET:
-        return
-    _dsv41_log_used += 1
-    logger.warning(fmt, *args)
-
 
 class DeepseekV4MoE(DeepseekV4MoEBase):
     def __init__(
@@ -855,80 +674,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             x = sp_all_gather(x)[: positions.shape[0]]
 
         x = self.attn(positions, x, None)
-        if _DSV41_LOG_ROW_DIFF:
-            # Debug: a per-token checksum right after the attention, from
-            # inside the decoder layer (so it fires whatever the runner
-            # does). The decoder layer does not know its own index, so the
-            # per-process line budget is what bounds this.
-            _h = x
-            if isinstance(_h, torch.Tensor) and _h.dim() == 2:
-                _s = _h.detach().float().sum(dim=1)
-                _m = _h.detach().float().abs().amax(dim=1)
-                # only the non-padding tokens (the padding rows are zero),
-                # and only a few, or the profile run floods the log
-                _nz = (_m > 0).nonzero().flatten()
-                for _ti in _nz[:_DSV41_LOG_MAX_TOKENS].tolist():
-                    _dsv41_log(
-                        "DSV41 ATN tok=%d sum=%.10g absmax=%.10g",
-                        _ti, float(_s[_ti]), float(_m[_ti]),
-                    )
-        if _DSV41_LOG_LAYER_SUMS and x is not None and x.numel():
-            # hash EVERY token row of the attention output, so the first
-            # diverging token can be identified.
-            _xr = x.detach().contiguous().view(torch.uint8).view(x.shape[0], -1)
-            _xh = [
-                hash(tuple(_xr[t].tolist()[:128]))
-                for t in range(min(_xr.shape[0], 12))
-            ]
-            logger.info(
-                "DSV41 PART L%d attn sum=%.10g absmax=%.10g h=%s",
-                getattr(self, "_dsv41_layer_id", -1),
-                float(x.detach().float().sum()),
-                float(x.detach().float().abs().max()),
-                _xh,
-            )
-        # The single-layer harness capture: the RAW ATTENTION output
-        # (before the MHC path reassigns x). This site's sum logging
-        # (the PART L%d attn rows) held real values, unlike the
-        # end-of-forward x which the deferred MHC/FFN writes leave
-        # empty at this call boundary.
-        _dump_dir0 = _dump_layer_dir()
-        if _dump_dir0 and x is not None and x.numel():
-            _lid0 = getattr(self, "_dsv41_layer_id", -1)
-            if _lid0 >= 0:
-                _n0 = getattr(_dump_counters, f"raw{_lid0}", 0)
-                setattr(_dump_counters, f"raw{_lid0}", _n0 + 1)
-                _layer_dump(
-                    _dump_dir0,
-                    f"L{_lid0}_attnraw_{_n0}.pt",
-                    {"layer": _lid0, "attn_raw": x.detach().float().cpu()},
-                )
         # With GEMM-RS bound, the attention output is already this rank's
         # sequence-parallel shard (see DeepseekV4Attention._wo_b_proj).
-        if _DSV41_LOG_LAYER_SUMS and x is not None and x.numel():
-            logger.info(
-                "DSV41 PART L%d attnout sum=%.10g absmax=%.10g",
-                getattr(self, "_dsv41_layer_id", -1),
-                float(x.detach().float().sum()),
-                float(x.detach().float().abs().max()),
-            )
         if self.use_sequence_parallel and self.attn.gemm_rs is None:
             x = sp_reduce_scatter(x)
 
         if mhc_stream is not None:
             torch.cuda.current_stream().wait_stream(mhc_stream)
-        if _DSV41_LOG_LAYER_SUMS and residual is not None and residual.numel():
-            # Debug: the MHC's INPUT (the residual the layer receives).
-            # Together with the gate input (GIN) and the layer output (x),
-            # this brackets the layer: if the MHC input and the gate input
-            # differ but the attention output does not, the difference is
-            # in the MHC; if the attention output differs, it is upstream.
-            logger.info(
-                "DSV41 PART L%d mhcin sum=%.10g absmax=%.10g",
-                getattr(self, "_dsv41_layer_id", -1),
-                float(residual.detach().float().sum()),
-                float(residual.detach().float().abs().max()),
-            )
         residual, post_mix, res_mix, x, ffn_pre, _ = mhc_shifted_post_pre(
             x,
             residual,
@@ -948,17 +700,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             stream=mhc_stream,
             reduce_results=self.fuse_mhc_all_reduce,
         )
-        if _DSV41_LOG_LAYER_SUMS and x is not None and x.numel():
-            # Debug: the FFN's INPUT (the MHC's output, after the ffn norm).
-            # The MHC streams (residual/post_mix/res_mix) are identical
-            # across runs at the failing layer, so if this differs, the MHC
-            # pre is where it enters.
-            logger.info(
-                "DSV41 PART L%d ffnin sum=%.10g absmax=%.10g",
-                getattr(self, "_dsv41_layer_id", -1),
-                float(x.detach().float().sum()),
-                float(x.detach().float().abs().max()),
-            )
         if self.fuse_mhc_all_reduce and self.ffn.defers_finalize(x.shape[0]):
             # The next layer's first boundary finalizes it with the all-reduce.
             x = self.ffn.forward_unfinalized(x, input_ids)
@@ -966,34 +707,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             x = self.ffn(x, input_ids, mega_gate_metadata)
         if mhc_stream is not None:
             torch.cuda.current_stream().wait_stream(mhc_stream)
-        if _DSV41_LOG_LAYER_SUMS and x is not None and x.numel():
-            logger.info(
-                "DSV41 PART ffn sum=%.10g absmax=%.10g",
-                float(x.detach().float().sum()),
-                float(x.detach().float().abs().max()),
-            )
-        # Debug: the SINGLE-LAYER COMPARISON harness's capture. When a
-        # VLLM_DSV41_DUMP_LAYER_DIR env is set, every layer's candidate
-        # end-of-forward state goes through _layer_dump (the guards:
-        # byte cap, free-space floor, mtime rotation). This site
-        # yielded ZERO-FILLED buffers in the 380/381 attempts (the
-        # deferred MHC write) - it stays in for completeness only.
-        _dump_dir = os.environ.get("VLLM_DSV41_DUMP_LAYER_DIR", "")
-        if _dump_dir and x is not None and x.numel():
-            _lid = getattr(self, "_dsv41_layer_id", -1)
-            if _lid >= 0:
-                _n = getattr(_dump_counters, f"out{_lid}", 0)
-                setattr(_dump_counters, f"out{_lid}", _n + 1)
-                _layer_dump(
-                    _dump_dir,
-                    f"L{_lid}_attnout_{_n}.pt",
-                    {
-                        "layer": _lid,
-                        "attn_out": x.detach().float().cpu(),
-                        "mhc_in": (residual.detach().float().cpu()
-                                   if residual is not None else None),
-                    },
-                )
         return x, residual, post_mix, res_mix, ffn_pre, previous_aux
 
     def write_kv(
@@ -1464,27 +1177,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # mixes — the mix the reference applies via
         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
         assert pre_mix is not None
-        if _DSV41_LOG_LAYER_SUMS and hidden_states is not None:
-            # Debug: the COLLAPSED and NORMALISED hidden states - the
-            # last steps before the LM head, which the per-layer probe
-            # does NOT cover (it stops at the layer boundary).
-            _hc = hidden_states.detach().float()
-            logger.warning(
-                "DSV41 COLLAPSE sum=%.10g absmax=%.10g hash=%d",
-                float(_hc.sum()),
-                float(_hc.abs().max()),
-                hash(tuple(_hc.reshape(-1)[:64].tolist())),
-            )
         hidden_states = hc_collapse_triton(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
-        if _DSV41_LOG_LAYER_SUMS and hidden_states is not None:
-            _hn = hidden_states.detach().float()
-            logger.warning(
-                "DSV41 FINALNORM sum=%.10g absmax=%.10g hash=%d",
-                float(_hn.sum()),
-                float(_hn.abs().max()),
-                hash(tuple(_hn.reshape(-1)[:64].tolist())),
-            )
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
@@ -1547,52 +1241,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 if self.use_sequence_parallel:
                     previous_aux = sp_all_gather(previous_aux)[:full_num_tokens]
                 aux_hidden_by_layer[idx] = previous_aux
-            if _DSV41_LOG_LAYER_SUMS:
-                # Debug: a per-layer checksum of EVERY stream the layer
-                # carries (the hidden state AND the three MHC streams), so
-                # a run-to-run divergence can be localised to the first
-                # layer and the first stream that differs.
-                def _ck(tag, t):
-                    if isinstance(t, torch.Tensor) and t.numel():
-                        v = t.detach().float()
-                        logger.warning(
-                            "DSV41 LAYER %d %s sum=%.10g absmax=%.10g",
-                            idx, tag, float(v.sum()), float(v.abs().max()),
-                        )
-
-                _ck("x", hidden_states)
-                _ck("res", residual)
-                _ck("post", post_mix)
-                _ck("resmix", res_mix)
-                if _DSV41_LOG_ROW_DIFF and idx == _DSV41_LOG_LAYER:
-                    # Debug: a per-TOKEN checksum of ONE layer's hidden
-                    # state, so two requests of a batch can be compared
-                    # OFFLINE (the token layout in the batch is not known
-                    # here, and the batch also holds the decode tokens).
-                    h = hidden_states
-                    if not isinstance(h, torch.Tensor):
-                        routed = getattr(h, "routed", None)
-                        shared = getattr(h, "shared_output", None)
-                        parts = [t for t in (routed, shared)
-                                 if isinstance(t, torch.Tensor)]
-                        h = parts[0] if parts else None
-                    if isinstance(h, torch.Tensor) and h.dim() == 2:
-                        hf = h.detach().float()
-                        sums = hf.sum(dim=1)
-                        mx = hf.abs().amax(dim=1)
-                        # only the non-padding tokens, and only a few
-                        nz = (mx > 0).nonzero().flatten()
-                        for ti in nz[:_DSV41_LOG_MAX_TOKENS].tolist():
-                            _dsv41_log(
-                                "DSV41 TOK layer=%d tok=%d sum=%.10g "
-                                "absmax=%.10g",
-                                idx, ti, float(sums[ti]), float(mx[ti]),
-                            )
-                    else:
-                        _dsv41_log(
-                            "DSV41 TOK layer=%d type=%s",
-                            idx, type(hidden_states).__name__,
-                        )
         assert residual is not None and post_mix is not None
         assert res_mix is not None and pre_mix is not None
         return hidden_states, residual, post_mix, res_mix, pre_mix
@@ -2061,88 +1709,8 @@ class DeepseekV41LLMForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        _hdt_on = os.environ.get("VLLM_DSV41_LOG_HEAD_DTYPE", "") == "1"
-        if not _hdt_on:
-            try:
-                with open("/tmp/dsv41-flags") as _f:
-                    _hdt_on = any(l.strip() == "LOG_HEAD_DTYPE" for l in _f)
-            except OSError:
-                _hdt_on = False
-        if _hdt_on:
-            logger.warning(
-                "DSV41 HEAD DTYPE: hidden=%s head_dtype=%s",
-                hidden_states.dtype,
-                getattr(self.logits_processor, "head_dtype", "NA"),
-            )
         logits = self.logits_processor(self.lm_head, hidden_states)
-        if _hdt_on:
-            logger.warning(
-                "DSV41 HEAD DTYPE: served=%s (from THIS logits_processor)",
-                logits.dtype if logits is not None else "None",
-            )
-        if _DSV41_LOG_LAYER_SUMS and logits is not None and logits.numel():
-            # Debug: the LOGITS' checksum. The per-layer probe covers the
-            # layers, but NOT the final norm or the LM head - so a
-            # divergence there would be invisible to it and visible in
-            # the sampled token.
-            v = logits.detach().float()
-            logger.warning(
-                "DSV41 LOGITS sum=%.10g absmax=%.10g hash=%d",
-                float(v.sum()),
-                float(v.abs().max()),
-                hash(tuple(v.reshape(-1)[:64].tolist())),
-            )
-        # THE +=FP32-SHADOW probe (step 1 of the precision ladder):
-        # for rows whose served top-2 logits are bit-equal in the
-        # raw dtype, recompute those two tokens in fp32 from the
-        # SAME hidden_states and the SAME weights, and dump both
-        # the bf16 pairs and the fp32 shadow values. Writes
-        # /tmp/dsv41-top64.jsonl (tie rows, shadow=True) so the
-        # sampler-side and head-side land in one stream. Budgeted
-        # like the other probes (a few MB).
-        try:
-            _on = False
-            try:
-                with open("/tmp/dsv41-flags") as _f:
-                    _on = any(l.strip() == "VLLM_DSV41_LOG_TOP64" for l in _f)
-            except OSError:
-                _on = False
-            if _on and logits is not None and logits.numel() \
-                    and hidden_states is not None:
-                _l = logits.detach()
-                _rows = _l.view(-1, _l.shape[-1]).float()
-                _mx = _rows.max(dim=-1).values
-                # the tie test: the top2 raw values equal
-                _srt = _rows.sort(dim=-1, descending=True).values
-                _eq = _srt[:, 0] == _srt[:, 1]
-                _idx = _eq.nonzero().flatten().tolist()
-                if _idx and not hasattr(self, "_dsv41_shadow_out"):
-                    self._dsv41_shadow_out = open(
-                        os.environ.get("VLLM_DSV41_TOP64_PATH",
-                                       "/tmp/dsv41-top64.jsonl"), "a")
-                for _r in _idx[:8]:
-                    _row = _rows[_r]
-                    _top = torch.topk(_row, k=2)
-                    t0, t1 = int(_top.indices[0]), int(_top.indices[1])
-                    _h = hidden_states.detach()
-                    if _h.dim() > 2:
-                        _h = _h.view(-1, _h.shape[-1])
-                    _hrow = _h[_r if _h.shape[0] > _r else 0].view(1, -1)
-                    # fp32 shadow: the same head weights, fp32 math
-                    _w = self.lm_head.weight
-                    _wsel = _w[[t0, t1]].detach().float()
-                    _sh = _hrow.float() @ _wsel.T
-                    v0, v1 = float(_sh[0, 0]), float(_sh[0, 1])
-                    self._dsv41_shadow_out.write(json.dumps(dict(
-                        shadow=True, r=_r, t0=t0, t1=t1,
-                        bf16_eq=bool(_row[t0] == _row[t1]),
-                        fp32_v0=v0, fp32_v1=v1,
-                        fp32_diff=v0 - v1,
-                    )) + "\n")
-                if _idx:
-                    self._dsv41_shadow_out.flush()
-        except Exception as _e:  # never break the serving path
-            logger.warning("DSV41 shadow probe failed: %s", _e)
+        return logits
         return logits
 
     def compute_logits_local(
@@ -2150,14 +1718,6 @@ class DeepseekV41LLMForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         logits = self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
-        if _DSV41_LOG_LAYER_SUMS and logits is not None and logits.numel():
-            v = logits.detach().float()
-            logger.warning(
-                "DSV41 LOGITSL sum=%.10g absmax=%.10g hash=%d",
-                float(v.sum()),
-                float(v.abs().max()),
-                hash(tuple(v.reshape(-1)[:64].tolist())),
-            )
         return logits
 
     @staticmethod

@@ -10,7 +10,6 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.config import get_current_vllm_config
-from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -154,80 +153,11 @@ def get_indexer_topk(backend: str) -> "SparseIndexerTopk":
 #
 # The -1 padding must stay at the END, so only the valid prefix is
 # sorted.
-logger = init_logger(__name__)
-
-
-def _dsv41_flag(name: str) -> bool:
-    """Read a debug flag from the env OR from /tmp/dsv41-flags."""
-    if os.environ.get(name, "0") == "1":
-        return True
-    try:
-        with open("/tmp/dsv41-flags") as f:
-            for line in f:
-                if line.strip() == name:
-                    return True
-    except OSError:
-        pass
-    return False
-
-
-
-# The decode selection probe's budget (the probe floods the log pipe).
-_decsel_count = 0
-
-_DSV41_LOG_DECODE_SELECTION = os.environ.get(
-    "VLLM_DSV41_LOG_DECODE_SELECTION", "0"
-) == "1"
-
-# THE TOPK-SETS probe (the attractor instrument, Step 1d): the decode
-# resolves the PERSISTENT backend (see the CANONICALISE block), so
-# the probe lives there. One JSON per decode step (up to 8 rows),
-# capped. Read from the env OR the flags file at CALL time.
-_TOPKSET_PATH = os.environ.get(
-    "VLLM_DSV41_TOPKSET_PATH", "/tmp/dsv41-topksets.jsonl")
-_TOPKSET_BUDGET = int(os.environ.get(
-    "VLLM_DSV41_TOPKSET_BUDGET", "400000"))
-_TOPKSET_STATE = {"n": 0}
-
-
-def _dsv41_topkset_flag() -> bool:
-    if os.environ.get("VLLM_DSV41_LOG_TOPK_SETS", "0") == "1":
-        return True
-    try:
-        with open("/tmp/dsv41-flags") as f:
-            return any(line.strip() == "VLLM_DSV41_LOG_TOPK_SETS"
-                       for line in f)
-    except OSError:
-        return False
-
-
-def _dsv41_flag(name: str) -> bool:
-    if os.environ.get(name, "0") == "1":
-        return True
-    try:
-        with open("/tmp/dsv41-flags") as f:
-            return any(line.strip() == name for line in f)
-    except OSError:
-        return False
 _DSV41_CANONICAL_TOPK = os.environ.get("VLLM_DSV41_CANONICAL_TOPK", "1") == "1"
 
 
 def _sort_topk_rows(out: torch.Tensor) -> None:
     """Sort each row's selected positions ascending, in place."""
-    # THE PERF A/B gate (2026-11-07): the canonical sort costs
-    # measurable decode time in the live paths; SKIP_CANON_TOPK
-    # (env or the flags-file line) restores the pre-canonical
-    # path so its throughput share is measurable directly.
-    _skip = os.environ.get("VLLM_DSV41_SKIP_CANON_TOPK", "") == "1"
-    if not _skip:
-        try:
-            with open("/tmp/dsv41-flags") as _f:
-                _skip = any(l.strip() == "SKIP_CANON_TOPK"
-                            for l in _f)
-        except OSError:
-            _skip = False
-    if _skip:
-        return
     if out.numel() == 0:
         return
     valid = (out >= 0).sum(dim=1)
@@ -429,22 +359,6 @@ class SparseIndexerTopk(torch.nn.Module):
         topk_indices (int32, -1 fill for rows shorter than topk_tokens).
         """
         backend = self.resolve_backend(logits, topk_tokens, logits.shape[0])
-        if _dsv41_flag("VLLM_DSV41_LOG_TOPK"):
-            # Debug: which decode top-k backend was resolved. Only the
-            # "per_row" backend canonicalises the selection's ORDER
-            # (the compiled top-k returns the selected positions in an
-            # arbitrary thread-arrival order, and the sparse attention
-            # reduces over them, so the order changes the BF16
-            # rounding). The cooperative and persistent backends do NOT
-            # sort, so their output order is arbitrary.
-            logger.warning(
-                "DSV41 TOPKBACKEND backend=%s topk_tokens=%d rows=%d "
-                "width=%d",
-                backend,
-                int(topk_tokens),
-                int(logits.shape[0]),
-                int(logits.shape[1]),
-            )
         # CANONICALISE THE SELECTION ORDER, FOR EVERY BACKEND.
         #
         # The compiled top-k kernels (cooperative_topk, persistent_topk)
@@ -485,31 +399,6 @@ class SparseIndexerTopk(torch.nn.Module):
             )
             if _DSV41_CANONICAL_TOPK:
                 _sort_topk_rows(topk_indices)
-            if _dsv41_topkset_flag() and \
-                    _TOPKSET_STATE["n"] < _TOPKSET_BUDGET:
-                _TOPKSET_STATE["n"] += 1
-                try:
-                    import json as _json
-                    _rows = min(int(logits.shape[0]), 8)
-                    _data = []
-                    _top = logits.detach().float()
-                    for _i in range(_rows):
-                        _row = topk_indices[_i].detach().to(torch.int64).tolist()
-                        _v = [int(x) for x in _row if x >= 0]
-                        _data.append(dict(
-                            sel=_v,
-                            scores=[round(x, 3)
-                                    for x in _top[_i, _v].tolist()[:64]]))
-                    _sl = seq_lens.reshape(-1).tolist()[:_rows] \
-                        if hasattr(seq_lens, "tolist") else []
-                    with open(_TOPKSET_PATH, "a") as _f:
-                        _f.write(_json.dumps(dict(
-                            rows=_data, seq_lens=_sl,
-                            topk=int(topk_tokens),
-                            backend=backend,
-                            layer=getattr(self, "layer_name", "?"))) + "\n")
-                except Exception as _e:
-                    logger.warning("DSV41 TOPKSET probe failed: %s", _e)
         elif backend == "persistent":
             (topk_workspace,) = current_workspace_manager().get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
@@ -529,30 +418,6 @@ class SparseIndexerTopk(torch.nn.Module):
             )
             if _DSV41_CANONICAL_TOPK:
                 _sort_topk_rows(topk_indices)
-            if _dsv41_topkset_flag() and \
-                    _TOPKSET_STATE["n"] < _TOPKSET_BUDGET:
-                _TOPKSET_STATE["n"] += 1
-                try:
-                    import json as _json
-                    _rows = min(int(logits.shape[0]), 8)
-                    _data = []
-                    _top = logits.detach().float()
-                    for _i in range(_rows):
-                        _row = topk_indices[_i].detach().to(torch.int64).tolist()
-                        _v = [int(x) for x in _row if x >= 0]
-                        _data.append(dict(
-                            sel=_v,
-                            scores=[round(x, 3)
-                                    for x in _top[_i, _v].tolist()[:64]]))
-                    _sl = seq_lens.reshape(-1).tolist()[:_rows] \
-                        if hasattr(seq_lens, "tolist") else []
-                    with open(_TOPKSET_PATH, "a") as _f:
-                        _f.write(_json.dumps(dict(
-                            rows=_data, seq_lens=_sl,
-                            topk=int(topk_tokens),
-                            backend=backend)) + "\n")
-                except Exception as _e:
-                    logger.warning("DSV41 TOPKSET probe failed: %s", _e)
         elif backend == "flashinfer":
             # Deferred: importing flashinfer initializes CUDA at import time.
             from flashinfer.topk import top_k_ragged_transform
@@ -598,25 +463,6 @@ class SparseIndexerTopk(torch.nn.Module):
             assert backend == "per_row", f"unknown topk backend: {backend}"
             self._per_row(logits, seq_lens, next_n, topk_indices, topk_tokens)
 
-        if _DSV41_LOG_DECODE_SELECTION and _decsel_count < 24:
-            # Debug: the decode selection's SET (not its order). The
-            # compiled top-k breaks the exactly-tied candidates by the
-            # thread arrival order, so the SET can differ between two
-            # runs - and the attention would then read a different
-            # context. The set hash is order-independent.
-            #
-            # The probe is bounded: one line per decode step floods the
-            # worker's log pipe, and the startup's shared-memory
-            # broadcast then times out (the engine never comes up).
-            _decsel_count += 1
-            _sel = topk_indices.detach().to(torch.int64)
-            _valid = _sel[_sel >= 0]
-            logger.warning(
-                "DSV41 DECSEL n=%d sum=%d hash=%d",
-                int(_valid.numel()),
-                int(_valid.sum()),
-                hash(tuple(sorted(_valid.tolist()))),
-            )
 
     @staticmethod
     def _per_row(

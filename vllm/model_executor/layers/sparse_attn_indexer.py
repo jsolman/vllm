@@ -22,7 +22,6 @@ from vllm.distributed import (
     get_tp_group,
 )
 from vllm.forward_context import get_forward_context
-from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     apply_candidate_mask as _apply_candidate_mask,
@@ -66,7 +65,6 @@ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 from vllm.v1.worker.workspace import current_workspace_manager
 
-logger = init_logger(__name__)
 
 # CANONICALISE THE TOP-K's OUTPUT ORDER.
 #
@@ -111,24 +109,6 @@ def _sort_topk_rows(out: torch.Tensor) -> None:
 
 
 
-def _dsv41_flag(name: str) -> bool:
-    """Read a debug flag from the env OR from /tmp/dsv41-flags.
-
-    A flag must be exported in BOTH blocks of the launcher (the top-level
-    one, which the head's API server inherits, and the remote ssh one,
-    which the ranks 1-3 inherit). The flags file is the belt-and-braces
-    channel: it works even when a flag is missing from one of them.
-    """
-    if os.environ.get(name, "0") == "1":
-        return True
-    try:
-        with open("/tmp/dsv41-flags") as f:
-            for line in f:
-                if line.strip() == name:
-                    return True
-    except OSError:
-        pass
-    return False
 
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
@@ -849,10 +829,6 @@ def sparse_attn_indexer(
                             chunk_candidates,
                             candidate_block_size,
                         )
-                logger.warning(
-                    "DSV41 PREFILL-TOPK-SITE reached logits=%s",
-                    tuple(logits.shape),
-                )
                 ops.top_k_per_row_prefill(
                     logits,
                     torch.zeros_like(row_ends) if row_starts is None else row_starts,
@@ -865,63 +841,6 @@ def sparse_attn_indexer(
                 )
                 if _DSV41_CANONICAL_TOPK:
                     _sort_topk_rows(topk_indices)
-                if _dsv41_flag("VLLM_DSV41_LOG_TOPK"):
-                    # Debug: the indexer's SCORES and the SELECTION they
-                    # produce (the prefill path). The selection is the
-                    # discrete choice the attention consumes, so if it
-                    # differs between two runs of the SAME request, the
-                    # scores differ.
-                    # NOTE: the probe must NOT copy or sort the whole
-                    # logits: they are (4096, 32768) fp32 = 537 MB, and
-                    # torch.sort / the isfinite() mask each materialise
-                    # another gigabyte - per layer, per rank. That is what
-                    # OOM-killed the worker during the 89K prefill.
-                    # Only the FIRST ROW is examined, and it is examined
-                    # with a partial sort over a bounded slice.
-                    _row0 = logits[0].detach().float()
-                    _fin0 = _row0[torch.isfinite(_row0)]
-                    if _fin0.numel():
-                        # the top-k selects the top topk_tokens scores; the
-                        # tie that matters is at the CUTOFF (the 1024th
-                        # score), not at the maximum.
-                        _k = min(topk_tokens, _fin0.numel())
-                        # torch.kthvalue is O(n) and does not materialise
-                        # a sorted copy of the whole row.
-                        _cut = torch.kthvalue(
-                            _fin0, _fin0.numel() - _k + 1
-                        ).values
-                        _ties = int((_fin0 == _cut).sum())
-                        _above = int((_fin0 > _cut).sum())
-                        logger.warning(
-                            "DSV41 ITIE row0 n=%d k=%d cutoff=%.10g "
-                            "above=%d ties_at_cutoff=%d",
-                            _fin0.numel(), _k, float(_cut), _above, _ties,
-                        )
-                    # hash the FINITE entries only: the mask makes the rest
-                    # -inf. If two runs of the same chunk produce the same
-                    # hash but different selections, the selection is the
-                    # race (the scores are identical).
-                    # hash a BOUNDED slice of the first row (not the
-                    # whole tensor: the isfinite() mask would copy it all)
-                    _sl = logits[0].detach().float()[:1024]
-                    logger.warning(
-                        "DSV41 ILOGITS shape=%s hash=%d",
-                        tuple(logits.shape),
-                        hash(tuple(_sl.tolist())),
-                    )
-                    _tk = topk_indices.detach().to(torch.int64)
-                    for _r in range(min(_tk.shape[0], 4)):
-                        _v = _tk[_r].tolist()
-                        # a hash of the WHOLE selection: if two runs of the
-                        # same request pick the same set, the hash matches.
-                        _hash = hash(tuple(int(x) for x in _v))
-                        logger.warning(
-                            "DSV41 TOPK row=%d sum=%d hash=%d first=%s",
-                            _r, sum(int(x) for x in _v if x >= 0), _hash,
-                            _v[:8],
-                        )
-
-            if deinterleave_idx is None:
                 # Under the PCP path the top-k already ran over the whole
                 # context.
                 _merge_dcp_topk_global(
@@ -1061,32 +980,6 @@ def sparse_attn_indexer(
             # DCP need fp32. SM100 decode is varlen: one context length per row.
             if topk_backend != "deep_select" or dcp_world_size != 1:
                 logits = as_fp32_logits(logits, seq_lens.view(-1))
-                if _dsv41_flag("VLLM_DSV41_LOG_TOPK"):
-                    # Debug: the RAW indexer logits, BEFORE the candidate
-                    # mask and the top-k. The ILOGITS probe below hashes
-                    # the logits AFTER the mask, so it cannot tell a
-                    # difference in the paged-MQA kernel from a
-                    # difference in the mask. This one isolates the
-                    # kernel.
-                    _rl = logits.detach().float()
-                    # The row is mostly -inf (the invalid columns are
-                    # masked), so a hash of the first 16 elements
-                    # says nothing. Report the FINITE values instead:
-                    # their count, their sum and their positions.
-                    _fin = torch.isfinite(_rl[0])
-                    _nfin = int(_fin.sum())
-                    _fv = _rl[0][_fin]
-                    logger.warning(
-                        "DSV41 RAWLOGITS shape=%s nfinite=%d fsum=%.10g "
-                        "fmax=%.10g fmin=%.10g first=%s",
-                        tuple(_rl.shape),
-                        _nfin,
-                        float(_fv.sum()) if _nfin else 0.0,
-                        float(_fv.max()) if _nfin else 0.0,
-                        float(_fv.min()) if _nfin else 0.0,
-                        _rl[0][_fin][:8].tolist(),
-                    )
-        num_rows = logits.shape[0]
         if candidate_blocks is not None:
             # Two-level selection (v4.1) on the decode logits; columns are
             # request-local compressed positions. seq_lens is (B, next_n)
@@ -1127,35 +1020,14 @@ def sparse_attn_indexer(
             topk_tokens,
             attn_metadata_narrowed.max_seq_len,
         )
-        if _dsv41_flag("VLLM_DSV41_LOG_TOPK"):
-            # Debug: the indexer's SCORES and the SELECTION they produce.
-            # The selection is the discrete choice the attention consumes, so
-            # if it differs between two runs of the SAME request, the
-            # scores differ. The scores' checksum localises it further.
-            _lg = logits.detach().float()
-            logger.warning(
-                "DSV41 ILOGITS shape=%s sum=%.10g absmax=%.10g",
-                tuple(_lg.shape),
-                float(_lg.sum()),
-                float(_lg.abs().amax()),
-            )
-            _tk = topk_indices.detach().to(torch.int64)
-            for _r in range(min(_tk.shape[0], 4)):
-                _v = _tk[_r].tolist()
-                logger.warning(
-                    "DSV41 TOPK row=%d sum=%d first=%s",
-                    _r, sum(int(x) for x in _v if x >= 0), _v[:12],
-                )
-
-        if decode_metadata.global_seq_lens is not None:
-            _merge_dcp_topk_global(
-                logits,
-                topk_indices,
-                topk_tokens,
-                dcp_rank,
-                dcp_world_size,
-                cp_kv_cache_interleave_size,
-            )
+        _merge_dcp_topk_global(
+            logits,
+            topk_indices,
+            topk_tokens,
+            dcp_rank,
+            dcp_world_size,
+            cp_kv_cache_interleave_size,
+        )
 
         if needs_padded_path:
             # if padded, we need to unpack

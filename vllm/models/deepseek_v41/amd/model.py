@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -81,8 +80,6 @@ if typing.TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Debug: log a per-layer / per-part checksum of the hidden states.
-_DSV41_LOG_LAYER_SUMS = os.environ.get("VLLM_DSV41_LOG_LAYER_SUMS", "0") == "1"
 
 
 class DeepseekV4MoE(DeepseekV4MoEBase):
@@ -416,12 +413,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             x = sp_all_gather(x)[: positions.shape[0]]
 
         x = self.attn(positions, x, None)
-        if _DSV41_LOG_LAYER_SUMS and x is not None and x.numel():
-            logger.info(
-                "DSV41 PART attn sum=%.10g absmax=%.10g",
-                float(x.detach().float().sum()),
-                float(x.detach().float().abs().max()),
-            )
         if self.use_sequence_parallel:
             x = sp_reduce_scatter(x)
         elif self.mono is not None and self.mono.ffn_only:
@@ -450,12 +441,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         if not self.fuse_seam_norm:
             x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
-        if _DSV41_LOG_LAYER_SUMS and x is not None and x.numel():
-            logger.info(
-                "DSV41 PART ffn sum=%.10g absmax=%.10g",
-                float(x.detach().float().sum()),
-                float(x.detach().float().abs().max()),
-            )
         return x, residual, post_mix, res_mix, ffn_pre
 
     def write_kv(

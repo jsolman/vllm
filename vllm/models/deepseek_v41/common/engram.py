@@ -106,7 +106,6 @@ def _dsv41_flag(name: str) -> bool:
 
 
 _DSV41_NO_ENGRAM = _dsv41_flag("VLLM_DSV41_NO_ENGRAM")
-_DSV41_LOG_ENGRAM_HASH = _dsv41_flag("VLLM_DSV41_LOG_ENGRAM_HASH")
 
 # Per-rank token slot from which the Engram DP exchange switches from peer
 # reads to all-to-all.
@@ -1938,23 +1937,6 @@ class Engram(nn.Module):
         consume them; DP-sharded tables take the group's gathered hash IDs."""
         rows = self.staged_rows[: hash_ids.shape[0]]
         assert rows.shape[0] == hash_ids.shape[0], "engram staging buffer too small"
-        if _DSV41_LOG_ENGRAM_HASH and hash_ids.numel():
-            # Debug: the HASH ids are the engram's input. If they differ
-            # between runs, the race is in the hash's source lookup (the
-            # lookback window / the hash_cache slots); if they are the same
-            # but the STAGED rows differ, the race is in the disk-table
-            # staging.
-            _h = hash_ids.detach().to(torch.int64)
-            logger.warning(
-                "DSV41 EHASH n=%d sum=%d rows=%s",
-                _h.shape[0],
-                int(_h.sum().item()),
-                hash(
-                    tuple(_h[0].flatten().tolist()),
-                )
-                if _h.shape[0]
-                else 0,
-            )
         if self.embed_tokens.disk_table is not None:
             self._lookup_from_disk(hash_ids, rows)
         elif self._prefetch_stream is None:
@@ -2000,18 +1982,6 @@ class Engram(nn.Module):
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
         if self._prefetch_done is not None:
             self._finish_prefetch(self._prefetch_done)
-        if _DSV41_LOG_ENGRAM_HASH and num_tokens:
-            # Debug: the STAGED rows are the engram's output. The hash ids
-            # are deterministic, so if these differ, the race is in the
-            # disk-table staging (the compact table) or in the lookup
-            # kernel.
-            _r = self.staged_rows[:num_tokens].detach().float()
-            logger.warning(
-                "DSV41 EROWS n=%d sum=%.10g absmax=%.10g",
-                num_tokens,
-                float(_r.sum().item()),
-                float(_r.abs().amax().item()),
-            )
         if self.embed_tokens.dp_size > 1:
             slot = engram_gathered_num_tokens()
             staged = self.staged_rows[: slot * self.embed_tokens.dp_size]

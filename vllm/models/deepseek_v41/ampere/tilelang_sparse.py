@@ -46,7 +46,6 @@ unavailable so the caller can fall back.
 from __future__ import annotations
 
 import functools
-import os
 from typing import Any
 
 import torch
@@ -83,30 +82,16 @@ def _reference_kernel_module():
     """Import the checkpoint's reference kernel module.
 
     The reference ships in the model directory as ``inference/kernel.py``.
-    We load it by path so we do not need the model on disk at import time
-    - the path is resolved when the backend is first used.
+    Without a configured model directory there is nothing to load, so the
+    TileLang backend reports itself unavailable.
     """
-    import importlib.util
-
-    model_path = os.environ.get("VLLM_DSV41_REFERENCE_MODEL", "")
-    if not model_path:
-        logger.warning(
-            "VLLM_DSV41_REFERENCE_MODEL is not set: the DSv4.1 TileLang "
-            "backend cannot find the reference kernel module.")
-        return None
-    kernel_py = os.path.join(model_path, "inference", "kernel.py")
-    if not os.path.exists(kernel_py):
-        logger.warning("reference kernel module not found at %s", kernel_py)
-        return None
-    spec = importlib.util.spec_from_file_location("dsv41_reference_kernel",
-                                                  kernel_py)
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    logger.warning(
+        "the DSv4.1 TileLang reference kernel module needs the model's "
+        "inference/kernel.py on disk; no model directory is configured.")
+    return None
 
 
-@functools.lru_cache(maxsize=8)
+
 def _compiled_sparse_attn(num_heads: int, head_dim: int, scale: float):
     """Compile (and cache) the reference sparse_attn kernel."""
     mod = _reference_kernel_module()
@@ -305,18 +290,6 @@ def tilelang_sparse_attn_decode(
     # takes the output buffer as an explicit argument (its own wrapper
     # allocates it with torch.empty_like(q)).
     out = torch.empty_like(q_p).unsqueeze(0)
-    if os.environ.get("VLLM_DSV41_TL_DEBUG", "0") == "1":
-        logger.warning(
-            "TL MODULE: q %s dense_rows %s topk_idxs %s "
-            "sink_sum %s q_rope %s "
-            "rows_absmax %s rows_nonzero %s",
-            tuple(q_p.shape), tuple(dense_rows.shape),
-            topk_idxs[0].tolist()[:8],
-            float(sink.sum()) if sink is not None else None,
-            q_p[0, 0, -64:].float().tolist()[:4],
-            dense_rows.abs().amax(dim=1).tolist()[:8],
-            int((dense_rows != 0).any(dim=1).sum()),
-        )
     kernel(q_p.unsqueeze(0), dense_rows.unsqueeze(0), out,
            sink if sink is not None else torch.zeros(num_heads_padded,
                                                      device=q.device,

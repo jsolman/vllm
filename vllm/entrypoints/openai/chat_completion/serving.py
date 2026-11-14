@@ -120,112 +120,6 @@ def _make_completion_tokens_details(
     return CompletionTokenUsageInfo(reasoning_tokens=reasoning_tokens)
 
 
-def _dsv41_dump_request(request) -> None:
-    """Dump a chat request's messages to /tmp for offline analysis.
-
-    The request logger only records the SAMPLING PARAMS at INFO (the
-    prompt needs DEBUG, which floods the log with everything). A client
-    request is the ground truth for a client-side symptom, so dump the
-    messages verbatim - one file per request, in the arrival order.
-
-    Controlled by VLLM_DSV41_DUMP_REQUESTS=1 (or the flag file), and
-    bounded: only the fields that matter for reproducing a divergence.
-    """
-    import json
-    import os
-    import time
-
-    def _on() -> bool:
-        if os.environ.get("VLLM_DSV41_DUMP_REQUESTS", "0") == "1":
-            return True
-        try:
-            with open("/tmp/dsv41-flags") as f:
-                return any(line.strip() == "VLLM_DSV41_DUMP_REQUESTS"
-                           for line in f)
-        except OSError:
-            return False
-
-    if not _on():
-        return
-    try:
-        msgs = []
-        for m in (request.messages or []):
-            # the messages may be dicts (the parsed JSON) or objects
-            if isinstance(m, dict):
-                role = m.get("role")
-                content = m.get("content")
-                tool_calls = m.get("tool_calls")
-                tool_call_id = m.get("tool_call_id")
-            else:
-                role = getattr(m, "role", None)
-                content = getattr(m, "content", None)
-                tool_calls = getattr(m, "tool_calls", None)
-                tool_call_id = getattr(m, "tool_call_id", None)
-            entry = {"role": role}
-            if isinstance(content, str):
-                entry["content"] = content
-            elif content is not None:
-                # the multimodal parts. NOTE: a dict has NO model_dump,
-                # so the old code fell through to str(p) and produced a
-                # PYTHON DICT REPR as a string - which made a perfectly
-                # valid client request look malformed. Keep the dicts
-                # as dicts.
-                parts = []
-                for p in content:
-                    if isinstance(p, dict):
-                        parts.append(p)
-                    else:
-                        d = getattr(p, "model_dump", None)
-                        parts.append(d() if d else str(p))
-                entry["content_parts"] = parts
-            if tool_calls:
-                tcs = []
-                for t in tool_calls:
-                    if isinstance(t, dict):
-                        fn = t.get("function") or {}
-                        tcs.append({"id": t.get("id"), "type": t.get("type"),
-                                    "function": {"name": fn.get("name"),
-                                                 "arguments": fn.get("arguments")}})
-                    else:
-                        fn = getattr(t, "function", None)
-                        tcs.append({"id": getattr(t, "id", None),
-                                    "type": getattr(t, "type", None),
-                                    "function": {"name": getattr(fn, "name", None),
-                                                 "arguments": getattr(fn, "arguments", None)}}
-                                    if fn is not None else str(t))
-                entry["tool_calls"] = tcs
-            if tool_call_id:
-                entry["tool_call_id"] = tool_call_id
-            msgs.append(entry)
-        rec = {
-            "t": time.time(),
-            "model": getattr(request, "model", None),
-            "temperature": getattr(request, "temperature", None),
-            "top_p": getattr(request, "top_p", None),
-            "max_tokens": getattr(request, "max_tokens", None),
-            "seed": getattr(request, "seed", None),
-            "chat_template_kwargs": getattr(request, "chat_template_kwargs", None),
-            "tools": [t.model_dump() if hasattr(t, "model_dump") else str(t)
-                      for t in (request.tools or [])],
-            "messages": msgs,
-        }
-        # write to BOTH the tmp path and the durable notes path, so the
-        # capture survives a /tmp wipe and a context compaction.
-        line = json.dumps(rec, ensure_ascii=False, default=str) + "\n"
-        for _path in ("/tmp/dsv41-client-requests.jsonl",
-                      "/home/jslave2/notes/dsv41-requests/client-requests.jsonl"):
-            try:
-                with open(_path, "a") as f:
-                    f.write(line)
-            except OSError:
-                pass
-    except Exception as e:
-        try:
-            print(f"DSV41 DUMP-REQ err {e}", flush=True)
-        except Exception:
-            pass
-
-
 class OpenAIServingChat(GenerateBaseServing):
     def __init__(
         self,
@@ -443,7 +337,6 @@ class OpenAIServingChat(GenerateBaseServing):
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
         # Streaming response
         self._maybe_log_request(request)
-        _dsv41_dump_request(request)
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
         chat_template_kwargs = self._effective_chat_template_kwargs(request)
