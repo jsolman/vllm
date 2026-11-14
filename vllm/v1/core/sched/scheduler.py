@@ -887,7 +887,11 @@ class Scheduler(SchedulerInterface):
                     and getattr(request, "num_output_placeholders", 0) > 0
                     and request.is_prefill_chunk is False
                 ):
-                    _gl53_lookahead = request.num_output_placeholders
+                    # Empirically the async pipeline's KV write frontier is
+                    # TWO tokens past the allocation frontier at a block
+                    # boundary (the sampled token of exec(k-1) plus the
+                    # placeholder accounting), so reserve both.
+                    _gl53_lookahead = request.num_output_placeholders + 1
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
