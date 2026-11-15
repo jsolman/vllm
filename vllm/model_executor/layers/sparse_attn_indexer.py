@@ -1054,14 +1054,16 @@ def sparse_attn_indexer(
             # int sums + first values + one float checksum (batch=1
             # decode, ~one line per step).
             _lg = logits.detach().float()
+            _fin = _lg[torch.isfinite(_lg)]
             _tk = topk_indices.detach().to(torch.int64)
             _vals = _tk[0].tolist()
             _valid = [int(x) for x in _vals if x >= 0]
             logger.warning(
-                "DSV41 DECODE-TOPK logits sum=%.6g absmax=%.6g "
+                "DSV41 DECODE-TOPK logits sum=%.6g absmax=%.6g nfin=%d "
                 "sel_sum=%d sel_max=%d sel_min=%d n_valid=%d first=%s",
-                float(_lg.sum()),
-                float(_lg.abs().amax()),
+                float(_fin.sum()) if _fin.numel() else float("nan"),
+                float(_lg[_lg.isfinite()].abs().amax()) if _fin.numel() else float("nan"),
+                int(_fin.numel()),
                 sum(_valid),
                 max(_valid) if _valid else -1,
                 min(_valid) if _valid else -1,
