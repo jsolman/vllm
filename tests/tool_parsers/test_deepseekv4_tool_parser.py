@@ -88,7 +88,13 @@ def build_tool_call(func_name: str, params: dict[str, str]) -> str:
     return f'{TC_START}\n{INV_START}{func_name}">\n{param_strs}{INV_END}\n{TC_END}'
 
 
-def stream(parser: DeepSeekV4EngineToolParser, full_text: str, chunk_size: int = 7):
+def stream(
+    parser: DeepSeekV4EngineToolParser,
+    full_text: str,
+    chunk_size: int = 7,
+    request=None,
+):
+    request = request if request is not None else make_request()
     deltas = []
     previous_text = ""
     for start in range(0, len(full_text), chunk_size):
@@ -101,7 +107,7 @@ def stream(parser: DeepSeekV4EngineToolParser, full_text: str, chunk_size: int =
             previous_token_ids=[],
             current_token_ids=[],
             delta_token_ids=[1],
-            request=make_request(),
+            request=request,
         )
         previous_text = current_text
         if delta is not None:
@@ -148,9 +154,23 @@ def test_extract_tool_calls():
     }
 
 
+def _search_tool() -> ChatCompletionToolsParam:
+    return ChatCompletionToolsParam(
+        type="function",
+        function={
+            "name": "search",
+            "description": "Search",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            },
+        },
+    )
+
+
 def test_function_calls_wrapper_is_not_recognized():
-    # The V3.2 wrapper is not a V4 terminal, so it passes through as content,
-    # but the invoke inside it is still parsed (tool calls anchor on the invoke).
+    # The V3.2 wrapper is foreign to V4: the whole block, invoke included,
+    # passes through as plain content instead of being parsed as a call.
     parser = make_parser()
     model_output = build_tool_call("search", {"query": "vllm"}).replace(
         "tool_calls", "function_calls"
@@ -158,28 +178,36 @@ def test_function_calls_wrapper_is_not_recognized():
 
     result = parser.extract_tool_calls(model_output, make_request())
 
-    assert result.tools_called
-    assert result.tool_calls[0].function.name == "search"
-    assert result.content == "<｜DSML｜function_calls>\n"
+    assert not result.tools_called
+    assert result.tool_calls == []
+    assert result.content == model_output
 
 
 def test_missing_tool_calls_wrapper_is_recovered():
     # Regression for #48931: at long context the model omits the
     # <｜DSML｜tool_calls> START token but still emits a complete invoke.
-    parser = make_parser()
+    # Recovery is only attempted for names the request declared, so the
+    # request must carry the tool.
+    tools = [_search_tool()]
+    parser = make_parser(tools=tools)
     model_output = build_tool_call("search", {"query": "vllm"}).replace(
         TC_START + "\n", ""
     )
     assert TC_START not in model_output
 
-    result = parser.extract_tool_calls(model_output, make_request())
+    result = parser.extract_tool_calls(model_output, make_request(tools=tools))
 
     assert result.tools_called
     assert result.tool_calls[0].function.name == "search"
     assert json.loads(result.tool_calls[0].function.arguments) == {"query": "vllm"}
     assert result.content is None
 
-    deltas = stream(make_parser(), model_output, chunk_size=3)
+    deltas = stream(
+        make_parser(tools=tools),
+        model_output,
+        chunk_size=3,
+        request=make_request(tools=tools),
+    )
     names = [
         tc.function.name
         for d in deltas
@@ -190,6 +218,20 @@ def test_missing_tool_calls_wrapper_is_recovered():
     assert names == ["search"]
     assert json.loads(reconstruct_args(deltas)) == {"query": "vllm"}
     assert not any(d.content and "DSML" in d.content for d in deltas)
+
+
+def test_missing_tool_calls_wrapper_undeclared_name_stays_content():
+    # Without a declared tool of that name, an orphan invoke is not
+    # recovered: it would otherwise let free text impersonate a call.
+    parser = make_parser()
+    model_output = build_tool_call("search", {"query": "vllm"}).replace(
+        TC_START + "\n", ""
+    )
+
+    result = parser.extract_tool_calls(model_output, make_request())
+
+    assert not result.tools_called
+    assert result.content == model_output
 
 
 def test_streaming_extracts_complete_invokes():
@@ -253,6 +295,198 @@ def test_streaming_emits_incremental_argument_chunks():
         "notes": "靠窗座位",
     }
 
+
+def _with_strict(
+    tools: list[ChatCompletionToolsParam],
+) -> list[ChatCompletionToolsParam]:
+    return [
+        ChatCompletionToolsParam(
+            type=t.type,
+            function=FunctionDefinition(
+                name=t.function.name,
+                description=t.function.description,
+                parameters=t.function.parameters,
+                strict=True,
+            ),
+        )
+        for t in tools
+    ]
+
+
+def test_get_vllm_registry_structural_tag_returns_structural_tag(
+    sample_tools: list[ChatCompletionToolsParam],
+) -> None:
+    parser = make_parser()
+    strict_tools = _with_strict(sample_tools)
+    req = ChatCompletionRequest(
+        messages=[],
+        model="m",
+        tools=strict_tools,
+        tool_choice="auto",
+    )
+    tag = parser.get_structural_tag(req)
+    assert isinstance(tag, StructuralTag)
+
+    req = ChatCompletionRequest(
+        messages=[],
+        model="m",
+        tools=sample_tools,
+        tool_choice="required",
+    )
+    tag = parser.get_structural_tag(req)
+    assert isinstance(tag, StructuralTag)
+
+    if sample_tools:
+        tool = sample_tools[0]
+        req = ChatCompletionRequest(
+            messages=[],
+            model="m",
+            tools=sample_tools,
+        )
+        req.tool_choice = ChatCompletionNamedToolChoiceParam(
+            function=ChatCompletionNamedFunction(name=tool.function.name)
+        )
+        tag = parser.get_structural_tag(req)
+        assert isinstance(tag, StructuralTag)
+
+
+def test_extract_tool_calls_arguments_wrapper():
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.get_vocab.return_value = {}
+
+    tool = ChatCompletionToolsParam(
+        type="function",
+        function={
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+            },
+        },
+    )
+
+    parser = DeepSeekV4EngineToolParser(mock_tokenizer, tools=[tool])
+    request = MagicMock()
+    request.tools = [tool]
+
+    model_output = (
+        f"{TC_START}"
+        f'{INV_START}get_weather">'
+        f'{PARAM_START}arguments" string="false">{{"location":"Beijing"}}{PARAM_END}'
+        f"{INV_END}"
+        f"{TC_END}"
+    )
+
+    result = parser.extract_tool_calls(model_output, request)
+    assert result.tools_called
+    args = json.loads(result.tool_calls[0].function.arguments)
+    assert args == {"location": "Beijing"}
+
+
+_ANGLE_BRACKET_TOOL = ChatCompletionToolsParam(
+    function=FunctionDefinition(
+        name="run_command",
+        parameters={
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+            },
+        },
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [[_ANGLE_BRACKET_TOOL], None],
+    ids=["with_tools", "without_tools"],
+)
+def test_no_dsml_closing_tag_leak_in_streamed_args(tools):
+    """Streaming must not leak </｜DSML｜parameter> into argument values.
+
+    When a parameter value contains '>' (e.g. shell redirects like
+    '2>&1'), certain chunk boundaries cause the incremental lexer to
+    emit the closing delimiter text as part of the content token.  The
+    partial regex then captures it as part of the value, violating the
+    prefix invariant and corrupting the streamed JSON.
+    """
+    full_text = build_tool_call("run_command", {"command": "git --version 2>&1"})
+    expected = {"command": "git --version 2>&1"}
+
+    for chunk_size in range(1, len(full_text) + 1):
+        parser = make_parser(tools=tools)
+        deltas = stream(parser, full_text, chunk_size=chunk_size)
+        args_str = reconstruct_args(deltas)
+        assert args_str, f"No args emitted at chunk_size={chunk_size}"
+        assert "DSML" not in args_str, (
+            f"DSML marker leaked into args at chunk_size={chunk_size}: {args_str!r}"
+        )
+        parsed = json.loads(args_str)
+        assert parsed == expected, (
+            f"Args mismatch at chunk_size={chunk_size}: "
+            f"got {parsed!r}, expected {expected!r}"
+        )
+
+
+def test_non_streaming_extract_with_angle_brackets():
+    """Non-streaming extraction must correctly handle '>' in values."""
+    parser = make_parser()
+    full_text = build_tool_call("run_command", {"command": "git --version 2>&1"})
+    result = parser.extract_tool_calls(full_text, make_request())
+
+    assert result.tools_called
+    assert len(result.tool_calls) == 1
+    args = json.loads(result.tool_calls[0].function.arguments)
+    assert args == {"command": "git --version 2>&1"}
+    assert "DSML" not in result.tool_calls[0].function.arguments
+
+
+def test_composed_schema_converts_object_and_array_params():
+    tool = ChatCompletionToolsParam(
+        type="function",
+        function={
+            "name": "set_timer",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "wait": {
+                        "anyOf": [
+                            {"type": "object"},
+                            {"type": "null"},
+                        ],
+                    },
+                    "patches": {
+                        "allOf": [
+                            {"type": "array", "items": {"type": "object"}},
+                        ],
+                    },
+                },
+            },
+        },
+    )
+    parser = make_parser(tools=[tool])
+    request = make_request(tools=[tool])
+    model_output = (
+        f"{TC_START}\n"
+        f'{INV_START}set_timer">\n'
+        f'{PARAM_START}wait" string="false">'
+        f'{{"type":"for","minutes":2880}}'
+        f"{PARAM_END}\n"
+        f'{PARAM_START}patches" string="false">'
+        f'[{{"op":"replace","path":"/schedule","value":"quiet"}}]'
+        f"{PARAM_END}\n"
+        f"{INV_END}\n"
+        f"{TC_END}"
+    )
+
+    result = parser.extract_tool_calls(model_output, request)
+
+    assert result.tools_called
+    args = json.loads(result.tool_calls[0].function.arguments)
+    assert args == {
+        "wait": {"type": "for", "minutes": 2880},
+        "patches": [{"op": "replace", "path": "/schedule", "value": "quiet"}],
+    }
 
 def _stream_param_body(properties: dict, param_open: str, body: str) -> list[str]:
     """Stream one parameter body in 32-char chunks, one argument list per chunk."""
