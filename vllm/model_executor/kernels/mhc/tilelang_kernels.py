@@ -879,8 +879,18 @@ def mhc_post_tilelang(
             # so leaving rows 1..hc-1 unwritten fed UNINITIALIZED memory
             # into the gate - which is what made the whole forward pass
             # nondeterministic at the engram layers.
-            for i_hco, i1_h in T.Parallel(hc, h_blk):
-                x[i_n, i_hco, i0_h * h_blk + i1_h] = x_local[i_hco, i1_h]
+            # LOOP-DISCRIMINATOR FLAG (VLLM_DSV41_POST_ROW0=1): the
+            # backport wrote only row 0, leaving rows 1..hc-1 stale at
+            # the engram gate input - and the backport NEVER loops.
+            # Setting this flag reproduces the backport's detuned gate
+            # input to test whether the echo attractor collapses
+            # (prediction: yes). Default off: correct full-row write.
+            import os as _os
+            if _os.environ.get("VLLM_DSV41_POST_ROW0", "0") == "1":
+                T.copy(x_local, x[i_n, 0, i0_h * h_blk])
+            else:
+                for i_hco, i1_h in T.Parallel(hc, h_blk):
+                    x[i_n, i_hco, i0_h * h_blk + i1_h] = x_local[i_hco, i1_h]
         if ENABLE_PDL:
             T.pdl_trigger()
 
