@@ -54,3 +54,22 @@ class DeepseekV41AmpereMLAAttention(
     backend_cls = DeepseekV41AmpereMLASparseBackend
     swa_backend_cls = DeepseekV41AmpereSparseSWABackend
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # The ROCm layer routes wo_a through the ordinary MXFP8 linear
+        # kernel (is_bmm=False) because its bf16 einsum dequantizes the
+        # raw fp8 weight itself. On CUDA that ordinary list resolves to
+        # Marlin/FlashInfer-CUTLASS, which repack the weight into a
+        # packed layout that the grouped form cannot be reshaped back
+        # into. Keep the grouped-BMM kernel list instead: it resolves to
+        # the emulation kernel, which dequantizes wo_a to a plain bf16
+        # [g*r, d] weight at load time; _get_cached_wo_a_bf16 then only
+        # views it (no second dequant).
+        #
+        # This must be set AFTER super().__init__(): the ROCm parent's
+        # __init__ sets is_bmm=False, and the base attention class sets
+        # it True before that - so without this override the final
+        # value on SM8x/SM110 is False and wo_a runs on a different
+        # MXFP8 kernel than the rest of the CUDA path expects.
+        self.wo_a.is_bmm = True
+
