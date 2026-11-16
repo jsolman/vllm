@@ -657,6 +657,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_REASONING_MAX_TEMPERATURE": lambda: os.getenv(
         "VLLM_REASONING_MAX_TEMPERATURE", ""
     ),
+    # Force the sparse decode's split count (the ROCm-family sparse MLA
+    # kernel reads it directly from the environment).
+    "VLLM_SPARSE_DECODE_NUM_SPLITS": lambda: os.getenv(
+        "VLLM_SPARSE_DECODE_NUM_SPLITS", ""
+    ),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]
