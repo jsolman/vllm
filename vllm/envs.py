@@ -633,13 +633,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_DSV41_USE_TILELANG_SPARSE", ""
     ),
     "VLLM_DSV41_NO_ENGRAM": lambda: bool(int(os.getenv("VLLM_DSV41_NO_ENGRAM", "0"))),
-    # Diagnostics: log the decode indexer's top-k selection, and the raw
-    # sampled token ids per decode step (pre-parser, so the parser's
-    # mask window can be read offline).
-    "VLLM_DSV41_LOG_TOPK": lambda: bool(int(os.getenv("VLLM_DSV41_LOG_TOPK", "0"))),
-    "VLLM_DSV41_LOG_RAWTOKENS": lambda: os.getenv(
-        "VLLM_DSV41_LOG_RAWTOKENS", "0"
-    ).strip().lower() in ("1", "true"),
     # The mHC (multi-head-chain) block-split knobs, read by the DSv4.1
     # MHC kernels; empty means "unset".
     "VLLM_MHC_TILE_N": lambda: os.getenv("VLLM_MHC_TILE_N", ""),

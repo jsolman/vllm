@@ -6,22 +6,6 @@ import os
 import torch
 import torch.distributed as dist
 
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
-
-
-def _dsv41_topk_probe() -> bool:
-    """Diagnostic: log the decode indexer's scores + selection (row 0).
-    Read per call so /tmp/dsv41-flags can toggle it live."""
-    if os.environ.get("VLLM_DSV41_LOG_TOPK", "0") == "1":
-        return True
-    try:
-        with open("/tmp/dsv41-flags") as f:
-            return any(line.strip() == "VLLM_DSV41_LOG_TOPK" for line in f)
-    except OSError:
-        return False
-
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
@@ -1045,31 +1029,6 @@ def sparse_attn_indexer(
             dcp_world_size,
             cp_kv_cache_interleave_size,
         )
-        if _dsv41_topk_probe():
-            # Diagnostic: the decode indexer's scores + selection (row
-            # 0 = the decode token). The selection is the discrete
-            # choice attention consumes; if it freezes or cycles while
-            # the content loops, the indexer is in the loop mechanism;
-            # if it varies normally, the loop is content-level. Cheap:
-            # int sums + first values + one float checksum (batch=1
-            # decode, ~one line per step).
-            _lg = logits.detach().float()
-            _fin = _lg[torch.isfinite(_lg)]
-            _tk = topk_indices.detach().to(torch.int64)
-            _vals = _tk[0].tolist()
-            _valid = [int(x) for x in _vals if x >= 0]
-            logger.warning(
-                "DSV41 DECODE-TOPK logits sum=%.6g absmax=%.6g nfin=%d "
-                "sel_sum=%d sel_max=%d sel_min=%d n_valid=%d first=%s",
-                float(_fin.sum()) if _fin.numel() else float("nan"),
-                float(_lg[_lg.isfinite()].abs().amax()) if _fin.numel() else float("nan"),
-                int(_fin.numel()),
-                sum(_valid),
-                max(_valid) if _valid else -1,
-                min(_valid) if _valid else -1,
-                len(_valid),
-                _vals[:16],
-            )
 
         if needs_padded_path:
             # if padded, we need to unpack

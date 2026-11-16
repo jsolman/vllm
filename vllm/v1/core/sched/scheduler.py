@@ -1,26 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-import json
 import os
 import time
-
-
-def _dsv41_rawtoken_probe() -> bool:
-    """SMOKING GUN probe: log raw sampled token ids per decode step
-    (pre-parser) so the parser-masked region can be read offline.
-    Toggle via /tmp/dsv41-flags or env."""
-    if os.environ.get("VLLM_DSV41_LOG_RAWTOKENS", "0") == "1":
-        return True
-    try:
-        with open("/tmp/dsv41-flags") as f:
-            return any(line.strip() == "VLLM_DSV41_LOG_RAWTOKENS" for line in f)
-    except OSError:
-        return False
-
-
-_RAWTOKEN_FILE = os.environ.get(
-    "VLLM_DSV41_RAWTOKENS_PATH", "/tmp/dsv41-rawtokens.jsonl")
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
@@ -2312,19 +2294,6 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
-            if _dsv41_rawtoken_probe():
-                # SMOKING GUN: log raw sampled token ids per step,
-                # pre-parser, so the parser-masked region can be read
-                # offline with the tokenizer. ~1 line per step.
-                try:
-                    with open(_RAWTOKEN_FILE, "a") as _f:
-                        _f.write(json.dumps({
-                            "t": round(time.time(), 3),
-                            "req": req_id,
-                            "toks": [int(x) for x in generated_token_ids],
-                        }) + "\n")
-                except Exception:
-                    pass
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
