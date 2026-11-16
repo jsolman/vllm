@@ -84,7 +84,8 @@ void launch_cooperative_topk_impl(const torch::stable::Tensor& logits,
   params.tie_ws =
       reinterpret_cast<hist4096::Tie*>(workspace.mutable_data_ptr<uint8_t>());
 
-  constexpr uint32_t kTieWsPerRow = ct::kCoarseTieCapacity;
+  constexpr uint32_t kTieWsPerRow =
+      TopK <= hist4096::kBlockSize ? hist4096::kMaxTies : TopK;
   STD_TORCH_CHECK(
       workspace.size(0) >=
           static_cast<int64_t>(num_rows * kTieWsPerRow * sizeof(hist4096::Tie)),

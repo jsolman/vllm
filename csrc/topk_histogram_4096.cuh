@@ -201,11 +201,11 @@ __device__ void tie_handle(const Tie* ties, uint32_t num_ties,
 // Extended tie_handle for TopK > kBlockSize (e.g. TopK=2048).
 // tie_handle assumes 1 tie per thread (max 1024).
 // This version handles 2 ties per thread via kPerThread=2
-template <uint32_t TopK, uint32_t MaxTies = TopK>
+template <uint32_t TopK>
 __device__ void tie_handle_large(const Tie* ties, uint32_t num_ties,
                                  uint32_t num_above, int32_t* output,
                                  void* _smem) {
-  static_assert(MaxTies > kBlockSize);
+  static_assert(TopK > kBlockSize);
   struct TS {
     alignas(128) uint32_t counter;
     alignas(128) MatchBin match;
@@ -217,7 +217,7 @@ __device__ void tie_handle_large(const Tie* ties, uint32_t num_ties,
   const auto li = tx % kWarpSize;
   const auto wi = tx / kWarpSize;
 
-  constexpr uint32_t kPerThread = (MaxTies + kBlockSize - 1) / kBlockSize;
+  constexpr uint32_t kPerThread = (TopK + kBlockSize - 1) / kBlockSize;
   Tie my_ties[kPerThread];
   uint32_t keys[kPerThread];
   bool active[kPerThread];
@@ -327,33 +327,9 @@ struct Histogram4096Smem {
   };
 };
 
-// Defined in topk_histogram_4096_overflow.cuh. Only kFp32Rescan instantiations
-// call it, and their callers include that header.
-template <uint32_t TopK, uint32_t BlockSize, uint32_t VecSize>
-__device__ __noinline__ void exact_topk_rescan_cold(
-    const float* __restrict__ scores, int32_t* __restrict__ output,
-    uint32_t length, void* smem);
-
-// kRegisterValues refines from the values already held in registers and
-// falls back to the FP32 rescan when the coarse bin cannot bound them.
-enum class OverflowRecovery { kFp32Rescan, kRegisterValues };
-
-// Defined in topk_histogram_4096_overflow.cuh, like exact_topk_rescan_cold.
-template <uint32_t TopK, uint32_t HistBits, uint32_t VecsPerThread>
-__device__ __forceinline__ bool exact_topk_refine_registers(
-    const float4 (&vecs)[VecsPerThread], int32_t* __restrict__ output,
-    uint32_t length, uint32_t coarse_bin, uint32_t num_above, void* _smem);
-
-template <uint32_t TopK, uint32_t BlockSize, uint32_t VecSize,
-          uint32_t StartRound, uint32_t FinalCandidateCapacity>
-__device__ void exact_topk_rescan(const float* __restrict__ scores,
-                                  int32_t* __restrict__ output, uint32_t length,
-                                  void* _smem, uint32_t initial_prefix,
-                                  uint32_t initial_remaining);
-
 template <uint32_t TopK, uint32_t HIST_BITS,
           uint32_t VECS_PER_THREAD = kHist4096VecsPerThread,
-          bool UsePredicatedLoads = false, OverflowRecovery Recovery>
+          bool UsePredicatedLoads = false>
 __device__ void histogram_4096_topk(const float* __restrict__ scores,
                                     int32_t* __restrict__ output,
                                     uint32_t length, void* _smem) {
@@ -470,25 +446,6 @@ __device__ void histogram_4096_topk(const float* __restrict__ scores,
   const auto [thr_bin, num_above, num_equal] = smem->match;
   const bool need_tie = (num_equal + num_above > TopK);
 
-  // Coarse-bin overflow must be refined before emitting any candidates.
-  if constexpr (Recovery == OverflowRecovery::kFp32Rescan) {
-    if (need_tie && num_equal > TopK) {
-      exact_topk_rescan_cold<TopK, kBlockSize, UsePredicatedLoads ? 1 : 4>(
-          scores, output, length, _smem);
-      return;
-    }
-  }
-  if constexpr (Recovery == OverflowRecovery::kRegisterValues) {
-    if (need_tie && num_equal > TopK) {
-      if (!exact_topk_refine_registers<TopK, HIST_BITS, VECS_PER_THREAD>(
-              vecs, output, length, thr_bin, num_above, _smem)) {
-        exact_topk_rescan<TopK, kBlockSize, UsePredicatedLoads ? 1 : 4, 0, 0>(
-            scores, output, length, _smem, 0, TopK);
-      }
-      return;
-    }
-  }
-
   done = false;
 #pragma unroll
   for (uint32_t v = 0; v < VECS_PER_THREAD && !done; v++) {
@@ -511,7 +468,7 @@ __device__ void histogram_4096_topk(const float* __restrict__ scores,
             }
           } else {
             if (pos < TopK) {
-              smem->tie_buffer[pos] = {idx, elems[e]};
+              smem->tie_buffer[pos] = {idx, elems[e]};  // store for refirement
             }
           }
         }
@@ -551,14 +508,15 @@ __device__ void histogram_4096_topk(const float* __restrict__ scores,
     if (lane_id == 0 && rank < topk_remain) {
       output[num_above + rank] = target.idx;  // place at correct position
     }
-  } else if (num_ties <= kWarpSize * 2) {
-    // Same idea, with each thread handling two tie elements.
+  } else if (num_ties <=
+             kWarpSize *
+                 2) {  // TODO (roberto): try to refactor this with <=32 case
+    //  Same idea but each thread handles 2 tie elements
     const auto lane_id = tx % kWarpSize;
     const auto warp_id = tx / kWarpSize;
     const auto lane1 = lane_id + kWarpSize;
     const auto warp1 = warp_id + kWarpSize;
-    // Padding must not outrank any real tie, including a -inf one.
-    const auto invalid = Tie{0xFFFFFFFF, -__builtin_huge_valf()};
+    const auto invalid = Tie{0xFFFFFFFF, -__FLT_MAX__};
     const auto tie0 = smem->tie_buffer[lane_id];
     const auto tie1 = lane1 < num_ties ? smem->tie_buffer[lane1] : invalid;
     if (warp_id < num_ties) {
@@ -591,13 +549,12 @@ __device__ void histogram_4096_topk(const float* __restrict__ scores,
 }
 
 template <uint32_t TopK, uint32_t HIST_BITS,
-          uint32_t VECS_PER_THREAD = kHist4096VecsPerThread,
-          OverflowRecovery Recovery>
+          uint32_t VECS_PER_THREAD = kHist4096VecsPerThread>
 __device__ __noinline__ void histogram_4096_topk_predicated(
     const float* __restrict__ scores, int32_t* __restrict__ output,
     uint32_t length, void* _smem) {
-  histogram_4096_topk<TopK, HIST_BITS, VECS_PER_THREAD, true, Recovery>(
-      scores, output, length, _smem);
+  histogram_4096_topk<TopK, HIST_BITS, VECS_PER_THREAD, true>(scores, output,
+                                                              length, _smem);
 }
 
 }  // namespace topk_histogram_4096

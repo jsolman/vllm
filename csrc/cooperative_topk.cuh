@@ -14,7 +14,6 @@
 #include <cstdint>
 
 #include "topk_histogram_4096.cuh"
-#include "topk_histogram_4096_overflow.cuh"
 
 namespace vllm {
 namespace cooperative {
@@ -23,11 +22,7 @@ namespace hist4096 = topk_histogram_4096;
 
 constexpr uint32_t kHistBits = 10;
 constexpr uint32_t kHistBins = 1 << kHistBits;
-using ExactRadix = hist4096::ExactRadixTraits;
-constexpr uint32_t kExactHistBins = ExactRadix::kBins;
 constexpr uint32_t kMaxTopK = 2048;
-// Retain this many threshold-bin candidates before exact recovery.
-constexpr uint32_t kCoarseTieCapacity = kMaxTopK;
 
 constexpr uint32_t kElemPerStage = 16;
 constexpr uint32_t kSizePerStage =
@@ -99,21 +94,18 @@ __device__ __forceinline__ void tma_load(void* d, const void* s, uint32_t n,
 // DSMEM histogram reduce
 // ============================================================================
 
-template <uint32_t CS, uint32_t NumBins>
+template <uint32_t CS>
 __device__ __forceinline__ void dsmem_hist_reduce(uint32_t* histogram) {
-  static_assert(NumBins % CS == 0);
-  // Fold the distributed per-rank bins into cluster-visible totals.
+  static_assert(kHistBins <= hist4096::kBlockSize);
   auto cluster = cooperative_groups::this_cluster();
   cluster.sync();
   const auto tx = threadIdx.x;
   const auto rank = blockIdx.y;
-  constexpr auto kLocal = NumBins / CS;
+  constexpr auto kLocal = kHistBins / CS;
   const auto off = kLocal * rank;
-#pragma unroll
-  for (uint32_t bin = tx; bin < NumBins; bin += hist4096::kBlockSize) {
-    // Cover histograms wider than one CTA without changing the reduction.
-    const auto addr = &histogram[off + bin / CS];
-    const auto src = cluster.map_shared_rank(addr, bin % CS);
+  if (tx < kHistBins) {
+    const auto addr = &histogram[off + tx / CS];
+    const auto src = cluster.map_shared_rank(addr, tx % CS);
     *src = warp_reduce_sum_subN<CS>(*src);
   }
   cluster.sync();
@@ -209,7 +201,7 @@ __device__ void tma_stream_pass(const float* scores, uint32_t length,
           indices[atomicAdd(&smem->counter_gt, 1)] = gi;
         } else if (bn == thr_bin) {
           const auto p = atomicAdd(&smem->counter_eq, 1);
-          if (p < kCoarseTieCapacity) {
+          if (p < hist4096::kMaxTies) {
             smem->tie_buffer[p] = {gi, sc};
           }
         }
@@ -247,7 +239,7 @@ struct SmemFused {
   alignas(128) hist4096::MatchBin match;
   uint32_t warp_sum[hist4096::kNumWarps];
   union {
-    uint32_t histogram[kExactHistBins];
+    uint32_t histogram[kHistBins];
     hist4096::Tie tie_buffer[kMaxTopK];
   };
   alignas(128) float score_buffer[kStages][kSizePerStage];
@@ -257,8 +249,6 @@ using Smem8 = SmemFused<kFusedStagesCS8>;
 using Smem16 = SmemFused<kFusedStagesCS16>;
 using Smem4 = SmemFused<kStreamingStagesCS4, 2>;
 using SmemSinglePass = SmemFused<kMaxSinglePassStages>;
-
-#include "cooperative_topk_overflow.cuh"
 
 // Cluster-cooperative large path.
 // kFused=true: all TMA stages resident, single-pass histogram + scatter (rescan
@@ -272,7 +262,7 @@ __device__ void large_topk(const float* __restrict__ row_input,
   const auto tx = threadIdx.x;
   const auto lane = tx % hist4096::kWarpSize;
 
-  extern __shared__ __align__(128) uint8_t smem_raw[];
+  extern __shared__ uint8_t smem_raw[];
   auto* smem = reinterpret_cast<SmemType*>(smem_raw);
   int32_t* s_topk = reinterpret_cast<int32_t*>(smem_raw + sizeof(SmemType));
 
@@ -353,19 +343,12 @@ __device__ void large_topk(const float* __restrict__ row_input,
   }
 
   // DSMEM all-reduce + find threshold
-  dsmem_hist_reduce<CS, kHistBins>(
+  dsmem_hist_reduce<CS>(
       smem->histogram);  // each block histogram is summed across all CS blocks
   find_threshold<TopK>(smem->histogram, smem->warp_sum, &smem->counter_gt,
                        &smem->counter_eq, &smem->match);
 
   const auto thr = smem->match.bin;
-  // A threshold bin beyond tie capacity needs exact recovery; scattering
-  // into the bounded buffer would discard possible TopK candidates.
-  if (__builtin_expect(smem->match.equal_count > kCoarseTieCapacity, 0)) {
-    recover_coarse_overflow<TopK, CS, kFused>(row_input, row_output, seq_len,
-                                              my_start, my_len, smem, s_topk);
-    return;
-  }
 
   if constexpr (kFused) {
     // Fused scatter: rescan score_buffer (still in smem)
@@ -386,7 +369,7 @@ __device__ void large_topk(const float* __restrict__ row_input,
         } else if (bin == thr) {
           const auto p = atomicAdd(&smem->counter_eq,
                                    1);  // equal -> ties (later refinement)
-          if (p < kCoarseTieCapacity) {
+          if (p < hist4096::kMaxTies) {
             smem->tie_buffer[p] = {gidx, score};
           }
         }
@@ -410,7 +393,7 @@ __device__ void large_topk(const float* __restrict__ row_input,
   const uint32_t la = smem->counter_gt;
   const uint32_t le_full = smem->counter_eq;
   const uint32_t le =
-      min(le_full, kCoarseTieCapacity);  // written smem tie_buffer entries
+      min(le_full, hist4096::kMaxTies);  // written smem tie_buffer entries
 
   __shared__ uint32_t s_local_counts[CS];
   __shared__ uint32_t s_prefix_packed;
@@ -454,12 +437,12 @@ __device__ void large_topk(const float* __restrict__ row_input,
   }
   for (uint32_t i = tx; i < le; i += hist4096::kBlockSize) {
     const auto t = smem->tie_buffer[i];
-    const uint32_t p = s_total_above + prefix_equal + i;
+    uint32_t p = s_total_above + prefix_equal + i;
     if (p < TopK) {
       row_output[p] = t.idx + my_start;
     }
-    const uint32_t tp = prefix_equal + i;
-    if (tp < kCoarseTieCapacity) {
+    uint32_t tp = prefix_equal + i;
+    if (tp < (TopK <= hist4096::kBlockSize ? hist4096::kMaxTies : TopK)) {
       tie_ws[tp] = hist4096::Tie{t.idx + my_start, t.score};
     }
   }
@@ -475,25 +458,19 @@ __device__ void large_topk(const float* __restrict__ row_input,
 
   // Tie-breaking uses FP32 (4-round radix sort)
   if constexpr (TopK <= hist4096::kBlockSize) {
-    if (s_total_equal <= hist4096::kMaxTies) {
-      // copy ties from tie_ws back to smem, then refine
-      const uint32_t num_ties = s_total_equal;
-      // TODO (roberto): could vectorize with uint2 (8 bytes = exactly one Tie)
-      for (uint32_t i = tx; i < num_ties; i += hist4096::kBlockSize) {
-        smem->tie_buffer[i] = hist4096::Tie{tie_ws[i].idx, tie_ws[i].score};
-      }
-      __syncthreads();
-      hist4096::tie_handle<TopK>(smem->tie_buffer, num_ties, s_total_above,
-                                 row_output, smem);
-    } else {
-      // The fast refiner fits one tie per thread; use the extended refiner
-      // when the threshold bin exceeds that capacity.
-      hist4096::tie_handle_large<TopK, kCoarseTieCapacity>(
-          tie_ws, s_total_equal, s_total_above, row_output, smem);
+    // copy ties from tie_ws back to smem, then refine
+    const uint32_t num_ties = min(s_total_equal, hist4096::kMaxTies);
+    // TODO (roberto): could vectorize with uint2 (8 bytes = exactly one Tie)
+    for (uint32_t i = tx; i < num_ties; i += hist4096::kBlockSize) {
+      smem->tie_buffer[i] = hist4096::Tie{tie_ws[i].idx, tie_ws[i].score};
     }
+    __syncthreads();
+    hist4096::tie_handle<TopK>(smem->tie_buffer, num_ties, s_total_above,
+                               row_output, smem);
   } else {
     // TopK=2048: process directly from tie_ws (GMEM)
-    hist4096::tie_handle_large<TopK>(tie_ws, s_total_equal, s_total_above,
+    const uint32_t num_ties = min(s_total_equal, static_cast<uint32_t>(TopK));
+    hist4096::tie_handle_large<TopK>(tie_ws, num_ties, s_total_above,
                                      row_output, smem);
   }
 }
@@ -527,10 +504,8 @@ __device__ void cooperative_topk_body(CooperativeTopKParams<TopK> params) {
   // Short-Medium path: histogram_4096_topk on rank 0 only - all data fits in RF
   if (sl <= static_cast<int32_t>(hist4096::kHist4096MaxLen)) {
     if (rank == 0) {
-      extern __shared__ __align__(128) uint8_t sr[];
-      hist4096::histogram_4096_topk<TopK, 12, hist4096::kHist4096VecsPerThread,
-                                    false,
-                                    hist4096::OverflowRecovery::kFp32Rescan>(
+      extern __shared__ uint8_t sr[];
+      hist4096::histogram_4096_topk<TopK, 12>(
           in, out, sl, sr);  // 4096-bin (12-bit) histogram
     }
     return;
@@ -553,9 +528,10 @@ __device__ void cooperative_topk_body(CooperativeTopKParams<TopK> params) {
                                                 : kMaxSinglePassStages;
   using FusedSmem = SmemFused<kFusedStages>;
 
-  extern __shared__ __align__(128) uint8_t sr[];
+  extern __shared__ uint8_t sr[];
 
-  constexpr uint32_t kTieWsPerRow = kCoarseTieCapacity;
+  constexpr uint32_t kTieWsPerRow =
+      TopK <= hist4096::kBlockSize ? hist4096::kMaxTies : TopK;
   hist4096::Tie* row_tie_ws = params.tie_ws + row * kTieWsPerRow;
 
   if (use_singlepass) {
