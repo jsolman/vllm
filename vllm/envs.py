@@ -614,6 +614,32 @@ def _resolve_rust_cli_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # ================== DeepSeek V4.1 (SM110) Env Vars ==================
+    # These are read by the DSv4.1 model/attention code paths, not by the
+    # generic vLLM env layer, so they are registered here to keep the
+    # platform's env validator from logging them as unknown.
+    # Route wo_a (the attention output projection) through the
+    # grouped-BMM MXFP8 kernel on SM8x/SM110: the ordinary list
+    # resolves to an MXFP8 GEMM with a quantized activation, which
+    # differs from the emulation (bf16 GEMM) path by ~2-3% on wo_a
+    # and flips the logits argmax on near-tied rows.
+    "VLLM_DSV41_QUANT_E2M1_CACHE": lambda: bool(
+        int(os.getenv("VLLM_DSV41_QUANT_E2M1_CACHE", "1"))
+    ),
+    "VLLM_DSV41_FP4_ACT_QUANT": lambda: bool(
+        int(os.getenv("VLLM_DSV41_FP4_ACT_QUANT", "0"))
+    ),
+    "VLLM_DSV41_USE_TILELANG_SPARSE": lambda: os.getenv(
+        "VLLM_DSV41_USE_TILELANG_SPARSE", ""
+    ),
+    "VLLM_DSV41_NO_ENGRAM": lambda: bool(int(os.getenv("VLLM_DSV41_NO_ENGRAM", "0"))),
+    # Diagnostics: log the decode indexer's top-k selection, and the raw
+    # sampled token ids per decode step (pre-parser, so the parser's
+    # mask window can be read offline).
+    "VLLM_DSV41_LOG_TOPK": lambda: bool(int(os.getenv("VLLM_DSV41_LOG_TOPK", "0"))),
+    "VLLM_DSV41_LOG_RAWTOKENS": lambda: bool(
+        int(os.getenv("VLLM_DSV41_LOG_RAWTOKENS", "0"))
+    ),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]
