@@ -640,6 +640,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSV41_LOG_RAWTOKENS": lambda: bool(
         int(os.getenv("VLLM_DSV41_LOG_RAWTOKENS", "0"))
     ),
+    # The mHC (multi-head-chain) block-split knobs, read by the DSv4.1
+    # MHC kernels; empty means "unset".
+    "VLLM_MHC_TILE_N": lambda: os.getenv("VLLM_MHC_TILE_N", ""),
+    "VLLM_MHC_SPLIT_K": lambda: os.getenv("VLLM_MHC_SPLIT_K", ""),
+    # The multi-stream GEMM path (the indexer's projection on an aux
+    # stream) is taken only when num_tokens <= this threshold, i.e. in
+    # the DECODE. 0 disables it.
+    "VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD": lambda: int(
+        os.getenv("VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD", "1024")
+    ),
+    # Chat request logging and the reasoning temperature cap.
+    "VLLM_LOG_CHAT_REQUESTS": lambda: bool(
+        int(os.getenv("VLLM_LOG_CHAT_REQUESTS", "0"))
+    ),
+    "VLLM_REASONING_MAX_TEMPERATURE": lambda: os.getenv(
+        "VLLM_REASONING_MAX_TEMPERATURE", ""
+    ),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]
