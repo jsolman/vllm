@@ -626,9 +626,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSV41_QUANT_E2M1_CACHE": lambda: bool(
         int(os.getenv("VLLM_DSV41_QUANT_E2M1_CACHE", "1"))
     ),
-    "VLLM_DSV41_FP4_ACT_QUANT": lambda: bool(
-        int(os.getenv("VLLM_DSV41_FP4_ACT_QUANT", "0"))
-    ),
+    "VLLM_DSV41_FP4_ACT_QUANT": lambda: os.getenv(
+        "VLLM_DSV41_FP4_ACT_QUANT", "0"
+    ).strip().lower() in ("1", "true"),
     "VLLM_DSV41_USE_TILELANG_SPARSE": lambda: os.getenv(
         "VLLM_DSV41_USE_TILELANG_SPARSE", ""
     ),
@@ -637,9 +637,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sampled token ids per decode step (pre-parser, so the parser's
     # mask window can be read offline).
     "VLLM_DSV41_LOG_TOPK": lambda: bool(int(os.getenv("VLLM_DSV41_LOG_TOPK", "0"))),
-    "VLLM_DSV41_LOG_RAWTOKENS": lambda: bool(
-        int(os.getenv("VLLM_DSV41_LOG_RAWTOKENS", "0"))
-    ),
+    "VLLM_DSV41_LOG_RAWTOKENS": lambda: os.getenv(
+        "VLLM_DSV41_LOG_RAWTOKENS", "0"
+    ).strip().lower() in ("1", "true"),
     # The mHC (multi-head-chain) block-split knobs, read by the DSv4.1
     # MHC kernels; empty means "unset".
     "VLLM_MHC_TILE_N": lambda: os.getenv("VLLM_MHC_TILE_N", ""),
@@ -651,9 +651,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD", "1024")
     ),
     # Chat request logging and the reasoning temperature cap.
-    "VLLM_LOG_CHAT_REQUESTS": lambda: bool(
-        int(os.getenv("VLLM_LOG_CHAT_REQUESTS", "0"))
-    ),
+    "VLLM_LOG_CHAT_REQUESTS": lambda: os.getenv(
+        "VLLM_LOG_CHAT_REQUESTS", "0"
+    ).strip().lower() in ("1", "true"),
     "VLLM_REASONING_MAX_TEMPERATURE": lambda: os.getenv(
         "VLLM_REASONING_MAX_TEMPERATURE", ""
     ),
